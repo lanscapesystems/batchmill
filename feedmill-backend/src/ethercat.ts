@@ -321,7 +321,11 @@ export function syncIoConf(
       writeFileSync(tmp, conf, 'utf8');
       renameSync(tmp, IO_CONF_PATH);
       try {
-        execFileSync('systemctl', ['restart', 'feedmill-io-daemon.service'], { timeout: 3000 });
+        // Calling systemctl directly here goes through polkit (not sudo), which
+        // refuses an unattended non-root caller with "Interactive authentication
+        // required" -- install.sh's NOPASSWD sudoers grant is for exactly this
+        // command, so it must actually be invoked via sudo to take effect.
+        execFileSync('sudo', ['-n', '/bin/systemctl', 'restart', 'feedmill-io-daemon.service'], { timeout: 3000 });
       } catch {
         // dev machine, daemon not installed, or this process lacks permission to manage the service
       }
