@@ -1,0 +1,168 @@
+{
+  "schema_version": 1,
+  "status": "DRAFT_NOT_ACTIVATABLE",
+  "installation": {
+    "id": null,
+    "display_mass_unit": null,
+    "timezone": null,
+    "config_revision": "draft-007"
+  },
+  "limits": {
+    "ingredient_bins": 32,
+    "finished_bins": 8,
+    "main_mixers": 1,
+    "hammer_mills": 4,
+    "micro_systems": 2
+  },
+  "assets": {
+    "ingredient_bins": [],
+    "finished_bins": [],
+    "mixers": [],
+    "scales": [],
+    "hammer_mills": [],
+    "hammer_source_bins": [],
+    "micro_systems": []
+  },
+  "io_adapters": [],
+  "signals": [],
+  "equipment": [],
+  "material_edges": [],
+  "routes": [],
+  "policies": {
+    "active_main_batches": 1,
+    "parallel_ingredient_dosing": false,
+    "same_bin_refill_and_dispense": false,
+    "arm_on_boot": false,
+    "automatic_power_loss_resume": false,
+    "micro_weighing_start": "batch_start_parallel_with_main_dosing",
+    "micro_transfer_after": "main_ingredients_complete",
+    "timed_mix_after": "all_required_material_received",
+    "batch_pause_available_in_all_phases": true,
+    "pause_equipment_stop_policy": null,
+    "hammer_refill_request": "low_level_when_automatic_enabled",
+    "hammer_refill_stop": "high_level",
+    "hammer_current_based_feeder_control": "high_current_infeed_pause",
+    "hammer_automatic_disable_during_fill": null
+  },
+  "activation_blockers": [
+    "Configure enabled assets and material assignments; previous installation counts were examples",
+    "Map physical source, mixing, micro and unload routes",
+    "Define scales, analog current transducers and level sensor mappings",
+    "Define capacities, units, timing, tolerance and current response policies",
+    "Define and commission startup, shutdown, pause and failure behavior"
+  ],
+  "topology_requirements": {
+    "ingredient_bin_count": 32,
+    "each_bin_has_discharge_auger": true,
+    "ingredient_receiving_path": "direct_or_optional_mixer_stuffer",
+    "micro_receiving_path": "weighed_drag_to_mixer_or_stuffer",
+    "unload_route_limits": {
+      "augers": 5,
+      "elevators": 1,
+      "valves_and_gates": 10
+    },
+    "unload_gate_limit_confirmation_before_motor_start": true,
+    "unload_motor_start_order": "downstream_first",
+    "ingredient_bin_count_semantics": "platform_capacity",
+    "hammer_receiving_assignments": "configurable",
+    "hammer_source_bins": "separate_configurable_registry",
+    "hammer_source_routes": "any_source_bin_to_any_mill_when_configured_and_physically_available",
+    "hammer_discharge_augers": "configurable_per_route",
+    "hammer_current_monitoring": "analog_current_transducer_per_mill",
+    "hammer_receiving_level_sensors": [
+      "low",
+      "high"
+    ],
+    "micro_system_count_options": [
+      0,
+      1,
+      2
+    ],
+    "main_mixer_motor_count": 1,
+    "main_weighing_arrangement": "weighed_mixer",
+    "hammer_infeed_speed_output": "optional_analog_VFD_setpoint_per_infeed_auger"
+  },
+  "hammer_load_control_contract": {
+    "development_priority": "low",
+    "high_current_pause_setpoint_unit": "A",
+    "high_current_pause_setpoint": null,
+    "resume_policy": null,
+    "current_validity_failure_policy": null,
+    "optional_vfd_speed_output": {
+      "enabled_per_auger": true,
+      "analog_channel": null,
+      "electrical_range": null,
+      "speed_unit": null,
+      "speed_limits": null,
+      "run_authorization_separate": true
+    },
+    "continuous_current_speed_regulation_confirmed": false
+  },
+  "motor_contract": {
+    "run_output_required": true,
+    "starter_aux_input_required": true,
+    "rotation_sensor_optional": true,
+    "rotation_monitoring": {
+      "pulse_input": null,
+      "calibration_unit": "pulses_per_revolution",
+      "pulses_per_revolution": null,
+      "minimum_rpm": null,
+      "evaluation_window_ms": null,
+      "no_pulse_timeout_ms": null,
+      "invalid_measurement_policy": null,
+      "startup_delay_source": "mill_configuration.rotation_startup_delay_ms",
+      "fault_delay_ms": null
+    },
+    "low_rpm_response": "stop_faulted_motor_and_all_upstream_equipment",
+    "upstream_scope": "transitive_material_feeding_dependencies",
+    "downstream_response": "separate_configured_policy",
+    "fault_reset_policy": null
+  },
+  "mill_configuration": {
+    "rotation_startup_delay_ms": null
+  },
+  "equipment_timing_contract": {
+    "auger_and_elevator": {
+      "start_delay_ms": null,
+      "stop_delay_ms": null
+    },
+    "fault_delay_scope": "per_condition_proposed",
+    "fault_stops_bypass_ordinary_stop_delays": true
+  },
+  "sensor_override_contract": {
+    "supported": [
+      "motor_starter_auxiliary",
+      "rotation_sensor",
+      "valve_limit_switch",
+      "gate_limit_switch"
+    ],
+    "individual_sensor_enable": true,
+    "raw_telemetry_preserved": true,
+    "status_when_overridden": "UNVERIFIED_OVERRIDDEN",
+    "enabling_override_starts_equipment": false,
+    "authorization_policy": null,
+    "expiry_policy": null,
+    "restart_persistence_policy": null,
+    "active_fault_reset_policy": null
+  },
+  "frontend_contract": {
+    "equipment_configuration": "all_assets_expand_in_flow_order_in_settings",
+    "diagram_source": "same_equipment_and_material_connections_as_settings",
+    "queue_history": "individual_run_records_with_frozen_target_and_actual_lines",
+    "schedule_types": [
+      "now",
+      "every_x_calendar_days",
+      "selected_weekdays"
+    ],
+    "schedule_time_required": true,
+    "quantity_storage": "one_order_field_not_duplicated_queue_rows",
+    "quantity_semantics": "runs_per_release_proposed",
+    "schedule_timezone": "IANA_installation_timezone",
+    "run_history_identity": [
+      "order_id",
+      "occurrence_id",
+      "run_id",
+      "run_ordinal"
+    ]
+  }
+}

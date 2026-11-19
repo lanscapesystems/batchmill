@@ -1,0 +1,20 @@
+[Unit]
+Description=Feedmill EtherCAT I/O daemon (digital, analog, rotation)
+After=ethercat.service
+Requires=ethercat.service
+
+[Service]
+Type=simple
+ExecStart=/opt/feedmill/ethercat-rt/io-daemon /etc/feedmill/io.conf
+Restart=on-failure
+RestartSec=2
+# Needed for mlockall()/SCHED_FIFO in io_daemon.c without running as root:
+CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK
+AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+RuntimeDirectory=feedmill
+User=root
+
+[Install]
+WantedBy=multi-user.target

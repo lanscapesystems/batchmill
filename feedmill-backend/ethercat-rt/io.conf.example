@@ -1,0 +1,29 @@
+# NOTE: this file is normally auto-generated — do not hand-maintain it.
+#
+# feedmill-backend writes /etc/feedmill/io.conf itself (see
+# generateIoConf()/syncIoConf() in src/ethercat.ts) from the configured
+# Omron rack and every signal currently mapped to an equipment port —
+# never edit it by hand, it'll just get overwritten.
+#
+# The per-model facts this is generated from — NX_CARD_PRODUCT_ID,
+# NX_DI_PDO, NX_DO_PDO, NX_AI_PDO, NX_AO_PDO in src/types.ts — are
+# PLACEHOLDERS, unverified. Confirm the real values on the Debian
+# target once IgH is installed and the bus is up, and update those
+# tables, not this file:
+#
+#   ethercat slaves -v                  -> vendor_id / product_id per slave
+#   ethercat pdos -p <slave position>   -> pdo index:subindex per point
+#
+# What follows is just a worked example of the format the generator
+# produces, for manually testing io_daemon.c before the backend exists
+# on the target:
+cycle_us 4000
+state_path /run/feedmill/io-state.json
+command_path /run/feedmill/io-command.txt
+slave 2 0x00000083 0x00000000
+slave 3 0x00000083 0x00000000
+channel I:02.00 2 DI 0x6000 0x01
+channel I:02.01 2 DI 0x6000 0x02 count
+channel O:03.00 3 DO 0x7000 0x01
+channel AI:02.00 2 AI 0x6010 0x01
+channel AO:03.00 3 AO 0x7010 0x01

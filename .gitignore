@@ -1,0 +1,6 @@
+.claude/
+.playwright-mcp/
+graphify-out/
+io-simulator/
+*.old-standalone-repo/
+.DS_Store

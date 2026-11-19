@@ -1,0 +1,381 @@
+export type SignalDirection = 'DI' | 'DO' | 'AI' | 'AO';
+export type SignalValue = boolean | number;
+
+export interface SignalDef {
+  id: string;
+  direction: SignalDirection;
+  label: string;
+  equipmentId?: string;
+  port?: string;
+}
+
+export type EquipmentStatus = 'not_running' | 'running' | 'fault' | 'warning' | 'disabled';
+export type EquipmentMode = 'Auto' | 'Hand' | 'Off';
+
+export interface EquipmentRuntime {
+  id: string;
+  name: string;
+  equipmentType: string;
+  class: string;
+  mode: EquipmentMode;
+  status: EquipmentStatus;
+  request: boolean;   // run request bit, set by Hand mode, the batch engine or a refill
+  runCmd: boolean;    // run command after start/stop delays; this is what the run output follows
+  feedback: boolean;
+  faultReason?: string;
+  warningReason?: string;
+  owner?: string;
+  config: Record<string, string | number | boolean>;
+  position?: { x: number; y: number };
+  speed?: number;    // VFD speed setpoint, % (only used when config.analogSpeedOutput is assigned)
+  faultTimerMs: number;
+  positionTimerMs: number;
+  startTimerMs: number;
+  stopTimerMs: number;
+  gatePosition?: 'open' | 'closed' | 'moving' | 'unknown';
+}
+
+export type BatchState = 'IDLE' | 'VALIDATING' | 'READY' | 'DOSING' | 'MIXING' |
+  'ROUTE_PRECHECK' | 'DISCHARGING' | 'CLEAROUT' | 'COMPLETED' | 'PAUSING' | 'PAUSED' | 'FAULTED';
+
+export interface DosingStep {
+  ingredientId: string;
+  ingredientName: string;
+  sourceBinId: string;
+  augerId: string;
+  target: number;
+  actual: number;
+  unit: string;
+  state: 'pending' | 'baseline' | 'feeding' | 'cutoff' | 'settling' | 'complete' | 'faulted';
+  baselineWeight: number;
+  settleStartTime: number;
+  cutoffStartTime: number;
+}
+
+export interface BatchRuntime {
+  id: string;
+  recipeId: string;
+  recipeName: string;
+  targetMass: number;
+  destination: string;
+  state: BatchState;
+  startedAt: string;
+  completedAt?: string;
+  dosingIndex: number;
+  dosingSteps: DosingStep[];
+  mixTimeRemainingMs: number;
+  mixTimeTotalMs: number;
+  dischargeStartTime: number;
+  faultReason?: string;
+  previousState?: BatchState;
+}
+
+export interface Recipe {
+  id: string;
+  name: string;
+  revision: number;
+  mixTime: number;
+  lines: { ingredientId: string; target: number; unit: string }[];
+  microLines: { ingredientId: string; target: number; unit: string }[];
+}
+
+export interface Ingredient {
+  id: string;
+  name: string;
+  category: 'MAIN' | 'MICRO';
+  unit: string;
+  hidden?: boolean;
+}
+
+export interface Bin {
+  id: string;
+  name: string;
+  note?: string;
+  ingredientId: string | null;
+  balance: number;
+  capacity: number;
+  unit: string;
+  type: 'ingredient' | 'finished' | 'micro_hopper';
+  tracked?: boolean;
+}
+
+export interface Fault {
+  id: string;
+  severity: 'CRITICAL' | 'WARNING' | 'INFO';
+  equipment: string;
+  message: string;
+  code: string;
+  raisedAt: string;
+  clearedAt: string | null;
+  acknowledgedAt: string | null;
+  active: boolean;
+}
+
+export interface ScaleReading {
+  weight: number;
+  stable: boolean;
+  valid: boolean;
+  timestamp: number;
+}
+
+export interface FlowConnection {
+  from: string;
+  fromPort: string;
+  to: string;
+  toPort: string;
+}
+
+export interface EquipmentDef {
+  prefix: string;
+  label: string;
+  class: string;
+  maxCount?: number;
+}
+
+export const EQUIPMENT_DEFS: Record<string, EquipmentDef> = {
+  bin:          { prefix: 'B',  label: 'Ingredient Bin', class: 'StorageBin',  maxCount: 32 },
+  hammermill:   { prefix: 'HM', label: 'Hammer Mill',    class: 'HammerMill',  maxCount: 4 },
+  mixer:        { prefix: 'MX', label: 'Mixer',          class: 'Mixer',       maxCount: 1 },
+  finished_bin: { prefix: 'FB', label: 'Finished Bin',   class: 'StorageBin',  maxCount: 8 },
+  micro_drag:   { prefix: 'MD', label: 'Micro Drag',     class: 'Conveyor',    maxCount: 2 },
+  gate:         { prefix: 'GT', label: 'Gate',            class: 'Gate' },
+  auger:        { prefix: 'A',  label: 'Auger',          class: 'Auger' },
+};
+
+// empty = low switch uncovered, full = high switch covered, fault = high covered while low uncovered (impossible)
+export type LevelSwitchState = 'empty' | 'normal' | 'full' | 'fault';
+
+export interface StateSnapshot {
+  revision: number;
+  timestamp: string;
+  equipment: {
+    id: string;
+    name: string;
+    equipmentType: string;
+    class: string;
+    status: EquipmentStatus;
+    mode: EquipmentMode;
+    commanded: boolean;
+    feedback: boolean;
+    faultReason?: string;
+    warningReason?: string;
+    owner?: string;
+    config: Record<string, string | number | boolean>;
+    position?: { x: number; y: number };
+    speed?: number;
+    refillState?: string;
+    gatePosition?: string;
+  }[];
+  queue: QueueSnapshot[];
+  activeBatch: BatchSnapshot | null;
+  faults: Fault[];
+  bins: (Bin & { levelSwitchState?: LevelSwitchState })[];
+  recipes: Recipe[];
+  ingredients: Ingredient[];
+  connections: FlowConnection[];
+  io: {
+    inputs: Record<string, SignalValue>;
+    outputs: Record<string, SignalValue>;
+    signals: SignalDef[];
+    overrides: Record<string, SignalValue>;
+  };
+  scales: Record<string, ScaleReading>;
+  scaleConfigs: ScaleConfig[];
+  omronConfig: OmronConfig;
+  globalConfig: Record<string, string | number>;
+  networkInterfaces: string[];
+}
+
+export interface QueueSnapshot {
+  id: string;
+  recipeId: string;
+  recipeName: string;
+  targetMass: number;
+  destination: string;
+  state: BatchState;
+  progress: number;
+  startedAt?: string;
+  completedAt?: string;
+  dosingSteps?: {
+    ingredientId: string;
+    ingredientName: string;
+    sourceBinId: string;
+    target: number;
+    actual: number;
+    unit: string;
+    state: string;
+  }[];
+  mixTimeRemainingMs?: number;
+  mixTimeTotalMs?: number;
+  faultReason?: string;
+}
+
+export interface BatchSnapshot extends QueueSnapshot {}
+
+export interface Command {
+  requestId: string;
+  action: string;
+  targetId?: string;
+  parameters?: Record<string, unknown>;
+}
+
+export interface CommandResult {
+  requestId: string;
+  accepted: boolean;
+  reason?: string;
+  revision: number;
+}
+
+export type ScaleConnectionType = 'serial' | 'rs1201';
+
+export interface ScaleConfig {
+  id: string;
+  name: string;
+  connectionType: ScaleConnectionType;
+  // Serial settings (used when connectionType === 'serial')
+  protocol: string;
+  comPort: string;
+  baudRate: number;
+  dataBits: number;
+  parity: 'none' | 'even' | 'odd';
+  stopBits: number;
+  // Weight extraction for 'serial': first match of this regex against each
+  // line is parsed as the weight (sign + digits + optional decimal point).
+  // Works unconfigured for most continuous-output scaleheads, which just
+  // emit a number per line; override only if a head's framing needs it
+  // (e.g. to skip a non-weight number elsewhere in the line).
+  weightRegex: string;
+  // RS1201 settings (used when connectionType === 'rs1201')
+  rackSlot: number;
+  // Calibration (RS1201 load cell)
+  zeroOffset: number;
+  ratedMvV: number;
+  // Common
+  capacity: number;
+  resolution: number;
+  freshnessTimeout: number;
+  stabilityWindow: number;
+}
+
+export type CouplerType = 'none' | 'NX-EIC' | 'NX-ECC';
+
+// NX-ECC202 vs NX-ECC203: min cyclic period and ring-topology support differ (Omron W519).
+export type EccModel = 'NX-ECC202' | 'NX-ECC203';
+
+export const ECC_MODEL_MIN_CYCLE_US: Record<EccModel, number> = {
+  'NX-ECC202': 250,
+  'NX-ECC203': 125,
+};
+
+export type NxCardCategory = 'power' | 'DI' | 'DO' | 'AI' | 'AO' | 'scale';
+
+export interface NxCardDef {
+  model: string;
+  category: NxCardCategory;
+  points: number;
+  label: string;
+  busWatts: number; // NX Bus power consumption (W) — coupler supplies 10W max
+}
+
+export const NX_CARD_CATALOG: NxCardDef[] = [
+  // Power — I/O field power supply; busWatts = coupler-connected values
+  { model: 'NX-PF0730', category: 'power', points: 0, label: 'I/O Power Supply (10A)', busWatts: 0.45 },
+  { model: 'NX-PF0630', category: 'power', points: 0, label: 'Additional I/O Power Supply (4A)', busWatts: 0.45 },
+  { model: 'NX-PC0030', category: 'power', points: 0, label: 'I/O Power Connection Unit', busWatts: 0.45 },
+  // Digital Input — DC
+  { model: 'NX-ID5442', category: 'DI', points: 16, label: '16pt 24VDC Input (PNP)', busWatts: 0.55 },
+  { model: 'NX-ID5342', category: 'DI', points: 16, label: '16pt 24VDC Input (NPN)', busWatts: 0.55 },
+  { model: 'NX-ID4342', category: 'DI', points: 8, label: '8pt 24VDC Input (NPN)', busWatts: 0.55 },
+  { model: 'NX-ID4442', category: 'DI', points: 8, label: '8pt 24VDC Input (PNP)', busWatts: 0.55 },
+  // Digital Input — AC
+  { model: 'NX-IA3117', category: 'DI', points: 4, label: '4pt 200-240VAC Input', busWatts: 0.50 },
+  // Digital Output — Transistor
+  { model: 'NX-OD5256', category: 'DO', points: 16, label: '16pt 24VDC Output (PNP)', busWatts: 0.70 },
+  { model: 'NX-OD4256', category: 'DO', points: 8, label: '8pt 24VDC Output (PNP)', busWatts: 0.65 },
+  // Digital Output — Relay (independent contacts per point, 2A/point)
+  { model: 'NX-OC4633', category: 'DO', points: 8, label: '8pt Relay Output (indep. contacts)', busWatts: 1.65 },
+  { model: 'NX-OC2633', category: 'DO', points: 2, label: '2pt Relay Output (indep. contacts)', busWatts: 0.80 },
+  // Analog Input
+  { model: 'NX-AD4203', category: 'AI', points: 8, label: '8ch Current Input (4-20mA)', busWatts: 1.05 },
+  { model: 'NX-AD4603', category: 'AI', points: 8, label: '8ch Voltage Input (±10V)', busWatts: 1.15 },
+  { model: 'NX-AD2203', category: 'AI', points: 2, label: '2ch Current Input (4-20mA)', busWatts: 0.90 },
+  { model: 'NX-AD3203', category: 'AI', points: 4, label: '4ch Current Input (4-20mA)', busWatts: 0.90 },
+  // Analog Output
+  { model: 'NX-DA2203', category: 'AO', points: 2, label: '2ch Current Output (4-20mA)', busWatts: 1.40 },
+  { model: 'NX-DA3203', category: 'AO', points: 4, label: '4ch Current Output (4-20mA)', busWatts: 1.80 },
+  { model: 'NX-DA3603', category: 'AO', points: 4, label: '4ch Voltage Output (±10V)', busWatts: 1.80 },
+  // Load Cell
+  { model: 'NX-RS1201', category: 'scale', points: 1, label: '1ch Load Cell Input (24-bit)', busWatts: 1.70 },
+  // Additional NX Bus Power (provides 10W to downstream units)
+  { model: 'NX-PD1000', category: 'power', points: 0, label: 'Addl NX Bus Power Supply (10W)', busWatts: 0.45 },
+];
+
+export const NX_BUS_POWER_BUDGET_W = 10; // Coupler provides 10W NX Bus power
+export const NX_MAX_UNITS = 63; // Max I/O units per coupler
+
+export const OMRON_VENDOR_ID = 0x00000083;
+
+// EtherCAT PDO addressing shared within each NX I/O category (subindex for
+// point p = subindexBase + p) — used by ethercat-rt/io_daemon.c to register
+// every signal in buildSignals()'s rack, not just rotation inputs. All
+// PLACEHOLDERS — confirm with `ethercat pdos -p <slot>` on the real target.
+export const NX_DI_PDO = { pdoIndex: 0x6000, subindexBase: 1 };
+export const NX_DO_PDO = { pdoIndex: 0x7000, subindexBase: 1 };
+export const NX_AI_PDO = { pdoIndex: 0x6010, subindexBase: 1 };
+export const NX_AO_PDO = { pdoIndex: 0x7010, subindexBase: 1 };
+
+// NX-RS1201 load cell: the weight-value PDO entry, plus the calibration
+// command/response field indexes Omron's W565 manual documents for
+// program-driven calibration. The calibration handshake itself (writing
+// Ch1 Calibration Command/Data and polling the Response SID) is NOT
+// implemented yet — it needs the actual module on the bench to validate
+// safely, since a wrong write can mis-calibrate a scale. PLACEHOLDERS.
+export const NX_RS1201_PDO = {
+  weightIndex: 0x6020, weightSubindex: 0x01,
+  statusIndex: 0x6020, statusSubindex: 0x02,
+};
+
+// NX_CARD_PRODUCT_ID: EtherCAT product ID per model, needed for
+// ecrt_master_slave_config — genuinely differs per model, unlike the PDO
+// addressing above. All PLACEHOLDERS — confirm with `ethercat slaves -v`.
+export const NX_CARD_PRODUCT_ID: Record<string, number> = {
+  'NX-ID5442': 0x00000000,
+  'NX-ID5342': 0x00000000,
+  'NX-ID4342': 0x00000000,
+  'NX-ID4442': 0x00000000,
+  'NX-IA3117': 0x00000000,
+  'NX-OD5256': 0x00000000,
+  'NX-OD4256': 0x00000000,
+  'NX-OC4633': 0x00000000,
+  'NX-OC2633': 0x00000000,
+  'NX-AD4203': 0x00000000,
+  'NX-AD4603': 0x00000000,
+  'NX-AD2203': 0x00000000,
+  'NX-AD3203': 0x00000000,
+  'NX-DA2203': 0x00000000,
+  'NX-DA3203': 0x00000000,
+  'NX-DA3603': 0x00000000,
+  'NX-RS1201': 0x00000000,
+};
+
+export interface IoRackCard {
+  slot: number;
+  model: string;
+  actual?: string;
+  status: 'unchecked' | 'ok' | 'mismatch' | 'missing';
+}
+
+export interface OmronConfig {
+  couplerType: CouplerType;
+  ipAddress: string;
+  nodeAddress: number;
+  ethercatInterface: string; // dedicated Debian NIC bound to the EtherCAT master (NX-ECC only)
+  eccModel: EccModel; // NX-ECC only: NX-ECC202 or NX-ECC203
+  cycleTimeUs: number; // EtherCAT master cyclic period, in microseconds (NX-ECC only)
+  ringTopology: boolean; // NX-ECC203 v1.5+ only
+  cards: IoRackCard[];
+  rackVerified: boolean;
+  lastReadAt?: string;
+  warnings: string[];
+}
+
