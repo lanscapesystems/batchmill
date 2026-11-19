@@ -43,13 +43,16 @@
  *      are installed (the install/install.sh script does this):
  *        gcc -O2 -Wall -o io-daemon io_daemon.c -lethercat -lpthread -lrt
  *
- *   2. Confirm the vendor/product IDs and PDO index:subindex against
- *      the REAL slaves, then fix NX_CARD_PRODUCT_ID / NX_DI_PDO /
- *      NX_DO_PDO / NX_AI_PDO / NX_AO_PDO in src/types.ts (NOT this
- *      file's config — it's generated from those tables) — on the
- *      target:
- *        ethercat slaves -v                  # vendor_id / product_id
- *        ethercat pdos -p <slave position>   # pdo index:subindex per point
+ *   2. Vendor/product IDs and PDO index:subindex are no longer hand
+ *      -maintained tables — src/ethercat.ts's verifyEthercatRack() reads
+ *      them live off the bus (`ethercat slaves -p <pos> -v` / `ethercat
+ *      pdos -p <pos>`) whenever the HMI's Read Rack runs, and this file's
+ *      config is generated from that. Those two CLI commands' output
+ *      format is parsed by getSlaveProductId()/getSlavePdoEntries() in
+ *      ethercat.ts from documented samples, not verified against a real
+ *      box — if Read Rack comes back with cards stuck "ok" but channels
+ *      missing from here, check those regexes against your IgH version's
+ *      actual output first.
  *
  *   3. This assumes every AI/AO entry is a 16-bit signed word and every
  *      SCALE (NX-RS1201 weight) entry is a 32-bit signed value, both at

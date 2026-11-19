@@ -5,14 +5,12 @@
 # Omron rack and every signal currently mapped to an equipment port —
 # never edit it by hand, it'll just get overwritten.
 #
-# The per-model facts this is generated from — NX_CARD_PRODUCT_ID,
-# NX_DI_PDO, NX_DO_PDO, NX_AI_PDO, NX_AO_PDO in src/types.ts — are
-# PLACEHOLDERS, unverified. Confirm the real values on the Debian
-# target once IgH is installed and the bus is up, and update those
-# tables, not this file:
-#
-#   ethercat slaves -v                  -> vendor_id / product_id per slave
-#   ethercat pdos -p <slave position>   -> pdo index:subindex per point
+# The vendor/product IDs and PDO addresses it's generated from are NOT
+# hand-maintained tables — verifyEthercatRack() in src/ethercat.ts reads
+# them live off the bus (via `ethercat slaves -p <pos> -v` / `ethercat
+# pdos -p <pos>`) every time the HMI's Read Rack command runs, and
+# stores them on each card. There's nothing to edit for a new card
+# model: wire it up, assign its slot in the HMI, click Read Rack.
 #
 # What follows is just a worked example of the format the generator
 # produces, for manually testing io_daemon.c before the backend exists

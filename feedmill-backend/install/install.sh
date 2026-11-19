@@ -12,11 +12,11 @@
 # already done before doing it.
 #
 # What this does NOT do (still genuinely hardware-specific, not automatable):
-#   - confirm the real vendor/product IDs and PDO addressing for whichever
-#     NX cards are actually racked (NX_CARD_PRODUCT_ID / NX_DI_PDO /
-#     NX_DO_PDO / NX_AI_PDO / NX_AO_PDO / NX_RS1201_PDO in src/types.ts
-#     are placeholders until you run `ethercat slaves -v` /
-#     `ethercat pdos -p <slot>` on this target and fix them)
+#   - vendor/product IDs and PDO addressing are no longer hand-maintained
+#     tables — the backend reads them live off the bus itself when you
+#     click "Read Rack" in the HMI. Just wire up each card, assign its
+#     slot (the real EtherCAT bus position) in the HMI's I/O Config tab,
+#     and click Read Rack; no `ethercat` CLI commands needed by hand.
 #   - the NX-RS1201 load cell calibration command/response handshake
 #     (needs the real module on the bench — see scaleReader.ts)
 #   - bench-test under real I/O load and a hard power-off
@@ -165,15 +165,18 @@ systemctl enable --now feedmill-backend.service
 cat <<EOF
 
 Done. Still required before trusting ANY real I/O point:
-  1. ethercat slaves -v                  # confirm vendor/product IDs
-  2. ethercat pdos -p <slave position>   # confirm PDO index:subindex per card
-     -> fix NX_CARD_PRODUCT_ID / NX_DI_PDO / NX_DO_PDO / NX_AI_PDO /
-        NX_AO_PDO / NX_RS1201_PDO in src/types.ts, then re-run this
-        script to redeploy.
-  3. Map real I/O points to equipment ports in the HMI's I/O Config tab
-     (including rotationPulseInput where applicable) and bench-test
-     each one — inputs, outputs, and a hard power-off — before relying
-     on it.
+  1. In the HMI's I/O Config tab: add each card with its real slot (the
+     EtherCAT bus position), map equipment ports to signals (including
+     rotationPulseInput where applicable), then click "Read Rack" — this
+     reads vendor/product IDs and PDO addresses live off the bus itself
+     and regenerates/restarts the io-daemon. No ethercat CLI by hand.
+  2. If Read Rack reports a card "ok" but its signals still don't show up
+     as channels in /etc/feedmill/io.conf, the ethercat CLI output on this
+     IgH version doesn't match what getSlaveProductId()/getSlavePdoEntries()
+     in src/ethercat.ts expect — compare their regexes against the actual
+     output of \`ethercat slaves -p <pos> -v\` / \`ethercat pdos -p <pos>\`.
+  3. Bench-test each point — inputs, outputs, and a hard power-off —
+     before relying on it.
   4. For an NX-RS1201 scale: the calibration handshake isn't implemented
      yet (see scaleReader.ts) — only the raw weight PDO read is wired up.
 

@@ -315,54 +315,26 @@ export const NX_MAX_UNITS = 63; // Max I/O units per coupler
 
 export const OMRON_VENDOR_ID = 0x00000083;
 
-// EtherCAT PDO addressing shared within each NX I/O category (subindex for
-// point p = subindexBase + p) — used by ethercat-rt/io_daemon.c to register
-// every signal in buildSignals()'s rack, not just rotation inputs. All
-// PLACEHOLDERS — confirm with `ethercat pdos -p <slot>` on the real target.
-export const NX_DI_PDO = { pdoIndex: 0x6000, subindexBase: 1 };
-export const NX_DO_PDO = { pdoIndex: 0x7000, subindexBase: 1 };
-export const NX_AI_PDO = { pdoIndex: 0x6010, subindexBase: 1 };
-export const NX_AO_PDO = { pdoIndex: 0x7010, subindexBase: 1 };
-
-// NX-RS1201 load cell: the weight-value PDO entry, plus the calibration
-// command/response field indexes Omron's W565 manual documents for
-// program-driven calibration. The calibration handshake itself (writing
-// Ch1 Calibration Command/Data and polling the Response SID) is NOT
-// implemented yet — it needs the actual module on the bench to validate
-// safely, since a wrong write can mis-calibrate a scale. PLACEHOLDERS.
-export const NX_RS1201_PDO = {
-  weightIndex: 0x6020, weightSubindex: 0x01,
-  statusIndex: 0x6020, statusSubindex: 0x02,
-};
-
-// NX_CARD_PRODUCT_ID: EtherCAT product ID per model, needed for
-// ecrt_master_slave_config — genuinely differs per model, unlike the PDO
-// addressing above. All PLACEHOLDERS — confirm with `ethercat slaves -v`.
-export const NX_CARD_PRODUCT_ID: Record<string, number> = {
-  'NX-ID5442': 0x00000000,
-  'NX-ID5342': 0x00000000,
-  'NX-ID4342': 0x00000000,
-  'NX-ID4442': 0x00000000,
-  'NX-IA3117': 0x00000000,
-  'NX-OD5256': 0x00000000,
-  'NX-OD4256': 0x00000000,
-  'NX-OC4633': 0x00000000,
-  'NX-OC2633': 0x00000000,
-  'NX-AD4203': 0x00000000,
-  'NX-AD4603': 0x00000000,
-  'NX-AD2203': 0x00000000,
-  'NX-AD3203': 0x00000000,
-  'NX-DA2203': 0x00000000,
-  'NX-DA3203': 0x00000000,
-  'NX-DA3603': 0x00000000,
-  'NX-RS1201': 0x00000000,
-};
+// A card's EtherCAT product ID and PDO map are no longer hand-maintained
+// placeholder tables — verifyEthercatRack() in src/ethercat.ts reads both
+// live off the bus (`ethercat slaves -p <slot> -v` / `ethercat pdos -p
+// <slot>`) during a Read Rack, and stores them right on the card below.
+// There is nothing to edit in source for a new card model: wire it up,
+// assign its slot in the HMI, click Read Rack.
+export interface PdoEntry {
+  index: number;
+  subindex: number;
+  bits: number;
+  dir: 'input' | 'output';
+}
 
 export interface IoRackCard {
   slot: number;
   model: string;
   actual?: string;
   status: 'unchecked' | 'ok' | 'mismatch' | 'missing';
+  productId?: number;      // discovered by verifyEthercatRack(), not configured
+  pdoEntries?: PdoEntry[];  // discovered by verifyEthercatRack(), in physical point order per direction
 }
 
 export interface OmronConfig {
