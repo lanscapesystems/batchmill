@@ -43,7 +43,7 @@ MAC="$(cat "/sys/class/net/$IFACE/address")"
 log "installing build dependencies"
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
-  build-essential autoconf automake libtool pkg-config git \
+  build-essential autoconf automake libtool pkg-config git rsync \
   "linux-headers-$(uname -r)" >/dev/null
 command -v node >/dev/null || die "node is not installed — install Node.js 20+ first, then re-run"
 NODE_BIN="$(command -v node)"

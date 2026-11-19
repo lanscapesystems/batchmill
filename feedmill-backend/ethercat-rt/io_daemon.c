@@ -187,6 +187,7 @@ static void load_config(const char *path) {
             channel_t *c = &channels[n_channels++];
             memset(c, 0, sizeof(*c));
             strncpy(c->signal_id, sig, sizeof(c->signal_id) - 1);
+            c->signal_id[sizeof(c->signal_id) - 1] = '\0'; /* belt-and-suspenders; memset above already guarantees this */
             c->slave_idx = si;
             c->dir = parse_dir(dirstr);
             c->pdo_index = (uint16_t)idx;
