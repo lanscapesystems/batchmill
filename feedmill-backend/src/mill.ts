@@ -140,6 +140,12 @@ export class Mill {
     if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return;
     const result = checkRackPresence(om);
     om.cards = result.cards;
+    if (result.unreachable) {
+      // Can't verify at all — fail safe with the same shutdown response as a
+      // genuine mismatch, not a bare fault with no protective action.
+      this.rackFaultShutdown([`cannot verify rack: ${result.unreachable}`]);
+      return;
+    }
     this.verifyRack();
   }
 

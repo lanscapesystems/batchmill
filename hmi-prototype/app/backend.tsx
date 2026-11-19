@@ -182,8 +182,14 @@ export function useBackend(): BackendState | null {
   return useContext(BackendCtx);
 }
 
+// Same-origin by default: the page is loaded through nginx on :80 (see
+// install.sh), which proxies /ws/hmi to the backend on 127.0.0.1:3001 —
+// so "this page's own host" is always the right address, from any device
+// on the network. The ?backend= override remains for local dev against
+// `next dev` + a bare backend (no nginx in front).
 const BACKEND_WS = typeof window !== 'undefined'
-  ? (new URLSearchParams(window.location.search).get('backend') ?? 'ws://localhost:3001/ws/hmi')
+  ? (new URLSearchParams(window.location.search).get('backend') ??
+     `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/hmi`)
   : 'ws://localhost:3001/ws/hmi';
 
 export function BackendProvider({ children }: { children: ReactNode }) {

@@ -46,7 +46,7 @@ MAC="$(cat "/sys/class/net/$IFACE/address")"
 log "installing build dependencies"
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
-  build-essential autoconf automake libtool pkg-config git rsync \
+  build-essential autoconf automake libtool pkg-config git rsync nginx \
   "linux-headers-$(uname -r)" >/dev/null
 command -v node >/dev/null || die "node is not installed — install Node.js 22+ first, then re-run"
 NODE_BIN="$(command -v node)"
@@ -115,6 +115,18 @@ id "$APP_USER" >/dev/null 2>&1 || useradd --system --home "$APP_DIR" --shell /us
 mkdir -p "$APP_DIR" "$DATA_DIR"
 chown -R "$APP_USER:$APP_USER" "$DATA_DIR" "$CONF_DIR"
 usermod -aG dialout "$APP_USER" # serial scalehead access (ScaleConfig connectionType 'serial')
+
+# The kernel module creates /dev/EtherCAT0 root-owned by default — without
+# this, every `ethercat` CLI call the backend makes (as the unprivileged
+# $APP_USER) fails with EACCES, and getMasterStatus() reports it as
+# unreachable (surfaced in the HMI as "cannot reach the EtherCAT master").
+getent group ethercat >/dev/null || groupadd --system ethercat
+usermod -aG ethercat "$APP_USER"
+cat >/etc/udev/rules.d/99-feedmill-ethercat.rules <<'EOF'
+KERNEL=="EtherCAT[0-9]*", GROUP="ethercat", MODE="0660"
+EOF
+udevadm control --reload-rules
+udevadm trigger # re-applies the new rule to a device node from an earlier run too
 
 # the backend must be able to restart the daemon after regenerating its
 # config (ecrt can't hot-add PDO registrations to an active master)
@@ -195,15 +207,73 @@ else
   log "hmi-prototype not found as a sibling of this checkout — skipping HMI deploy"
 fi
 
-# ---- 7. enable + (re)start everything -----------------------------------
+# ---- 7. nginx: the one externally-reachable port (80) --------------------
+# The backend (127.0.0.1:3001) and HMI (127.0.0.1:3000) both bind loopback-
+# only, by design — nothing but nginx is meant to reach them. This is what
+# makes the HMI reachable from other devices on the network while keeping
+# the backend port closed to it.
+log "configuring nginx on port 80"
+rm -f /etc/nginx/sites-enabled/default
+if [[ -n "$HMI_SRC_DIR" ]]; then
+  ROOT_LOCATION='
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }'
+else
+  ROOT_LOCATION='
+    location / {
+        default_type text/plain;
+        return 404 "feedmill backend only on this host -- no HMI deployed\n";
+    }'
+fi
+cat >/etc/nginx/conf.d/feedmill.conf <<EOF
+server {
+    listen 80 default_server;
+
+    location /ws/hmi {
+        proxy_pass http://127.0.0.1:3001/ws/hmi;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:3001/api/;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }
+$ROOT_LOCATION
+}
+EOF
+nginx -t || die "generated nginx config is invalid"
+
+# ---- 8. enable + (re)start everything -----------------------------------
+# `enable --now` only STARTS a unit that isn't running yet — it won't pick
+# up a rebuilt binary or changed code on a re-run. feedmill-io-daemon and
+# feedmill-backend both get rebuilt from source every run (steps 3 and 5),
+# so they're explicitly restarted below, not just enabled. That's a brief,
+# deliberate interruption to real I/O and the control loop — don't re-run
+# this installer while a batch is actively running real outputs.
+# ethercat.service (the kernel modules) is left as enable-only: reloading
+# it tears down the whole EtherCAT bus, which is more disruptive and only
+# actually needed if the NIC/MAC changed — do that by hand if so.
 log "enabling and starting services"
 systemctl daemon-reload
 systemctl enable --now ethercat.service
-systemctl enable --now feedmill-io-daemon.service
-systemctl enable --now feedmill-backend.service
+systemctl enable feedmill-io-daemon.service
+systemctl restart feedmill-io-daemon.service
+systemctl enable feedmill-backend.service
+systemctl restart feedmill-backend.service
 if [[ -n "$HMI_SRC_DIR" ]]; then
-  systemctl enable --now feedmill-hmi.service
+  systemctl enable feedmill-hmi.service
+  systemctl restart feedmill-hmi.service
 fi
+systemctl enable --now nginx
+systemctl reload nginx # picks up the config even when nginx was already running from an earlier install
 
 cat <<EOF
 
@@ -222,13 +292,13 @@ Done. Still required before trusting ANY real I/O point:
      before relying on it.
   4. For an NX-RS1201 scale: the calibration handshake isn't implemented
      yet (see scaleReader.ts) — only the raw weight PDO read is wired up.
-  5. The HMI defaults to ws://localhost:3001/ws/hmi, which means "this
-     browser's own machine" — fine if you're opening it on this box, but
-     an operator on another workstation needs
-     http://<this-box-ip>:3000?backend=ws://<this-box-ip>:3001/ws/hmi
-     until that default is made environment-aware.
+
+Open the HMI from any device on the network at http://<this-box-ip>/ —
+nginx on port 80 is the only externally-reachable door; the backend
+(127.0.0.1:3001) and the HMI's own Next.js process (127.0.0.1:3000) are
+both loopback-only and unreachable directly, by design.
 
 Check status with:
-  systemctl status ethercat.service feedmill-io-daemon.service feedmill-backend.service feedmill-hmi.service
+  systemctl status ethercat.service feedmill-io-daemon.service feedmill-backend.service feedmill-hmi.service nginx
   journalctl -u feedmill-backend -u feedmill-io-daemon -u feedmill-hmi -f
 EOF

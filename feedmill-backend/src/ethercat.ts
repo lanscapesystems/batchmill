@@ -11,6 +11,7 @@ const PDO_DIR_BY_SIGNAL: Record<'DI' | 'DO' | 'AI' | 'AO', PdoEntry['dir']> = {
 
 export interface EthercatMasterStatus {
   toolAvailable: boolean;
+  error?: string; // why toolAvailable is false — e.g. "ENOENT" (not installed) vs an EACCES permission message
   phase?: string;
   linkUp?: boolean;
   slaveCount?: number;
@@ -22,11 +23,17 @@ export interface EthercatSlave {
   name: string;
 }
 
-function runEthercat(args: string[]): string | null {
+function runEthercat(args: string[]): { out: string | null; error?: string } {
   try {
-    return execFileSync('ethercat', args, { encoding: 'utf8', timeout: 3000 });
-  } catch {
-    return null;
+    return { out: execFileSync('ethercat', args, { encoding: 'utf8', timeout: 3000 }) };
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException & { stderr?: Buffer | string };
+    if (e.code === 'ENOENT') return { out: null, error: 'ethercat CLI not found on PATH' };
+    const stderr = e.stderr ? String(e.stderr).trim() : '';
+    // Most common real cause on a freshly-installed box: the backend runs as an
+    // unprivileged user, and /dev/EtherCAT0 is root-owned until a udev rule grants
+    // group access (see install.sh) — that shows up here as an EACCES in stderr/message.
+    return { out: null, error: stderr || e.message || 'ethercat command failed' };
   }
 }
 
@@ -34,8 +41,8 @@ function runEthercat(args: string[]): string | null {
 // `ethercat master`/`ethercat slaves` samples, not live hardware). If the installed IgH
 // version's column layout differs, update these regexes against `ethercat --version`.
 export function getMasterStatus(): EthercatMasterStatus {
-  const out = runEthercat(['master']);
-  if (out === null) return { toolAvailable: false };
+  const { out, error } = runEthercat(['master']);
+  if (out === null) return { toolAvailable: false, error };
   const phase = /Phase:\s*(.+)/.exec(out)?.[1]?.trim();
   const slaveCountStr = /Slaves:\s*(\d+)/.exec(out)?.[1];
   const linkMatch = /Link:\s*(UP|DOWN)/i.exec(out);
@@ -48,7 +55,7 @@ export function getMasterStatus(): EthercatMasterStatus {
 }
 
 export function listSlaves(): EthercatSlave[] {
-  const out = runEthercat(['slaves']);
+  const { out } = runEthercat(['slaves']);
   if (out === null) return [];
   const slaves: EthercatSlave[] = [];
   for (const line of out.split('\n')) {
@@ -65,7 +72,7 @@ export function listSlaves(): EthercatSlave[] {
 // if it comes back undefined for a real slave, run `ethercat slaves -p
 // <pos> -v` by hand and fix this regex to match what your IgH version prints.
 function getSlaveProductId(position: number): number | null {
-  const out = runEthercat(['slaves', '-p', String(position), '-v']);
+  const { out } = runEthercat(['slaves', '-p', String(position), '-v']);
   if (out === null) return null;
   const m = /Product code:\s*0x([0-9a-fA-F]+)/.exec(out);
   return m ? parseInt(m[1], 16) : null;
@@ -79,7 +86,7 @@ function getSlaveProductId(position: number): number | null {
 // against a real `ethercat pdos -p <pos>` dump and fix the regexes below
 // if your IgH version's wording differs.
 function getSlavePdoEntries(position: number): PdoEntry[] {
-  const out = runEthercat(['pdos', '-p', String(position)]);
+  const { out } = runEthercat(['pdos', '-p', String(position)]);
   if (out === null) return [];
   const entries: PdoEntry[] = [];
   let dir: PdoEntry['dir'] | null = null;
@@ -116,7 +123,7 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
   if (!master.toolAvailable) {
     return {
       cards: om.cards.map(c => ({ ...c, actual: c.model, status: 'ok' as const })),
-      warnings: ['ethercat master tool not found on this host — showing simulated rack, not a live read'],
+      warnings: [`cannot reach the EtherCAT master (${master.error ?? 'unknown reason'}) — showing an unverified rack, not a live read`],
     };
   }
 
@@ -155,15 +162,21 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
  * PDO discovery (two more blocking `ethercat` CLI calls per card), so it's safe
  * to run every few seconds from Mill's background timer without stalling the
  * control loop. Never touches om.discoveredModels or card.productId/pdoEntries
- * — only a full Read Rack refreshes those. */
-export function checkRackPresence(om: OmronConfig): { cards: IoRackCard[]; warnings: string[] } {
+ * — only a full Read Rack refreshes those.
+ *
+ * If the master itself can't be reached, that's treated as every card going
+ * missing (can't verify == can't trust), not silently skipped — losing the
+ * ability to check the rack at all is worse than a single wrong card, and the
+ * watchdog must fail safe, not fail silent. */
+export function checkRackPresence(om: OmronConfig): { cards: IoRackCard[]; unreachable?: string } {
   const master = getMasterStatus();
-  if (!master.toolAvailable) return { cards: om.cards, warnings: [] };
-  const warnings: string[] = [];
-  if (master.linkUp === false) {
-    warnings.push(`EtherCAT link down on ${om.ethercatInterface || 'the configured NIC'}`);
+  if (!master.toolAvailable) {
+    return {
+      cards: om.cards.map(c => ({ ...c, actual: undefined, status: 'missing' as const })),
+      unreachable: master.error ?? 'unknown reason',
+    };
   }
-  return { cards: matchCardsToSlaves(om.cards, listSlaves()), warnings };
+  return { cards: matchCardsToSlaves(om.cards, listSlaves()) };
 }
 
 /** Builds the io_daemon's full channel config from every signal currently

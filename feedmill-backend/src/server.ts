@@ -11,6 +11,11 @@ let PKG_VERSION = '0.0.0';
 try { PKG_VERSION = JSON.parse(fs.readFileSync('package.json', 'utf-8')).version; } catch {}
 
 const PORT = parseInt(process.env.PORT ?? '3001', 10);
+// Loopback-only by default — this port carries no auth of its own, so it
+// must never be reachable from the network directly. nginx (see install.sh)
+// is the one thing that's supposed to reach it, proxying /ws/hmi and /api/
+// from the HMI's port 80 to here. Override only for local dev.
+const HOST = process.env.HOST ?? '127.0.0.1';
 const BROADCAST_INTERVAL_MS = 200;
 
 const app = express();
@@ -143,9 +148,9 @@ setInterval(() => {
   broadcastToHmi(mill.getSnapshot());
 }, BROADCAST_INTERVAL_MS);
 
-server.listen(PORT, () => {
-  console.log(`Feed Mill Backend running on http://localhost:${PORT}`);
-  console.log(`  HMI WebSocket:       ws://localhost:${PORT}/ws/hmi`);
-  console.log(`  REST API:            http://localhost:${PORT}/api/v1/state`);
-  console.log(`  Health:              http://localhost:${PORT}/api/v1/health`);
+server.listen(PORT, HOST, () => {
+  console.log(`Feed Mill Backend running on http://${HOST}:${PORT} (not reachable from the network — see nginx)`);
+  console.log(`  HMI WebSocket:       ws://${HOST}:${PORT}/ws/hmi`);
+  console.log(`  REST API:            http://${HOST}:${PORT}/api/v1/state`);
+  console.log(`  Health:              http://${HOST}:${PORT}/api/v1/health`);
 });
