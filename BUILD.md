@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Node.js 20+
+- Node.js 22+ (feedmill-backend's better-sqlite3 version requires it)
 - npm
 
 ## Project structure

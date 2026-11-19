@@ -186,8 +186,7 @@ static void load_config(const char *path) {
             if (n_channels >= MAX_CHANNELS) { fprintf(stderr, "io_daemon: too many channels\n"); exit(1); }
             channel_t *c = &channels[n_channels++];
             memset(c, 0, sizeof(*c));
-            strncpy(c->signal_id, sig, sizeof(c->signal_id) - 1);
-            c->signal_id[sizeof(c->signal_id) - 1] = '\0'; /* belt-and-suspenders; memset above already guarantees this */
+            snprintf(c->signal_id, sizeof(c->signal_id), "%s", sig); /* truncates safely; strncpy triggers -Wstringop-truncation here */
             c->slave_idx = si;
             c->dir = parse_dir(dirstr);
             c->pdo_index = (uint16_t)idx;

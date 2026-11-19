@@ -45,8 +45,10 @@ apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   build-essential autoconf automake libtool pkg-config git rsync \
   "linux-headers-$(uname -r)" >/dev/null
-command -v node >/dev/null || die "node is not installed — install Node.js 20+ first, then re-run"
+command -v node >/dev/null || die "node is not installed — install Node.js 22+ first, then re-run"
 NODE_BIN="$(command -v node)"
+NODE_MAJOR="$(node -v | sed 's/^v//' | cut -d. -f1)"
+[[ "$NODE_MAJOR" -ge 22 ]] || die "Node.js 22+ required (found $(node -v)) — better-sqlite3 needs it; reinstall with setup_22.x from deb.nodesource.com"
 
 # ---- 2. IgH EtherCAT Master (generic driver — works on any NIC) -------
 if command -v ethercat >/dev/null && [[ -f /usr/local/include/ecrt.h ]]; then
@@ -124,13 +126,13 @@ log "deploying app to $APP_DIR"
 rsync -a --delete \
   --exclude node_modules --exclude dist --exclude data --exclude install \
   "$PROJECT_DIR"/ "$APP_DIR"/
+chown -R "$APP_USER:$APP_USER" "$APP_DIR" # must happen before npm runs as $APP_USER below, not after
 (
   cd "$APP_DIR"
   sudo -u "$APP_USER" npm ci --no-audit --no-fund
   sudo -u "$APP_USER" npm run build
   sudo -u "$APP_USER" npm prune --omit=dev --no-audit --no-fund
 )
-chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 
 cat >/etc/systemd/system/feedmill-backend.service <<EOF
 [Unit]
