@@ -8,7 +8,7 @@ import {
   EQUIPMENT_DEFS,
 } from './types.js';
 import { listCandidateNics } from './network.js';
-import { verifyEthercatRack, syncIoConf } from './ethercat.js';
+import { verifyEthercatRack, syncIoConf, checkRackPresence } from './ethercat.js';
 import { readIoState, writeIoCommand } from './ioDaemon.js';
 import { loadConfig, saveConfig, type MillConfig } from './config.js';
 import {
@@ -17,6 +17,11 @@ import {
 } from './db.js';
 
 const SCAN_MS = 100;
+// How often the rack watchdog polls `ethercat slaves` for a card going missing/
+// mismatched after commissioning. Deliberately NOT inside scan() — it shells out
+// to the ethercat CLI (blocking, up to its 3s timeout), which the 100ms control
+// loop can't afford.
+const RACK_WATCHDOG_MS = 3000;
 const SETTLE_MS = 2000;
 const DISCHARGE_TIMEOUT_MS = 60000;
 // All delay settings are stored in seconds (0.1 s steps, like a 100 ms PLC timer); the scan runs in ms.
@@ -65,13 +70,14 @@ export class Mill {
   ioOverrides: Record<string, SignalValue> = {};
   scaleConfigs: ScaleConfig[] = [];
   scaleConfigVersion = 0; // bumped on ConfigureScale/RemoveScale — server.ts watches this to restart scale readers
-  omronConfig: OmronConfig = { couplerType: 'none', ipAddress: '', nodeAddress: 1, ethercatInterface: '', eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
+  omronConfig: OmronConfig = { couplerType: 'none', ipAddress: '', nodeAddress: 1, ethercatInterface: '', eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [], discoveredModels: {} };
   globalConfig: Record<string, string | number> = { motorStarterFaultDelay: 0.5, siteName: 'FEED MILL CONTROLLER' };
   networkInterfaces: string[] = listCandidateNics(); // computed once at startup; restart the service to pick up newly added NICs
   private faultSeq = 300;
   private batchSeq = 2000;
   private batchPersistCounter = 0;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
+  private rackWatchdogHandle: ReturnType<typeof setInterval> | null = null;
   private onChange?: () => void;
 
   constructor() {
@@ -115,11 +121,26 @@ export class Mill {
   start(onChange: () => void) {
     this.onChange = onChange;
     this.intervalHandle = setInterval(() => this.scan(), SCAN_MS);
+    this.rackWatchdogHandle = setInterval(() => this.rackWatchdogCheck(), RACK_WATCHDOG_MS);
   }
 
   stop() {
     if (this.intervalHandle) clearInterval(this.intervalHandle);
+    if (this.rackWatchdogHandle) clearInterval(this.rackWatchdogHandle);
     closeDb();
+  }
+
+  // Confirmed-good rack, left running: re-checks presence/identity against
+  // the bus every RACK_WATCHDOG_MS and faults (E-OM-01, via verifyRack) if a
+  // card goes missing or changes — same check Read Rack does, minus the
+  // per-card PDO discovery, so it's cheap enough to poll continuously.
+  // Doesn't run until the operator has confirmed the rack once (rackVerified).
+  private rackWatchdogCheck() {
+    const om = this.omronConfig;
+    if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return;
+    const result = checkRackPresence(om);
+    om.cards = result.cards;
+    this.verifyRack();
   }
 
   private applyConfig(cfg: MillConfig): void {
@@ -391,6 +412,7 @@ export class Mill {
       case 'ReadOmronRack': {
         if (this.omronConfig.couplerType === 'none') return reject('No coupler configured');
         this.readOmronRack();
+        this.persistConfig(); // discoveredModels must survive a restart, or every reboot would need a fresh Read Rack
         return ok();
       }
 
@@ -713,6 +735,7 @@ export class Mill {
           cards,
           rackVerified: false,
           warnings: [],
+          discoveredModels: this.omronConfig.discoveredModels, // survives reconfiguration — it's per-model, not per-card
         };
         this.validateRack();
         this.clearRackFault();
@@ -1630,6 +1653,8 @@ export class Mill {
     }
     if (mismatched.length > 0) {
       this.rackFaultShutdown(mismatched);
+    } else {
+      this.clearRackFault(); // rack matches again (e.g. a reseated card) — the watchdog resolves this on its own
     }
   }
 
@@ -1652,6 +1677,7 @@ export class Mill {
     if (idx >= 0) {
       this.faults[idx].active = false;
       this.faults[idx].clearedAt = new Date().toISOString();
+      persistFault(this.faults[idx]); // now runs from the watchdog too, not just on reconfigure — keep fault_log in sync
     }
   }
 

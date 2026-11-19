@@ -349,5 +349,10 @@ export interface OmronConfig {
   rackVerified: boolean;
   lastReadAt?: string;
   warnings: string[];
+  // Product ID + PDO map are properties of the card MODEL (its SII/ESI, set
+  // by Omron), not of a specific slot — once Read Rack has confirmed one
+  // card of a given model, every other card of that model reuses this
+  // without a new bus read. Keyed by IoRackCard.model.
+  discoveredModels: Record<string, { productId: number; pdoEntries: PdoEntry[] }>;
 }
 

@@ -94,8 +94,23 @@ function getSlavePdoEntries(position: number): PdoEntry[] {
   return entries;
 }
 
+// card.slot IS the EtherCAT bus position — set from the HMI's I/O Config tab
+// to match the module's actual physical port on the daisy chain, no CLI
+// needed. Shared by the full verify (below, with discovery) and the cheap
+// watchdog presence check (checkRackPresence) — neither re-derives this.
+function matchCardsToSlaves(cards: IoRackCard[], slaves: EthercatSlave[]): IoRackCard[] {
+  return cards.map(card => {
+    const slave = slaves.find(s => s.position === card.slot);
+    if (!slave) return { ...card, actual: undefined, status: 'missing' as const };
+    const matches = slave.name.toUpperCase().includes(card.model.toUpperCase());
+    return { ...card, actual: slave.name, status: matches ? 'ok' as const : 'mismatch' as const };
+  });
+}
+
 /** Real rack verification via the IgH `ethercat` CLI, with a simulated echo fallback
- * when the tool isn't installed (dev machine, or master not set up yet on the target). */
+ * when the tool isn't installed (dev machine, or master not set up yet on the target).
+ * For each card that matches, also discovers its product ID and PDO map and caches
+ * them on om.discoveredModels by model — a one-time cost per model, not per card. */
 export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warnings: string[] } {
   const master = getMasterStatus();
   if (!master.toolAvailable) {
@@ -124,23 +139,31 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
     warnings.push(`Coupler at position 0 reports "${coupler.name}", expected ${om.eccModel}`);
   }
 
-  const cards: IoRackCard[] = om.cards.map(card => {
-    // card.slot IS the EtherCAT bus position — set from the HMI's I/O Config
-    // tab to match the module's actual physical port on the daisy chain, no
-    // CLI needed. Only trust discovered data when the model at that
-    // position actually matches what's configured.
-    const slave = slaves.find(s => s.position === card.slot);
-    if (!slave) return { ...card, actual: undefined, status: 'missing' as const };
-    const matches = slave.name.toUpperCase().includes(card.model.toUpperCase());
-    if (!matches) return { ...card, actual: slave.name, status: 'mismatch' as const };
-    return {
-      ...card, actual: slave.name, status: 'ok' as const,
-      productId: getSlaveProductId(card.slot) ?? undefined,
-      pdoEntries: getSlavePdoEntries(card.slot),
-    };
+  const cards = matchCardsToSlaves(om.cards, slaves).map(card => {
+    if (card.status !== 'ok') return card;
+    const productId = getSlaveProductId(card.slot) ?? undefined;
+    const pdoEntries = getSlavePdoEntries(card.slot);
+    if (productId !== undefined) om.discoveredModels[card.model] = { productId, pdoEntries };
+    return { ...card, productId, pdoEntries };
   });
 
   return { cards, warnings };
+}
+
+/** Cheap, poll-safe rack presence check for the watchdog — same card-to-slave
+ * matching as verifyEthercatRack() above, but WITHOUT the per-card product-ID/
+ * PDO discovery (two more blocking `ethercat` CLI calls per card), so it's safe
+ * to run every few seconds from Mill's background timer without stalling the
+ * control loop. Never touches om.discoveredModels or card.productId/pdoEntries
+ * — only a full Read Rack refreshes those. */
+export function checkRackPresence(om: OmronConfig): { cards: IoRackCard[]; warnings: string[] } {
+  const master = getMasterStatus();
+  if (!master.toolAvailable) return { cards: om.cards, warnings: [] };
+  const warnings: string[] = [];
+  if (master.linkUp === false) {
+    warnings.push(`EtherCAT link down on ${om.ethercatInterface || 'the configured NIC'}`);
+  }
+  return { cards: matchCardsToSlaves(om.cards, listSlaves()), warnings };
 }
 
 /** Builds the io_daemon's full channel config from every signal currently
@@ -149,9 +172,11 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
  * verified rack are the single source of truth for what's wired where. A
  * signal is marked for edge-counting ("count") when some equipment has it
  * assigned as rotationPulseInput. Product IDs and PDO addresses come from
- * each card's last Read Rack (verifyEthercatRack) — nothing here is a
- * hand-maintained hardware table, so a card with no discovered data yet
- * just produces a warning telling the operator to run Read Rack. */
+ * om.discoveredModels, keyed by card model — populated the first time any
+ * card of that model is confirmed by Read Rack, then reused for every
+ * other card of that model with no further bus access. A model nobody has
+ * ever confirmed just produces a warning telling the operator to run Read
+ * Rack once. */
 export function generateIoConf(
   om: OmronConfig, signals: Iterable<SignalDef>, equipment: Iterable<EquipmentRuntime>, scaleConfigs: Iterable<ScaleConfig>,
 ): { conf: string; warnings: string[] } {
@@ -166,17 +191,22 @@ export function generateIoConf(
     slaveLines.set(slot, `slave ${slot} 0x${vid} 0x${pid}`);
   };
 
+  const discoveryFor = (card: IoRackCard) =>
+    om.discoveredModels[card.model] ??
+    (card.productId !== undefined ? { productId: card.productId, pdoEntries: card.pdoEntries ?? [] } : undefined);
+
   for (const sc of scaleConfigs) {
     if (sc.connectionType !== 'rs1201') continue;
     const card = om.cards.find(c => c.slot === sc.rackSlot);
     if (!card) { warnings.push(`${sc.name}: no card in slot ${sc.rackSlot}`); continue; }
     const def = NX_CARD_CATALOG.find(d => d.model === card.model);
     if (!def || def.category !== 'scale') { warnings.push(`${sc.name}: ${card.model} is not a load cell card`); continue; }
-    if (card.productId === undefined) { warnings.push(`${sc.name}: run Read Rack — no discovered product ID for slot ${sc.rackSlot}`); continue; }
+    const discovered = discoveryFor(card);
+    if (!discovered) { warnings.push(`${sc.name}: run Read Rack once for a ${card.model} card — nothing discovered for it yet`); continue; }
     // RS1201 convention, unverified: the weight value is its first input PDO entry.
-    const weightEntry = card.pdoEntries?.find(e => e.dir === 'input');
-    if (!weightEntry) { warnings.push(`${sc.name}: run Read Rack — no discovered weight PDO entry for slot ${sc.rackSlot}`); continue; }
-    addSlave(sc.rackSlot, card.productId);
+    const weightEntry = discovered.pdoEntries.find(e => e.dir === 'input');
+    if (!weightEntry) { warnings.push(`${sc.name}: ${card.model}'s discovered PDO map has no input entry for weight`); continue; }
+    addSlave(sc.rackSlot, discovered.productId);
     const idx = weightEntry.index.toString(16).padStart(4, '0');
     const sub = weightEntry.subindex.toString(16).padStart(2, '0');
     channelLines.push(`channel SC:${sc.id} ${sc.rackSlot} SCALE 0x${idx} 0x${sub}`);
@@ -195,12 +225,13 @@ export function generateIoConf(
     if (!card) { warnings.push(`${sig.id}: no card in slot ${slot}`); continue; }
     const def = NX_CARD_CATALOG.find(d => d.model === card.model);
     if (!def || def.category !== sig.direction) { warnings.push(`${sig.id}: ${card.model} is not a ${sig.direction} card`); continue; }
-    if (card.productId === undefined) { warnings.push(`${sig.id}: run Read Rack — no discovered product ID for slot ${slot}`); continue; }
+    const discovered = discoveryFor(card);
+    if (!discovered) { warnings.push(`${sig.id}: run Read Rack once for a ${card.model} card — nothing discovered for it yet`); continue; }
     const wantDir = PDO_DIR_BY_SIGNAL[sig.direction];
-    const entry = (card.pdoEntries ?? []).filter(e => e.dir === wantDir)[point];
-    if (!entry) { warnings.push(`${sig.id}: run Read Rack — no discovered PDO entry for point ${point} on slot ${slot}`); continue; }
+    const entry = discovered.pdoEntries.filter(e => e.dir === wantDir)[point];
+    if (!entry) { warnings.push(`${sig.id}: ${card.model}'s discovered PDO map has no ${wantDir} entry for point ${point}`); continue; }
 
-    addSlave(slot, card.productId);
+    addSlave(slot, discovered.productId);
     const index = entry.index.toString(16).padStart(4, '0');
     const subindex = entry.subindex.toString(16).padStart(2, '0');
     const countFlag = sig.direction === 'DI' && rotationSignals.has(sig.id) ? ' count' : '';
