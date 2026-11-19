@@ -43,27 +43,32 @@
  *      are installed (the install/install.sh script does this):
  *        gcc -O2 -Wall -o io-daemon io_daemon.c -lethercat -lpthread -lrt
  *
- *   2. Vendor/product IDs and PDO index:subindex are no longer hand
+ *   2. Vendor/product ID and the PDO entry list are no longer hand
  *      -maintained tables — src/ethercat.ts's verifyEthercatRack() reads
- *      them live off the bus (`ethercat slaves -p <pos> -v` / `ethercat
- *      pdos -p <pos>`) whenever the HMI's Read Rack runs, and this file's
- *      config is generated from that. Those two CLI commands' output
- *      format is parsed by getSlaveProductId()/getSlavePdoEntries() in
- *      ethercat.ts from documented samples, not verified against a real
- *      box — if Read Rack comes back with cards stuck "ok" but channels
- *      missing from here, check those regexes against your IgH version's
- *      actual output first.
+ *      them live off the bus (`ethercat slaves -p 0 -v` / `ethercat pdos
+ *      -p 0`) whenever the HMI's Read Rack runs, and this file's config
+ *      is generated from that. CONFIRMED on a real NX-ECC203: the coupler
+ *      + every NX module behind it is ONE EtherCAT slave (position 0),
+ *      not one per card — so every "slave" line below is that same
+ *      coupler, and a digital card's 16 points all share ONE PDO entry
+ *      (e.g. 0x6022:01, 16 bit), addressed as a BIT within it, not 16
+ *      separate entries. The config's explicit bit field (below) carries
+ *      that addressing — this program does not compute it from a point
+ *      number. Those two CLI commands' output format is parsed by
+ *      getSlaveProductId()/getRackPdoEntries() in ethercat.ts — if Read
+ *      Rack comes back with cards stuck "ok" but channels missing from
+ *      here, check those regexes against your IgH version's actual output
+ *      first.
  *
- *   3. This assumes every AI/AO entry is a 16-bit signed word and every
- *      SCALE (NX-RS1201 weight) entry is a 32-bit signed value, both at
- *      a byte-aligned offset — true for Omron NX-AD/NX-DA's documented
- *      default mapping, but confirm per module, including the RS1201's
- *      actual weight-value width/format in the W565 manual. Registration
- *      assumes
- *      the slave's default (SII/ESI) PDO mapping already exposes the
- *      index:subindex used; if the active mapping differs, call
- *      ecrt_slave_config_pdos() with an explicit sync-manager/PDO list
- *      before ecrt_slave_config_reg_pdo_entry().
+ *   3. Analog (AI/AO) and SCALE (NX-RS1201 weight) entries are each their
+ *      OWN whole PDO entry (one per channel, not packed into bits like
+ *      digital) — AI/AO assumed 16-bit signed, SCALE assumed 32-bit
+ *      signed, both byte-aligned. UNVERIFIED — no real analog/RS1201 PDO
+ *      dump seen yet; confirm per module against the W565/W519 manuals.
+ *      Registration assumes the slave's default (SII/ESI) PDO mapping
+ *      already exposes the index:subindex used; if the active mapping
+ *      differs, call ecrt_slave_config_pdos() with an explicit sync
+ *      -manager/PDO list before ecrt_slave_config_reg_pdo_entry().
  *
  *   4. Run as its own systemd service (feedmill-io-daemon.service),
  *      independent of the Node backend's lifecycle — see that unit.
@@ -96,9 +101,10 @@ typedef struct {
     uint16_t   pdo_index;
     uint8_t    pdo_subindex;
     chan_dir_t dir;
+    unsigned   cfg_bit;        /* from config: DI/DO point's bit position within the registered word; 0 and unused for AI/AO/SCALE */
     bool       counted;        /* DI only: also edge-count (rotation sensors) */
-    unsigned   offset;         /* byte offset into the domain process image, set at config time */
-    unsigned   bit;            /* bit position within that byte (DI/DO only) */
+    unsigned   offset;         /* final byte offset into the domain process image, computed at setup time */
+    unsigned   bit;            /* final bit position within that byte (DI/DO only) */
     bool       last_state;     /* DI only — edge detection */
     uint64_t   count;          /* DI+counted only — accessed via __atomic builtins from both threads */
     uint64_t   last_edge_us;
@@ -175,10 +181,10 @@ static void load_config(const char *path) {
 
         } else if (strcmp(kw, "channel") == 0) {
             char sig[32], dirstr[8], flag[8];
-            unsigned pos; unsigned long idx, sub;
+            unsigned pos; unsigned long idx, sub; unsigned bit;
             flag[0] = '\0';
-            int nf = sscanf(line, "%31s %31s %u %7s %lx %lx %7s", kw, sig, &pos, dirstr, &idx, &sub, flag);
-            if (nf != 6 && nf != 7) {
+            int nf = sscanf(line, "%31s %31s %u %7s %lx %lx %u %7s", kw, sig, &pos, dirstr, &idx, &sub, &bit, flag);
+            if (nf != 7 && nf != 8) {
                 fprintf(stderr, "io_daemon: bad channel line: %s", line); exit(1);
             }
             int si = find_slave((uint16_t)pos);
@@ -194,7 +200,8 @@ static void load_config(const char *path) {
             c->dir = parse_dir(dirstr);
             c->pdo_index = (uint16_t)idx;
             c->pdo_subindex = (uint8_t)sub;
-            c->counted = (nf == 7 && strcmp(flag, "count") == 0);
+            c->cfg_bit = bit;
+            c->counted = (nf == 8 && strcmp(flag, "count") == 0);
         }
     }
     fclose(f);
@@ -318,6 +325,11 @@ static void setup_ethercat(void) {
     for (int i = 0; i < n_channels; i++) {
         channel_t *c = &channels[i];
         ec_slave_config_t *sc = slaves[c->slave_idx].sc;
+        /* Multiple channels (e.g. 16 DI points) register the SAME index:subindex —
+         * one whole word shared by every point of that card. ecrt returns the same
+         * base offset each time; bitpos comes back 0 for a multi-bit word entry
+         * (there's no sub-bit to report), so DI/DO must compute their own bit
+         * position from the config's cfg_bit, not trust ecrt's bitpos here. */
         unsigned bitpos = 0;
         int off = ecrt_slave_config_reg_pdo_entry(sc, c->pdo_index, c->pdo_subindex, domain, &bitpos);
         if (off < 0) {
@@ -328,8 +340,13 @@ static void setup_ethercat(void) {
                 slaves[c->slave_idx].position, slaves[c->slave_idx].position);
             exit(1);
         }
-        c->offset = (unsigned)off;
-        c->bit = bitpos;
+        if (c->dir == DIR_DI || c->dir == DIR_DO) {
+            c->offset = (unsigned)off + c->cfg_bit / 8;
+            c->bit = c->cfg_bit % 8;
+        } else {
+            c->offset = (unsigned)off; /* AI/AO/SCALE: the whole registered word/dword, no bit addressing */
+            c->bit = 0;
+        }
     }
 
     if (ecrt_domain_size(domain) <= 0) { fprintf(stderr, "io_daemon: empty domain\n"); exit(1); }

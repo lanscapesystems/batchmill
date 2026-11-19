@@ -315,12 +315,15 @@ export const NX_MAX_UNITS = 63; // Max I/O units per coupler
 
 export const OMRON_VENDOR_ID = 0x00000083;
 
-// A card's EtherCAT product ID and PDO map are no longer hand-maintained
-// placeholder tables — verifyEthercatRack() in src/ethercat.ts reads both
-// live off the bus (`ethercat slaves -p <slot> -v` / `ethercat pdos -p
-// <slot>`) during a Read Rack, and stores them right on the card below.
-// There is nothing to edit in source for a new card model: wire it up,
-// assign its slot in the HMI, click Read Rack.
+// Confirmed on real NX-ECC203 hardware: the coupler + every NX I/O module
+// racked behind it is ONE EtherCAT slave, not one slave per card — Omron's
+// NX bus is an internal backplane the coupler bridges to EtherCAT, invisible
+// to the network. So there's one shared product ID and PDO entry list for
+// the whole rack (DiscoveredRack below), and a card's own entry/entries are
+// a SLICE of that list — which slice depends on the card's position among
+// same-category cards, not just its model, so re-slicing happens fresh
+// every time generateIoConf() runs (see allocateRackEntries in
+// src/ethercat.ts), not once and cached per model.
 export interface PdoEntry {
   index: number;
   subindex: number;
@@ -328,13 +331,18 @@ export interface PdoEntry {
   dir: 'input' | 'output';
 }
 
+export interface DiscoveredRack {
+  productId: number;
+  inputEntries: PdoEntry[];  // in physical rack order among DI/AI/scale cards
+  outputEntries: PdoEntry[]; // in physical rack order among DO/AO cards
+}
+
 export interface IoRackCard {
-  slot: number;
+  slot: number; // position in the physical rack (1st, 2nd module...), NOT an EtherCAT bus position
   model: string;
   actual?: string;
   status: 'unchecked' | 'ok' | 'mismatch' | 'missing';
-  productId?: number;      // discovered by verifyEthercatRack(), not configured
-  pdoEntries?: PdoEntry[];  // discovered by verifyEthercatRack(), in physical point order per direction
+  pdoEntries?: PdoEntry[]; // this card's slice of DiscoveredRack, from the last Read Rack
 }
 
 export interface OmronConfig {
@@ -349,10 +357,6 @@ export interface OmronConfig {
   rackVerified: boolean;
   lastReadAt?: string;
   warnings: string[];
-  // Product ID + PDO map are properties of the card MODEL (its SII/ESI, set
-  // by Omron), not of a specific slot — once Read Rack has confirmed one
-  // card of a given model, every other card of that model reuses this
-  // without a new bus read. Keyed by IoRackCard.model.
-  discoveredModels: Record<string, { productId: number; pdoEntries: PdoEntry[] }>;
+  discoveredRack?: DiscoveredRack; // from the last Read Rack; persists across restarts and reconfiguration
 }
 

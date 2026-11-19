@@ -5,23 +5,31 @@
 # Omron rack and every signal currently mapped to an equipment port —
 # never edit it by hand, it'll just get overwritten.
 #
-# The vendor/product IDs and PDO addresses it's generated from are NOT
-# hand-maintained tables — verifyEthercatRack() in src/ethercat.ts reads
-# them live off the bus (via `ethercat slaves -p <pos> -v` / `ethercat
-# pdos -p <pos>`) every time the HMI's Read Rack command runs, and
-# stores them on each card. There's nothing to edit for a new card
-# model: wire it up, assign its slot in the HMI, click Read Rack.
+# CONFIRMED on a real NX-ECC203: the coupler + every NX module racked
+# behind it is ONE EtherCAT slave (position 0) — there's no separate bus
+# position per card, and a digital card's points all share ONE PDO entry
+# (its point count in bits), addressed as a bit within it, not one entry
+# each. That's why every "slave" line below is the same coupler, and every
+# digital "channel" line carries an explicit bit number as its own field
+# (the daemon doesn't compute it from the point number). Nothing here is
+# a hand-maintained table: wire a card up, assign its slot in the HMI,
+# click Read Rack.
 #
-# What follows is just a worked example of the format the generator
-# produces, for manually testing io_daemon.c before the backend exists
-# on the target:
+# What follows is a worked example of the format the generator produces —
+# the two digital lines are REAL values confirmed from `ethercat pdos -p 0`
+# against an NX-ECC203 + one NX-OD5256 (16 DO) + one NX-ID5442 (16 DI).
+# The AI/AO/SCALE lines are still unverified placeholders (see io_daemon.c's
+# header) — analog/scale channels get one whole PDO entry PER channel
+# (point field in the signal id selects which), not a shared bit-packed
+# word like digital.
 cycle_us 4000
 state_path /run/feedmill/io-state.json
 command_path /run/feedmill/io-command.txt
-slave 2 0x00000083 0x00000000
-slave 3 0x00000083 0x00000000
-channel I:02.00 2 DI 0x6000 0x01
-channel I:02.01 2 DI 0x6000 0x02 count
-channel O:03.00 3 DO 0x7000 0x01
-channel AI:02.00 2 AI 0x6010 0x01
-channel AO:03.00 3 AO 0x7010 0x01
+slave 0 0x00000083 0x00000000
+channel O:01.00 0 DO 0x7002 0x01 0
+channel O:01.01 0 DO 0x7002 0x01 1
+channel I:02.00 0 DI 0x6022 0x01 0
+channel I:02.01 0 DI 0x6022 0x01 1 count
+channel AI:03.00 0 AI 0x6010 0x01 0
+channel AO:03.00 0 AO 0x7010 0x01 0
+channel SC:mixer-scale 0 SCALE 0x6020 0x01 0

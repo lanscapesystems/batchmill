@@ -4,10 +4,6 @@ import type { OmronConfig, IoRackCard, EquipmentRuntime, SignalDef, ScaleConfig,
 import { NX_CARD_CATALOG, OMRON_VENDOR_ID } from './types.js';
 
 const IO_CONF_PATH = process.env.FEEDMILL_IO_CONF_PATH ?? '/etc/feedmill/io.conf';
-// DI/AI points are inputs to the master, DO/AO points are outputs from it.
-const PDO_DIR_BY_SIGNAL: Record<'DI' | 'DO' | 'AI' | 'AO', PdoEntry['dir']> = {
-  DI: 'input', AI: 'input', DO: 'output', AO: 'output',
-};
 
 export interface EthercatMasterStatus {
   toolAvailable: boolean;
@@ -78,46 +74,70 @@ function getSlaveProductId(position: number): number | null {
   return m ? parseInt(m[1], 16) : null;
 }
 
-// shortcut: parses `ethercat pdos -p <pos>`'s documented Sync Manager /
-// PDO entry listing (an "Outputs"/"RxPDO" section is what the master
-// writes; "Inputs"/"TxPDO" is what it reads), collecting each section's
-// "PDO entry 0x####:##, N bit[s]" lines in physical point order. Same
-// caveat as getSlaveProductId: written from documented samples, verify
-// against a real `ethercat pdos -p <pos>` dump and fix the regexes below
-// if your IgH version's wording differs.
-function getSlavePdoEntries(position: number): PdoEntry[] {
+// Parses `ethercat pdos -p <pos>`'s Sync Manager / PDO entry listing — an
+// "RxPDO" section is what the master writes (outputs), "TxPDO" is what it
+// reads (inputs). CONFIRMED against a real NX-ECC203 dump: only entries at
+// index 0x6000-0x6fff (inputs) / 0x7000-0x7fff (outputs) are real channel
+// data (the CoE digital-I/O profile convention) — everything else seen
+// (0x3xxx 64-bit blocks, 0x2xxx status byte, 0x0000 "Gap") is coupler
+// diagnostics/padding, not a card's data. Called ONCE for the whole rack
+// (position 0, the coupler) — see allocateRackEntries for how individual
+// cards' entries get sliced out of the result.
+function getRackPdoEntries(position: number): PdoEntry[] {
   const { out } = runEthercat(['pdos', '-p', String(position)]);
   if (out === null) return [];
   const entries: PdoEntry[] = [];
   let dir: PdoEntry['dir'] | null = null;
   for (const line of out.split('\n')) {
-    if (/\bOutputs\b|\bRxPDO\b/.test(line)) dir = 'output';
-    else if (/\bInputs\b|\bTxPDO\b/.test(line)) dir = 'input';
+    if (/\bRxPDO\b/.test(line)) dir = 'output';
+    else if (/\bTxPDO\b/.test(line)) dir = 'input';
     const m = /PDO entry\s+0x([0-9a-fA-F]+):([0-9a-fA-F]+),\s*(\d+)\s*bit/.exec(line);
-    if (m && dir) {
-      entries.push({ index: parseInt(m[1], 16), subindex: parseInt(m[2], 16), bits: Number(m[3]), dir });
-    }
+    if (!m || !dir) continue;
+    const index = parseInt(m[1], 16);
+    const inRange = dir === 'input' ? (index >= 0x6000 && index <= 0x6fff) : (index >= 0x7000 && index <= 0x7fff);
+    if (inRange) entries.push({ index, subindex: parseInt(m[2], 16), bits: Number(m[3]), dir });
   }
   return entries;
 }
 
-// card.slot IS the EtherCAT bus position — set from the HMI's I/O Config tab
-// to match the module's actual physical port on the daisy chain, no CLI
-// needed. Shared by the full verify (below, with discovery) and the cheap
-// watchdog presence check (checkRackPresence) — neither re-derives this.
-function matchCardsToSlaves(cards: IoRackCard[], slaves: EthercatSlave[]): IoRackCard[] {
-  return cards.map(card => {
-    const slave = slaves.find(s => s.position === card.slot);
-    if (!slave) return { ...card, actual: undefined, status: 'missing' as const };
-    const matches = slave.name.toUpperCase().includes(card.model.toUpperCase());
-    return { ...card, actual: slave.name, status: matches ? 'ok' as const : 'mismatch' as const };
-  });
+interface SlotAllocation {
+  status: IoRackCard['status'];
+  pdoEntries?: PdoEntry[];
 }
 
-/** Real rack verification via the IgH `ethercat` CLI, with a simulated echo fallback
- * when the tool isn't installed (dev machine, or master not set up yet on the target).
- * For each card that matches, also discovers its product ID and PDO map and caches
- * them on om.discoveredModels by model — a one-time cost per model, not per card. */
+// Which PDO entry (or entries) belong to a card depends on where it sits
+// among same-category cards, not just its model -- two NX-ID5442s in the
+// rack need two DIFFERENT input entries. So this re-slices the rack's
+// (cached or freshly-read) entry lists against the CURRENT card list every
+// time it's called, in physical rack order (card.slot ascending), rather
+// than caching a slice per model. Digital cards (DI/DO) consume exactly
+// ONE entry — every point is a bit within it. Analog/scale cards consume
+// one entry PER CHANNEL (unverified — no real analog dump seen yet, but
+// unlike digital bits, analog values can't share a word).
+function allocateRackEntries(cards: IoRackCard[], inputEntries: PdoEntry[], outputEntries: PdoEntry[]): Map<number, SlotAllocation> {
+  const sorted = [...cards].sort((a, b) => a.slot - b.slot);
+  let inIdx = 0, outIdx = 0;
+  const bySlot = new Map<number, SlotAllocation>();
+  for (const card of sorted) {
+    const def = NX_CARD_CATALOG.find(d => d.model === card.model);
+    if (!def) { bySlot.set(card.slot, { status: 'mismatch' }); continue; }
+    if (def.category === 'power') { bySlot.set(card.slot, { status: 'ok' }); continue; }
+    const isInput = def.category === 'DI' || def.category === 'AI' || def.category === 'scale';
+    const take = def.category === 'DI' || def.category === 'DO' ? 1 : def.points;
+    const pool = isInput ? inputEntries : outputEntries;
+    const start = isInput ? inIdx : outIdx;
+    const slice = pool.slice(start, start + take);
+    if (isInput) inIdx += take; else outIdx += take;
+    bySlot.set(card.slot, slice.length === take ? { status: 'ok', pdoEntries: slice } : { status: 'missing' });
+  }
+  return bySlot;
+}
+
+/** Real rack verification via the IgH `ethercat` CLI, with a simulated echo
+ * fallback when the tool isn't installed (dev machine, or master not set up
+ * yet). Reads the coupler's product ID and PDO entry lists ONCE (position 0
+ * — the whole rack is one slave) and caches them on om.discoveredRack; each
+ * card's own entry/entries are then sliced out fresh via allocateRackEntries. */
 export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warnings: string[] } {
   const master = getMasterStatus();
   if (!master.toolAvailable) {
@@ -146,23 +166,28 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
     warnings.push(`Coupler at position 0 reports "${coupler.name}", expected ${om.eccModel}`);
   }
 
-  const cards = matchCardsToSlaves(om.cards, slaves).map(card => {
-    if (card.status !== 'ok') return card;
-    const productId = getSlaveProductId(card.slot) ?? undefined;
-    const pdoEntries = getSlavePdoEntries(card.slot);
-    if (productId !== undefined) om.discoveredModels[card.model] = { productId, pdoEntries };
-    return { ...card, productId, pdoEntries };
+  const productId = getSlaveProductId(0);
+  const rackEntries = getRackPdoEntries(0);
+  const inputEntries = rackEntries.filter(e => e.dir === 'input');
+  const outputEntries = rackEntries.filter(e => e.dir === 'output');
+  if (productId !== null) om.discoveredRack = { productId, inputEntries, outputEntries };
+
+  const allocations = allocateRackEntries(om.cards, inputEntries, outputEntries);
+  const cards = om.cards.map(card => {
+    const alloc = allocations.get(card.slot)!;
+    if (alloc.status === 'missing') {
+      warnings.push(`${card.model} in slot ${card.slot}: coupler doesn't expose enough PDO entries for it — missing module, or an earlier-slot card is claiming entries that belong to it`);
+    }
+    return { ...card, actual: coupler.name, status: alloc.status, pdoEntries: alloc.pdoEntries };
   });
 
   return { cards, warnings };
 }
 
-/** Cheap, poll-safe rack presence check for the watchdog — same card-to-slave
- * matching as verifyEthercatRack() above, but WITHOUT the per-card product-ID/
- * PDO discovery (two more blocking `ethercat` CLI calls per card), so it's safe
- * to run every few seconds from Mill's background timer without stalling the
- * control loop. Never touches om.discoveredModels or card.productId/pdoEntries
- * — only a full Read Rack refreshes those.
+/** Cheap, poll-safe rack presence check for the watchdog — same coupler-
+ * presence + PDO-entry-count check as verifyEthercatRack() above, but never
+ * touches om.discoveredRack or card.pdoEntries — only a full Read Rack
+ * refreshes those.
  *
  * If the master itself can't be reached, that's treated as every card going
  * missing (can't verify == can't trust), not silently skipped — losing the
@@ -176,7 +201,22 @@ export function checkRackPresence(om: OmronConfig): { cards: IoRackCard[]; unrea
       unreachable: master.error ?? 'unknown reason',
     };
   }
-  return { cards: matchCardsToSlaves(om.cards, listSlaves()) };
+
+  const slaves = listSlaves();
+  const coupler = slaves.find(s => s.position === 0);
+  if (!coupler) return { cards: om.cards.map(c => ({ ...c, actual: undefined, status: 'missing' as const })) };
+  const expectedCoupler = om.eccModel.replace('NX-', '');
+  if (!coupler.name.toUpperCase().includes(expectedCoupler)) {
+    return { cards: om.cards.map(c => ({ ...c, actual: coupler.name, status: 'mismatch' as const })) };
+  }
+
+  const rackEntries = getRackPdoEntries(0);
+  const inputEntries = rackEntries.filter(e => e.dir === 'input');
+  const outputEntries = rackEntries.filter(e => e.dir === 'output');
+  const allocations = allocateRackEntries(om.cards, inputEntries, outputEntries);
+  return {
+    cards: om.cards.map(card => ({ ...card, actual: coupler.name, status: allocations.get(card.slot)!.status })),
+  };
 }
 
 /** Builds the io_daemon's full channel config from every signal currently
@@ -184,29 +224,31 @@ export function checkRackPresence(om: OmronConfig): { cards: IoRackCard[]; unrea
  * no hand-maintained channel list of its own; the HMI's I/O Config and the
  * verified rack are the single source of truth for what's wired where. A
  * signal is marked for edge-counting ("count") when some equipment has it
- * assigned as rotationPulseInput. Product IDs and PDO addresses come from
- * om.discoveredModels, keyed by card model — populated the first time any
- * card of that model is confirmed by Read Rack, then reused for every
- * other card of that model with no further bus access. A model nobody has
- * ever confirmed just produces a warning telling the operator to run Read
- * Rack once. */
+ * assigned as rotationPulseInput. The whole rack is ONE EtherCAT slave
+ * (position 0, the coupler) — om.discoveredRack's product ID and PDO entry
+ * lists, from the last Read Rack, get re-sliced against the CURRENT card
+ * list here every time (allocateRackEntries), not cached per card. Nothing
+ * discovered yet at all just produces one warning telling the operator to
+ * run Read Rack. */
 export function generateIoConf(
   om: OmronConfig, signals: Iterable<SignalDef>, equipment: Iterable<EquipmentRuntime>, scaleConfigs: Iterable<ScaleConfig>,
 ): { conf: string; warnings: string[] } {
   const warnings: string[] = [];
-  const slaveLines = new Map<number, string>();
   const channelLines: string[] = [];
 
-  const addSlave = (slot: number, productId: number) => {
-    if (slaveLines.has(slot)) return;
-    const vid = OMRON_VENDOR_ID.toString(16).padStart(8, '0');
-    const pid = productId.toString(16).padStart(8, '0');
-    slaveLines.set(slot, `slave ${slot} 0x${vid} 0x${pid}`);
-  };
+  if (!om.discoveredRack) {
+    const anyRackCards = om.cards.some(c => NX_CARD_CATALOG.find(d => d.model === c.model)?.category !== 'power');
+    const anyScale = Array.from(scaleConfigs).some(sc => sc.connectionType === 'rs1201');
+    if (anyRackCards || anyScale) warnings.push('Run Read Rack once — no PDO map discovered for this coupler yet');
+    const lines = ['# auto-generated by feedmill-backend from the rack + I/O config — do not hand-edit', `cycle_us ${om.cycleTimeUs}`];
+    return { conf: lines.join('\n') + '\n', warnings };
+  }
 
-  const discoveryFor = (card: IoRackCard) =>
-    om.discoveredModels[card.model] ??
-    (card.productId !== undefined ? { productId: card.productId, pdoEntries: card.pdoEntries ?? [] } : undefined);
+  const { productId, inputEntries, outputEntries } = om.discoveredRack;
+  const allocations = allocateRackEntries(om.cards, inputEntries, outputEntries);
+  const vid = OMRON_VENDOR_ID.toString(16).padStart(8, '0');
+  const pid = productId.toString(16).padStart(8, '0');
+  const slaveLine = `slave 0 0x${vid} 0x${pid}`; // the whole rack is one EtherCAT slave: the coupler
 
   for (const sc of scaleConfigs) {
     if (sc.connectionType !== 'rs1201') continue;
@@ -214,15 +256,13 @@ export function generateIoConf(
     if (!card) { warnings.push(`${sc.name}: no card in slot ${sc.rackSlot}`); continue; }
     const def = NX_CARD_CATALOG.find(d => d.model === card.model);
     if (!def || def.category !== 'scale') { warnings.push(`${sc.name}: ${card.model} is not a load cell card`); continue; }
-    const discovered = discoveryFor(card);
-    if (!discovered) { warnings.push(`${sc.name}: run Read Rack once for a ${card.model} card — nothing discovered for it yet`); continue; }
-    // RS1201 convention, unverified: the weight value is its first input PDO entry.
-    const weightEntry = discovered.pdoEntries.find(e => e.dir === 'input');
-    if (!weightEntry) { warnings.push(`${sc.name}: ${card.model}'s discovered PDO map has no input entry for weight`); continue; }
-    addSlave(sc.rackSlot, discovered.productId);
-    const idx = weightEntry.index.toString(16).padStart(4, '0');
-    const sub = weightEntry.subindex.toString(16).padStart(2, '0');
-    channelLines.push(`channel SC:${sc.id} ${sc.rackSlot} SCALE 0x${idx} 0x${sub}`);
+    const alloc = allocations.get(card.slot);
+    if (!alloc || alloc.status !== 'ok' || !alloc.pdoEntries) { warnings.push(`${sc.name}: ${card.model} in slot ${sc.rackSlot} — not enough PDO entries discovered; re-run Read Rack`); continue; }
+    // RS1201 convention, unverified: the weight value is the card's one allocated entry.
+    const entry = alloc.pdoEntries[0];
+    const idx = entry.index.toString(16).padStart(4, '0');
+    const sub = entry.subindex.toString(16).padStart(2, '0');
+    channelLines.push(`channel SC:${sc.id} 0 SCALE 0x${idx} 0x${sub} 0`);
   }
 
   const rotationSignals = new Set(
@@ -238,23 +278,26 @@ export function generateIoConf(
     if (!card) { warnings.push(`${sig.id}: no card in slot ${slot}`); continue; }
     const def = NX_CARD_CATALOG.find(d => d.model === card.model);
     if (!def || def.category !== sig.direction) { warnings.push(`${sig.id}: ${card.model} is not a ${sig.direction} card`); continue; }
-    const discovered = discoveryFor(card);
-    if (!discovered) { warnings.push(`${sig.id}: run Read Rack once for a ${card.model} card — nothing discovered for it yet`); continue; }
-    const wantDir = PDO_DIR_BY_SIGNAL[sig.direction];
-    const entry = discovered.pdoEntries.filter(e => e.dir === wantDir)[point];
-    if (!entry) { warnings.push(`${sig.id}: ${card.model}'s discovered PDO map has no ${wantDir} entry for point ${point}`); continue; }
+    const alloc = allocations.get(slot);
+    if (!alloc || alloc.status !== 'ok' || !alloc.pdoEntries) { warnings.push(`${sig.id}: ${card.model} in slot ${slot} — not enough PDO entries discovered; re-run Read Rack`); continue; }
 
-    addSlave(slot, discovered.productId);
+    // Digital cards pack every point into the ONE entry they were allocated,
+    // addressed as a bit within it; analog cards get one entry PER point.
+    const isDigital = sig.direction === 'DI' || sig.direction === 'DO';
+    const entry = isDigital ? alloc.pdoEntries[0] : alloc.pdoEntries[point];
+    if (!entry) { warnings.push(`${sig.id}: ${card.model}'s allocated PDO entries have nothing for point ${point}`); continue; }
+    const bit = isDigital ? point : 0;
+
     const index = entry.index.toString(16).padStart(4, '0');
     const subindex = entry.subindex.toString(16).padStart(2, '0');
     const countFlag = sig.direction === 'DI' && rotationSignals.has(sig.id) ? ' count' : '';
-    channelLines.push(`channel ${sig.id} ${slot} ${sig.direction} 0x${index} 0x${subindex}${countFlag}`);
+    channelLines.push(`channel ${sig.id} 0 ${sig.direction} 0x${index} 0x${subindex} ${bit}${countFlag}`);
   }
 
   const lines = [
     '# auto-generated by feedmill-backend from the rack + I/O config — do not hand-edit',
     `cycle_us ${om.cycleTimeUs}`,
-    ...slaveLines.values(),
+    slaveLine,
     ...channelLines,
   ];
   return { conf: lines.join('\n') + '\n', warnings };

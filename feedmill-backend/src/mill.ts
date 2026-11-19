@@ -70,7 +70,7 @@ export class Mill {
   ioOverrides: Record<string, SignalValue> = {};
   scaleConfigs: ScaleConfig[] = [];
   scaleConfigVersion = 0; // bumped on ConfigureScale/RemoveScale — server.ts watches this to restart scale readers
-  omronConfig: OmronConfig = { couplerType: 'none', ipAddress: '', nodeAddress: 1, ethercatInterface: '', eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [], discoveredModels: {} };
+  omronConfig: OmronConfig = { couplerType: 'none', ipAddress: '', nodeAddress: 1, ethercatInterface: '', eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
   globalConfig: Record<string, string | number> = { motorStarterFaultDelay: 0.5, siteName: 'FEED MILL CONTROLLER' };
   networkInterfaces: string[] = listCandidateNics(); // computed once at startup; restart the service to pick up newly added NICs
   private faultSeq = 300;
@@ -418,7 +418,7 @@ export class Mill {
       case 'ReadOmronRack': {
         if (this.omronConfig.couplerType === 'none') return reject('No coupler configured');
         this.readOmronRack();
-        this.persistConfig(); // discoveredModels must survive a restart, or every reboot would need a fresh Read Rack
+        this.persistConfig(); // discoveredRack must survive a restart, or every reboot would need a fresh Read Rack
         return ok();
       }
 
@@ -741,7 +741,7 @@ export class Mill {
           cards,
           rackVerified: false,
           warnings: [],
-          discoveredModels: this.omronConfig.discoveredModels, // survives reconfiguration — it's per-model, not per-card
+          discoveredRack: this.omronConfig.discoveredRack, // survives reconfiguration — it's rack-level, not per-card
         };
         this.validateRack();
         this.clearRackFault();
