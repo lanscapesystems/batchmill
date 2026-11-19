@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# One-shot installer for the feedmill backend + EtherCAT I/O daemon stack
-# on a Debian 13 target. Run once as root, from this project's checkout,
-# after it's been copied onto the real machine:
+# One-shot installer for the feedmill backend + EtherCAT I/O daemon + HMI
+# frontend stack on a Debian 13 target. Run once as root, from this
+# project's checkout (the monorepo root, so hmi-prototype/ is a sibling of
+# feedmill-backend/), after it's been copied onto the real machine:
 #
 #   sudo ./install/install.sh <ethercat-nic>
 #
@@ -26,6 +27,8 @@ IGH_REF="${IGH_REF:-stable-1.6}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="/usr/local/src/ethercat-master"
 APP_DIR="/opt/feedmill/app"
+HMI_DIR="/opt/feedmill/hmi"
+HMI_SRC_DIR="$(cd "$PROJECT_DIR/../hmi-prototype" 2>/dev/null && pwd || true)"
 DATA_DIR="/var/lib/feedmill/data"
 CONF_DIR="/etc/feedmill"
 APP_USER="feedmill"
@@ -155,12 +158,52 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
-# ---- 6. enable + (re)start everything -----------------------------------
+# ---- 6. deploy + build the HMI frontend (sibling checkout in the monorepo) --
+if [[ -n "$HMI_SRC_DIR" ]]; then
+  log "deploying HMI to $HMI_DIR"
+  rsync -a --delete --exclude node_modules --exclude .next \
+    "$HMI_SRC_DIR"/ "$HMI_DIR"/
+  chown -R "$APP_USER:$APP_USER" "$HMI_DIR" # before npm runs as $APP_USER, same reason as the backend above
+  (
+    cd "$HMI_DIR"
+    sudo -u "$APP_USER" npm ci --no-audit --no-fund
+    sudo -u "$APP_USER" npm run build
+    sudo -u "$APP_USER" npm prune --omit=dev --no-audit --no-fund
+  )
+
+  cat >/etc/systemd/system/feedmill-hmi.service <<EOF
+[Unit]
+Description=Feedmill HMI (Next.js frontend)
+After=network.target feedmill-backend.service
+Wants=feedmill-backend.service
+
+[Service]
+Type=simple
+User=$APP_USER
+Group=$APP_USER
+WorkingDirectory=$HMI_DIR
+Environment=NODE_ENV=production
+Environment=PORT=3000
+ExecStart=$NODE_BIN node_modules/.bin/next start
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+else
+  log "hmi-prototype not found as a sibling of this checkout — skipping HMI deploy"
+fi
+
+# ---- 7. enable + (re)start everything -----------------------------------
 log "enabling and starting services"
 systemctl daemon-reload
 systemctl enable --now ethercat.service
 systemctl enable --now feedmill-io-daemon.service
 systemctl enable --now feedmill-backend.service
+if [[ -n "$HMI_SRC_DIR" ]]; then
+  systemctl enable --now feedmill-hmi.service
+fi
 
 cat <<EOF
 
@@ -179,8 +222,13 @@ Done. Still required before trusting ANY real I/O point:
      before relying on it.
   4. For an NX-RS1201 scale: the calibration handshake isn't implemented
      yet (see scaleReader.ts) — only the raw weight PDO read is wired up.
+  5. The HMI defaults to ws://localhost:3001/ws/hmi, which means "this
+     browser's own machine" — fine if you're opening it on this box, but
+     an operator on another workstation needs
+     http://<this-box-ip>:3000?backend=ws://<this-box-ip>:3001/ws/hmi
+     until that default is made environment-aware.
 
 Check status with:
-  systemctl status ethercat.service feedmill-io-daemon.service feedmill-backend.service
-  journalctl -u feedmill-backend -u feedmill-io-daemon -f
+  systemctl status ethercat.service feedmill-io-daemon.service feedmill-backend.service feedmill-hmi.service
+  journalctl -u feedmill-backend -u feedmill-io-daemon -u feedmill-hmi -f
 EOF
