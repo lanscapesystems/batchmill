@@ -81,8 +81,6 @@ export interface BackendScaleConfig {
   stabilityWindow: number;
 }
 
-export type IOSource = 'simulated' | 'simulator';
-
 export type BackendCouplerType = 'none' | 'NX-EIC' | 'NX-ECC';
 
 export type BackendEccModel = 'NX-ECC202' | 'NX-ECC203';
@@ -127,13 +125,12 @@ interface BackendState {
   ioInputs: Record<string, boolean | number>;
   ioOutputs: Record<string, boolean | number>;
   ioOverrides: Record<string, boolean | number>;
-  ioSource: IOSource;
   scales: Record<string, BackendScaleReading>;
   scaleConfigs: BackendScaleConfig[];
   omronConfig: BackendOmronConfig;
   globalConfig: Record<string, string | number>;
-  simulatorEnabled: boolean;
   networkInterfaces: string[];
+  commissioningMode: boolean;
   sendCommand: (action: string, targetId?: string, parameters?: Record<string, unknown>) => Promise<CommandResult>;
 }
 
@@ -144,12 +141,12 @@ const EMPTY_OMRON: BackendOmronConfig = { couplerType: 'none', ipAddress: '', no
 const EMPTY_DATA: SnapshotData = {
   equipment: [], queue: [], activeBatch: null,
   faults: [], bins: [], recipes: [], ingredients: [], connections: [],
-  ioSignals: [], ioInputs: {}, ioOutputs: {}, ioOverrides: {}, ioSource: 'simulated',
+  ioSignals: [], ioInputs: {}, ioOutputs: {}, ioOverrides: {},
   scales: {}, scaleConfigs: [],
   omronConfig: EMPTY_OMRON,
   globalConfig: {},
-  simulatorEnabled: false,
   networkInterfaces: [],
+  commissioningMode: false,
 };
 
 function parseSnapshot(d: Record<string, any>): SnapshotData { // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -166,13 +163,12 @@ function parseSnapshot(d: Record<string, any>): SnapshotData { // eslint-disable
     ioInputs: d.io?.inputs ?? {},
     ioOutputs: d.io?.outputs ?? {},
     ioOverrides: d.io?.overrides ?? {},
-    ioSource: d.io?.source ?? 'simulated',
     scales: d.scales ?? {},
     scaleConfigs: d.scaleConfigs ?? [],
     omronConfig: d.omronConfig ?? EMPTY_OMRON,
     globalConfig: d.globalConfig ?? {},
-    simulatorEnabled: d.simulatorEnabled ?? false,
     networkInterfaces: d.networkInterfaces ?? [],
+    commissioningMode: d.commissioningMode ?? false,
   };
 }
 

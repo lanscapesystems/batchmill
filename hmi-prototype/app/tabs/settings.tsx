@@ -3,6 +3,7 @@
 import { useState, useRef, useCallback, useEffect, type MouseEvent as ReactMouseEvent } from 'react';
 import { useMillStore, EQUIPMENT_DEFS, IO_POOL, getPortsForEquipment, GRID_SNAP, FLOW_HIDDEN_TYPES, GLOBAL_DEFAULTS, type EquipmentItem, type PortDef, type Position, type FlowConnection } from '../store';
 import { useBackend, type BackendScaleConfig, type BackendOmronConfig, type BackendIoRackCard, type BackendCouplerType, type BackendEccModel } from '../backend';
+import { IOSignalList } from './system';
 
 function useIOPools(backend: ReturnType<typeof useBackend>) {
   if (!backend?.connected || backend.ioSignals.length === 0) return IO_POOL;
@@ -890,7 +891,7 @@ function IOSection() {
   const [editingScale, setEditingScale] = useState<BackendScaleConfig | null>(null);
   const [scaleDraft, setScaleDraft] = useState<BackendScaleConfig>({ id: '', name: '', connectionType: 'serial', protocol: '', comPort: '', baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, rackSlot: 0, zeroOffset: 0, ratedMvV: 2.0, capacity: 5000, resolution: 1, freshnessTimeout: 5000, stabilityWindow: 500 });
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [commissioningOpen, setCommissioningOpen] = useState(false);
   const [calOpen, setCalOpen] = useState(false);
   const [calStep, setCalStep] = useState<'zero' | 'span'>('zero');
   const [calZeroReading, setCalZeroReading] = useState(0);
@@ -898,7 +899,7 @@ function IOSection() {
 
   const scaleConfigs = backend?.scaleConfigs ?? [];
   const om: BackendOmronConfig = backend?.omronConfig ?? { couplerType: 'none', ipAddress: '', nodeAddress: 1, ethercatInterface: '', eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
-  const simEnabled = backend?.simulatorEnabled ?? false;
+  const commissioningMode = backend?.commissioningMode ?? false;
   const [omDraft, setOmDraft] = useState<BackendOmronConfig>(om);
   const [omEditing, setOmEditing] = useState(false);
   const [dragIdx, setDragIdx] = useState<number | null>(null);
@@ -964,9 +965,9 @@ function IOSection() {
   }
   function doReadRack() { backend?.sendCommand('ReadOmronRack'); setConfirmReadRack(false); }
 
-  // Simulator
-  function toggleSimulator(en: boolean) {
-    backend?.sendCommand('SetSimulatorEnabled', undefined, { enabled: en });
+  // Commissioning
+  function toggleCommissioningMode(en: boolean) {
+    backend?.sendCommand('SetCommissioningMode', undefined, { enabled: en });
   }
 
   // Scales
@@ -1409,30 +1410,26 @@ function IOSection() {
         </div>
       </div>
 
-      {/* ── Advanced (Simulator) ── */}
+      {/* ── Commissioning / Raw I/O ── */}
       <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: '3px' }}>
-        <div className="px-4 py-2 flex items-center justify-between cursor-pointer" style={{ borderBottom: advancedOpen ? '1px solid var(--border)' : undefined, color: 'var(--fg-bright)', fontSize: '12px', fontWeight: 600 }}
-          onClick={() => setAdvancedOpen(!advancedOpen)}>
-          <span>ADVANCED</span>
-          <span style={{ fontSize: '11px' }}>{advancedOpen ? '▾' : '▸'}</span>
+        <div className="px-4 py-2 flex items-center justify-between cursor-pointer" style={{ borderBottom: commissioningOpen ? '1px solid var(--border)' : undefined, color: 'var(--fg-bright)', fontSize: '12px', fontWeight: 600 }}
+          onClick={() => setCommissioningOpen(!commissioningOpen)}>
+          <span>COMMISSIONING / RAW I/O</span>
+          <span style={{ fontSize: '11px' }}>{commissioningOpen ? '▾' : '▸'}</span>
         </div>
-        {advancedOpen && (
+        {commissioningOpen && (
           <div className="px-4 py-3 flex flex-col gap-2" style={{ fontSize: '12px' }}>
             <label className="flex items-center gap-2 cursor-pointer" style={{ color: 'var(--fg-bright)' }}>
-              <input type="checkbox" checked={simEnabled} onChange={e => toggleSimulator(e.target.checked)}
+              <input type="checkbox" checked={commissioningMode} onChange={e => toggleCommissioningMode(e.target.checked)}
                 style={{ accentColor: 'var(--orange)' }} />
-              Enable I/O Simulator
+              Enable Commissioning Mode
             </label>
             <div style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>
-              {simEnabled
-                ? 'Simulator active — real Omron I/O is bypassed. Inputs use auto-feedback or the external I/O simulator app.'
-                : 'When enabled, all real I/O communication is disabled. Only simulated or external simulator inputs are used.'}
+              {commissioningMode
+                ? 'Commissioning mode is ON — every output below can be forced directly, bypassing control logic. Real outputs will energize. Turn this off when done; any forced outputs release automatically.'
+                : 'Lets you watch every discovered rack signal live, independent of equipment mapping. Enable to also force outputs directly — e.g. to bench-test a DO point before it is wired to any equipment.'}
             </div>
-            {simEnabled && (
-              <div style={{ fontSize: '11px', color: 'var(--orange)', marginTop: '2px' }}>
-                I/O Source: {backend?.ioSource ?? 'simulated'}
-              </div>
-            )}
+            {backend?.connected && <IOSignalList backend={backend} showAll />}
           </div>
         )}
       </div>

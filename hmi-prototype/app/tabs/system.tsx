@@ -270,7 +270,7 @@ export function SystemTab() {
 
 }
 
-type Backend = NonNullable<ReturnType<typeof useBackend>>;
+export type Backend = NonNullable<ReturnType<typeof useBackend>>;
 
 function SpeedField({ beq, backend }: { beq: BackendEquipment; backend: Backend }) {
   const min = Number(beq.config.speedMinLimit ?? 0);
@@ -313,11 +313,14 @@ function SpeedField({ beq, backend }: { beq: BackendEquipment; backend: Backend 
   );
 }
 
-function IOSignalList({ equipmentId, backend }: { equipmentId: string; backend: Backend }) {
+// equipmentId filters to one piece of equipment's mapped ports; pass showAll
+// instead to list every rack signal regardless of equipment mapping (used by
+// the Commissioning panel, where nothing may be mapped to equipment yet).
+export function IOSignalList({ equipmentId, backend, showAll }: { equipmentId?: string; backend: Backend; showAll?: boolean }) {
   const [confirmSignal, setConfirmSignal] = useState<string | null>(null);
   const [confirmValue, setConfirmValue] = useState<boolean>(false);
 
-  const signals = backend.ioSignals.filter(s => s.equipmentId === equipmentId);
+  const signals = showAll ? backend.ioSignals : backend.ioSignals.filter(s => s.equipmentId === equipmentId);
   const outputs = signals.filter(s => s.direction === 'DO' || s.direction === 'AO');
   const inputs = signals.filter(s => s.direction === 'DI' || s.direction === 'AI');
 
@@ -347,7 +350,9 @@ function IOSignalList({ equipmentId, backend }: { equipmentId: string; backend: 
     const val = isOutput ? backend.ioOutputs[sig.id] : backend.ioInputs[sig.id];
     const on = !!val;
     const isOverridden = sig.id in backend.ioOverrides;
-    const isInput = !isOutput;
+    // Forcing an output needs commissioning mode — the backend rejects it
+    // otherwise. Hide the control rather than show one that always fails.
+    const canOverride = !isOutput || backend.commissioningMode;
 
     return (
       <div key={sig.id} className="flex items-center gap-2 py-0.5" style={{ fontSize: '11px' }}>
@@ -359,8 +364,9 @@ function IOSignalList({ equipmentId, backend }: { equipmentId: string; backend: 
         <span style={{ color: on ? 'var(--green)' : 'var(--fg-dim)', width: '24px', textAlign: 'right', flexShrink: 0 }}>
           {typeof val === 'number' ? val : (on ? 'ON' : 'OFF')}
         </span>
-        {isInput && (
-          <label style={{ flexShrink: 0, cursor: 'pointer', display: 'flex', alignItems: 'center' }} title={isOverridden ? 'Override active — click to release' : 'Override this input'}>
+        {canOverride && (
+          <label style={{ flexShrink: 0, cursor: 'pointer', display: 'flex', alignItems: 'center' }}
+            title={isOverridden ? 'Override active — click to release' : isOutput ? 'Force this output (commissioning mode)' : 'Override this input'}>
             <input
               type="checkbox"
               checked={isOverridden}
@@ -394,10 +400,14 @@ function IOSignalList({ equipmentId, backend }: { equipmentId: string; backend: 
               {confirmSignal in backend.ioOverrides ? 'Release Override' : 'Set Override'}
             </div>
             <div style={{ color: 'var(--fg)', fontSize: '12px', marginBottom: '14px' }}>
-              {confirmSignal in backend.ioOverrides
-                ? `Release manual override on ${confirmSignal}? Signal will return to ${backend.ioSource === 'simulator' ? 'simulator' : 'auto-feedback'} control.`
-                : `Override ${confirmSignal} to ${confirmValue ? 'ON' : 'OFF'}? This bypasses normal ${backend.ioSource === 'simulator' ? 'simulator' : 'auto-feedback'} control.`
-              }
+              {(() => {
+                const sig = backend.ioSignals.find(s => s.id === confirmSignal);
+                const isOutput = sig?.direction === 'DO' || sig?.direction === 'AO';
+                const normal = isOutput ? 'control logic' : 'the real reading';
+                return confirmSignal in backend.ioOverrides
+                  ? `Release manual override on ${confirmSignal}? Signal will return to ${normal}.`
+                  : `${isOutput ? 'Force' : 'Override'} ${confirmSignal} to ${confirmValue ? 'ON' : 'OFF'}? This bypasses ${normal}${isOutput ? ' — the real output will energize.' : '.'}`;
+              })()}
             </div>
             <div className="flex gap-2 justify-end">
               <button onClick={() => setConfirmSignal(null)}

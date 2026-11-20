@@ -68,6 +68,9 @@ export class Mill {
   private out(sig: string | undefined, value: boolean | number) { if (sig) this.outImage[sig] = value; }
   private rotationState = new Map<string, { prevCount: number; prevAtMs: number; runningMs: number; rpm?: number }>();
   ioOverrides: Record<string, SignalValue> = {};
+  // Gates forcing an output via SetOverride; never persisted, so a restart
+  // never comes back up with this on. Resets any forced outputs on exit.
+  commissioningMode = false;
   scaleConfigs: ScaleConfig[] = [];
   scaleConfigVersion = 0; // bumped on ConfigureScale/RemoveScale — server.ts watches this to restart scale readers
   omronConfig: OmronConfig = { couplerType: 'none', ipAddress: '', nodeAddress: 1, ethercatInterface: '', eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
@@ -403,6 +406,11 @@ export class Mill {
         const sig = cmd.targetId;
         const val = cmd.parameters?.value;
         if (!sig || val === undefined) return reject('Missing signal or value');
+        const sigDef = this.signals.find(s => s.id === sig);
+        const isOutput = sigDef?.direction === 'DO' || sigDef?.direction === 'AO';
+        if (isOutput && !this.commissioningMode) {
+          return reject('Enable commissioning mode to force an output');
+        }
         this.ioOverrides[sig] = val as SignalValue;
         return ok();
       }
@@ -411,7 +419,23 @@ export class Mill {
         const sig = cmd.targetId;
         if (!sig) return reject('Missing signal');
         delete this.ioOverrides[sig];
-        // Released inputs get the real reading back on the next scan's readRealInputs().
+        // Released inputs get the real reading back on the next scan's readRealInputs();
+        // released outputs get the next scan's control-logic value via computeOutputs().
+        return ok();
+      }
+
+      case 'SetCommissioningMode': {
+        const en = cmd.parameters?.enabled;
+        if (typeof en !== 'boolean') return reject('Missing enabled');
+        this.commissioningMode = en;
+        if (!en) {
+          // Leaving commissioning mode drops any forced outputs rather than
+          // leaving an actuator stuck at whatever it was forced to.
+          for (const id of Object.keys(this.ioOverrides)) {
+            const sigDef = this.signals.find(s => s.id === id);
+            if (sigDef?.direction === 'DO' || sigDef?.direction === 'AO') delete this.ioOverrides[id];
+          }
+        }
         return ok();
       }
 
@@ -773,6 +797,8 @@ export class Mill {
 
   private applyOverrides() {
     for (const [id, val] of Object.entries(this.ioOverrides)) {
+      const sigDef = this.signals.find(s => s.id === id);
+      if (sigDef?.direction === 'DO' || sigDef?.direction === 'AO') continue; // applied in computeOutputs(), after control logic runs
       this.ioInputs[id] = val;
     }
   }
@@ -1493,6 +1519,12 @@ export class Mill {
   private computeOutputs() {
     Object.assign(this.ioOutputs, this.outImage);
     this.outImage = {};
+    // Forced outputs win over whatever control logic just computed — this is
+    // the one place that's true, so a forced value always reaches the bus.
+    for (const [id, val] of Object.entries(this.ioOverrides)) {
+      const sigDef = this.signals.find(s => s.id === id);
+      if (sigDef?.direction === 'DO' || sigDef?.direction === 'AO') this.ioOutputs[id] = val;
+    }
     writeIoCommand(this.ioOutputs, this.signals);
   }
 
@@ -1547,6 +1579,7 @@ export class Mill {
       omronConfig: { ...this.omronConfig, cards: this.omronConfig.cards.map(c => ({ ...c })) },
       globalConfig: { ...this.globalConfig },
       networkInterfaces: this.networkInterfaces,
+      commissioningMode: this.commissioningMode,
     };
   }
 

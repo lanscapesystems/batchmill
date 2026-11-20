@@ -184,6 +184,9 @@ export interface StateSnapshot {
   omronConfig: OmronConfig;
   globalConfig: Record<string, string | number>;
   networkInterfaces: string[];
+  // Gates forcing an output via SetOverride — bench-testing real DO/AO points
+  // needs to bypass control logic, which normal operation must never allow.
+  commissioningMode: boolean;
 }
 
 export interface QueueSnapshot {
