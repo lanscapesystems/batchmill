@@ -1604,15 +1604,14 @@ export class Mill {
     }
     if (om.couplerType === 'none' || om.cards.length === 0) return;
 
-    const ioCards = om.cards.filter(c => {
-      const def = NX_CARD_CATALOG.find(d => d.model === c.model);
-      return def && def.category !== 'power';
-    });
-    const hasPf0730 = om.cards.some(c => c.model === 'NX-PF0730');
-
-    if (ioCards.length > 0 && !hasPf0730) {
-      om.warnings.push('NX-PF0730 I/O power supply required — add one before I/O cards');
-    }
+    // NX-PF0630/PF0730 ("I/O power feed unit") is NOT required just because
+    // I/O cards exist — confirmed from Omron's NX-series I/O datasheet: the
+    // coupler's own terminal block has a separate I/O power supply input
+    // (up to 10A on an ECC203) that feeds the NX bus directly. NX-PF units
+    // are listed as being "for separation of groups" — i.e. an additional
+    // feed point for current beyond the coupler's own rating or an
+    // electrically isolated zone, not a mandatory first unit. No warning
+    // here; only check its placement below, if one happens to be present.
 
     // NX Bus power zones: coupler supplies 10W, NX-PD1000 starts a new 10W zone
     let zoneIdx = 0;
@@ -1640,12 +1639,10 @@ export class Mill {
       om.warnings.push(`Too many units (${om.cards.length}) — coupler supports max ${NX_MAX_UNITS}`);
     }
 
-    if (hasPf0730) {
-      const pf = om.cards.find(c => c.model === 'NX-PF0730');
-      if (pf && pf.slot !== 1) {
-        om.warnings.push('NX-PF0730 should be in slot 1 (first position after coupler)');
-      }
-    }
+    // (Dropped the "NX-PF0730 must be in slot 1" check along with the
+    // "required" one above — same unverified assumption. If you do add an
+    // I/O power feed unit, place it wherever its "separation of groups"
+    // zone needs to start, same as NX-PD1000 for NX bus power below.)
   }
 
   private verifyRack() {
