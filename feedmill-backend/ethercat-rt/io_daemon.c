@@ -205,7 +205,14 @@ static void load_config(const char *path) {
         }
     }
     fclose(f);
-    if (n_channels == 0) { fprintf(stderr, "io_daemon: no channels configured\n"); exit(1); }
+    if (n_channels == 0) {
+        /* Not an error -- the normal state before anything's been commissioned
+         * (fresh install, or the rack config was just cleared). Exiting here
+         * used to crash-loop every 2s until systemd's restart limiter parked
+         * the unit in a permanent failed state. main() checks n_channels and
+         * idles instead of touching EtherCAT at all. */
+        fprintf(stderr, "io_daemon: no channels configured yet -- idling (commission a rack in the HMI, then Read Rack)\n");
+    }
 }
 
 /* ---- state-file writer thread (non-realtime; the RT thread never touches disk) ---- */
@@ -420,6 +427,22 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+
+    if (n_channels == 0) {
+        /* Nothing commissioned yet -- never touch EtherCAT (ecrt_master_activate
+         * on an empty domain is rejected anyway). Still run the writer/reader
+         * threads so the state file exists and reads as "running, nothing
+         * configured" rather than "not running" to the Node backend. Exits
+         * cleanly on SIGTERM; syncIoConf() restarts this unit once a real
+         * config is written, which re-execs main() from the top. */
+        pthread_t writer, reader;
+        pthread_create(&writer, NULL, writer_thread, NULL);
+        pthread_create(&reader, NULL, reader_thread, NULL);
+        while (running) usleep(200000);
+        pthread_join(writer, NULL);
+        pthread_join(reader, NULL);
+        return 0;
+    }
 
     setup_ethercat();
 
