@@ -42,15 +42,16 @@ export function readIoState(): IoStateFile | null {
   }
 }
 
-let lastWritten: string | null = null;
-
 /**
  * Writes every DO/AO signal's desired value for the io_daemon to apply on
  * its next cycle. Analog values are converted from the engineering-unit
  * percentages mill.ts works in to the daemon's raw PDO counts (see
- * NX_ANALOG_FULL_SCALE above). Skips the write entirely when nothing
- * changed, and otherwise writes tmp+rename — a hard power-off must never
- * leave the daemon reading a half-written command file.
+ * NX_ANALOG_FULL_SCALE above). Always writes (tmp+rename) even when the
+ * content is unchanged: io_daemon.c's reader thread treats the file's
+ * mtime as a liveness heartbeat and force-zeros every output after 2s
+ * without an mtime change (COMMAND_STALE_US) — skipping the write on
+ * unchanged content would starve that heartbeat and the daemon would
+ * zero a steadily-commanded output 2s after it was set.
  */
 export function writeIoCommand(outputs: Record<string, SignalValue>, signals: SignalDef[]): void {
   const lines: string[] = [];
@@ -62,12 +63,10 @@ export function writeIoCommand(outputs: Record<string, SignalValue>, signals: Si
     lines.push(`output ${sig.id} ${raw}`);
   }
   const text = lines.join('\n') + '\n';
-  if (text === lastWritten) return;
   try {
     const tmp = `${COMMAND_PATH}.tmp`;
     writeFileSync(tmp, text, 'utf8');
     renameSync(tmp, COMMAND_PATH);
-    lastWritten = text;
   } catch {
     // e.g. /run/feedmill isn't writable here (dev machine, daemon not installed) — nothing to apply anyway
   }
