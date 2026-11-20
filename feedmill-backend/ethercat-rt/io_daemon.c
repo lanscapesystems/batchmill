@@ -37,7 +37,14 @@
  *
  * STATUS: written against the documented ecrt API from memory. NOT
  * compiled or run against real IgH headers/hardware in this session.
- * Before trusting it:
+ * CONFIRMED on real hardware (an NX-ECC203 + NX-OD5256 + NX-ID5442): the DI
+ * read path works end to end (16 points sharing one 0x6022:01 entry,
+ * addressed per-bit). The DO write path did NOT energize the real output
+ * despite the software reporting it forced ON — diagnosed as re-
+ * registering the same PDO entry once per channel instead of once per
+ * entry (see setup_ethercat()'s registered[] cache, added as the fix) —
+ * NOT yet re-confirmed against real hardware after that fix. Before
+ * trusting it:
  *
  *   1. Build on the Debian target once the IgH master + dev headers
  *      are installed (the install/install.sh script does this):
@@ -314,6 +321,34 @@ static ec_master_t *master;
 static ec_domain_t *domain;
 static uint8_t *domain_pd;
 
+/* Multiple channels (e.g. 16 DI/DO points) share the SAME PDO entry — one
+ * whole word covers every point of a digital card. Re-registering that
+ * identical (slave, index, subindex) once per channel is NOT a safe,
+ * documented ecrt pattern (confirmed against a known-working bench tool
+ * for this exact coupler, which registers each entry's position exactly
+ * once per sync manager and computes every other bit's offset by hand) —
+ * so register each unique entry once here and reuse its offset. */
+typedef struct {
+    int slave_idx;
+    uint16_t pdo_index;
+    uint8_t pdo_subindex;
+    unsigned base_offset;
+} registered_entry_t;
+
+static registered_entry_t registered[MAX_CHANNELS];
+static int n_registered = 0;
+
+static int find_registered(int slave_idx, uint16_t index, uint8_t subindex, unsigned *out_offset) {
+    for (int i = 0; i < n_registered; i++) {
+        if (registered[i].slave_idx == slave_idx && registered[i].pdo_index == index &&
+            registered[i].pdo_subindex == subindex) {
+            *out_offset = registered[i].base_offset;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void setup_ethercat(void) {
     master = ecrt_request_master(0);
     if (!master) { fprintf(stderr, "io_daemon: ecrt_request_master failed\n"); exit(1); }
@@ -332,31 +367,43 @@ static void setup_ethercat(void) {
     for (int i = 0; i < n_channels; i++) {
         channel_t *c = &channels[i];
         ec_slave_config_t *sc = slaves[c->slave_idx].sc;
-        /* Multiple channels (e.g. 16 DI points) register the SAME index:subindex —
-         * one whole word shared by every point of that card. ecrt returns the same
-         * base offset each time; bitpos comes back 0 for a multi-bit word entry
-         * (there's no sub-bit to report), so DI/DO must compute their own bit
-         * position from the config's cfg_bit, not trust ecrt's bitpos here. */
-        unsigned bitpos = 0;
-        int off = ecrt_slave_config_reg_pdo_entry(sc, c->pdo_index, c->pdo_subindex, domain, &bitpos);
-        if (off < 0) {
-            fprintf(stderr,
-                "io_daemon: failed to register PDO entry %04x:%02x for %s (slave pos %u) — "
-                "check it's in the slave's active PDO mapping (`ethercat pdos -p %u`)\n",
-                c->pdo_index, c->pdo_subindex, c->signal_id,
-                slaves[c->slave_idx].position, slaves[c->slave_idx].position);
-            exit(1);
+
+        unsigned base_off;
+        if (!find_registered(c->slave_idx, c->pdo_index, c->pdo_subindex, &base_off)) {
+            unsigned bitpos = 0;
+            int off = ecrt_slave_config_reg_pdo_entry(sc, c->pdo_index, c->pdo_subindex, domain, &bitpos);
+            if (off < 0) {
+                fprintf(stderr,
+                    "io_daemon: failed to register PDO entry %04x:%02x for %s (slave pos %u) — "
+                    "check it's in the slave's active PDO mapping (`ethercat pdos -p %u`)\n",
+                    c->pdo_index, c->pdo_subindex, c->signal_id,
+                    slaves[c->slave_idx].position, slaves[c->slave_idx].position);
+                exit(1);
+            }
+            base_off = (unsigned)off;
+            if (n_registered < MAX_CHANNELS) {
+                registered[n_registered].slave_idx = c->slave_idx;
+                registered[n_registered].pdo_index = c->pdo_index;
+                registered[n_registered].pdo_subindex = c->pdo_subindex;
+                registered[n_registered].base_offset = base_off;
+                n_registered++;
+            }
         }
+
         if (c->dir == DIR_DI || c->dir == DIR_DO) {
-            c->offset = (unsigned)off + c->cfg_bit / 8;
+            c->offset = base_off + c->cfg_bit / 8;
             c->bit = c->cfg_bit % 8;
         } else {
-            c->offset = (unsigned)off; /* AI/AO/SCALE: the whole registered word/dword, no bit addressing */
+            c->offset = base_off; /* AI/AO/SCALE: the whole registered word/dword, no bit addressing */
             c->bit = 0;
         }
     }
 
     if (ecrt_domain_size(domain) <= 0) { fprintf(stderr, "io_daemon: empty domain\n"); exit(1); }
+    /* Matches the known-working bench tool's setup -- tells the master the
+     * actual cyclic rate so its internal timing isn't left at a default
+     * that may not match this cycle_us. */
+    ecrt_master_set_send_interval(master, cycle_us);
     if (ecrt_master_activate(master)) { fprintf(stderr, "io_daemon: activate failed\n"); exit(1); }
     domain_pd = ecrt_domain_data(domain);
     if (!domain_pd) { fprintf(stderr, "io_daemon: domain_data failed\n"); exit(1); }
@@ -384,6 +431,23 @@ static inline void write_i16(unsigned offset, int16_t v) {
 static void run_cycle(void) {
     ecrt_master_receive(master);
     ecrt_domain_process(domain);
+
+    /* Working-counter visibility this daemon never had before: AL state
+     * alone (INIT/PREOP/SAFEOP/OP) doesn't guarantee every registered PDO
+     * entry is actually part of a complete exchange each cycle. Logged at
+     * most once a second -- cheap state reads every cycle, the fprintf
+     * itself is rare/bounded, not a steady-state RT cost. */
+    static uint64_t last_diag_us = 0;
+    uint64_t now = now_us();
+    if (now - last_diag_us >= 1000000) {
+        ec_master_state_t ms;
+        ec_domain_state_t ds;
+        ecrt_master_state(master, &ms);
+        ecrt_domain_state(domain, &ds);
+        fprintf(stderr, "io_daemon: link=%u slaves=%u wc=%u wc_state=%u\n",
+                ms.link_up, ms.slaves_responding, ds.working_counter, ds.wc_state);
+        last_diag_us = now;
+    }
 
     uint64_t t = now_us();
     for (int i = 0; i < n_channels; i++) {
