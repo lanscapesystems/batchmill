@@ -66,7 +66,8 @@ export class Mill {
   // Outputs are staged during the scan and written to the I/O image once, at the end (computeOutputs), like a PLC.
   private outImage: Record<string, boolean | number> = {};
   private out(sig: string | undefined, value: boolean | number) { if (sig) this.outImage[sig] = value; }
-  private rotationState = new Map<string, { prevCount: number; prevAtMs: number; runningMs: number; rpm?: number }>();
+  private rotationState = new Map<string, { runningMs: number; rpm?: number }>();
+  private lastDaemonStartUs: number | null = null; // detects an io_daemon restart (see updateBusHealth)
   ioOverrides: Record<string, SignalValue> = {};
   // Gates forcing an output via SetOverride; never persisted, so a restart
   // never comes back up with this on. Resets any forced outputs on exit.
@@ -783,6 +784,7 @@ export class Mill {
   private scan() {
     this.applyOverrides();
     const ioState = readIoState(); // read once; shared by readRealInputs and updateRotationSensors
+    this.updateBusHealth(ioState);
     this.readRealInputs(ioState);
     this.checkLevelSensors();
     this.updateRefills();
@@ -814,6 +816,42 @@ export class Mill {
       if (sig.id in this.ioOverrides) continue;
       const v = state.inputs[sig.id];
       if (v !== undefined) this.ioInputs[sig.id] = v;
+    }
+  }
+
+  // The daemon now gates its own reads/writes on a complete working counter
+  // and publishes the result as `healthy` (io_daemon.c's run_cycle) instead
+  // of this backend trusting "the state file is recent" as proof the I/O
+  // underneath it is valid. Once a rack is actually commissioned, no state
+  // at all (daemon down) or healthy:false (daemon up, bus degraded) both
+  // get the same fail-safe response as a rack mismatch: abort refills,
+  // pause hammermills, pause the active batch. Also detects an io_daemon
+  // process restart (daemonStartUs changing) and clears any forced output
+  // overrides on it — a restarted daemon starts every DO/AO at 0 with no
+  // memory of what was forced before, so a stale UI override should not
+  // silently resume commanding a value the daemon no longer agrees with.
+  private updateBusHealth(state: ReturnType<typeof readIoState>) {
+    const om = this.omronConfig;
+    if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return; // not commissioned yet — nothing to enforce
+
+    if (state && this.lastDaemonStartUs !== null && state.daemonStartUs !== this.lastDaemonStartUs) {
+      const hadOverrides = Object.keys(this.ioOverrides).length > 0;
+      this.ioOverrides = {};
+      if (hadOverrides) {
+        this.raiseFault('OMRON', 'WARNING',
+          'io_daemon restarted — forced outputs were cleared; re-force from Commissioning if still needed', 'W-OM-02');
+        this.clearFault('W-OM-02'); // one-shot notice, not an ongoing condition
+      }
+    }
+    if (state) this.lastDaemonStartUs = state.daemonStartUs;
+
+    const unhealthy = !state || state.healthy === false;
+    if (unhealthy) {
+      this.ioFaultShutdown('E-OM-02', state
+        ? 'EtherCAT process data invalid (link down or incomplete working counter)'
+        : 'io_daemon not reporting (not running, or state file stale)');
+    } else {
+      this.clearFault('E-OM-02');
     }
   }
 
@@ -860,24 +898,27 @@ export class Mill {
   }
 
   // Reads the io_daemon's state file (ethercat-rt/io_daemon.c), which counts
-  // shaft-sensor pulses in its own EtherCAT cyclic loop — this 100ms scan
-  // can't sample fast enough to count them itself. Derives RPM from the
-  // count delta and faults a running motor whose shaft has stalled.
+  // shaft-sensor pulses AND their edge-to-edge interval in its own EtherCAT
+  // cyclic loop — this 100ms scan can't sample fast enough to count them
+  // itself. RPM comes from that interval, not from a count delta over this
+  // scan's own 100ms window: at 500 RPM/1 pulse-per-rev, edges arrive every
+  // 120ms, so a 100ms window aliases between catching 0 or 1 edge (reading
+  // ~0 or ~600 RPM) depending only on where the window happens to land.
   private updateRotationSensors(state: ReturnType<typeof readIoState>) {
     const counters = state?.rotation;
-    const now = Date.now();
+    const nowUs = state?.atUs;
     for (const eq of this.equipment.values()) {
       const sig = eq.config.rotationPulseInput as string | undefined;
       if (!sig) continue;
 
       let st = this.rotationState.get(eq.id);
       if (!st) {
-        st = { prevCount: 0, prevAtMs: now, runningMs: 0 };
+        st = { runningMs: 0 };
         this.rotationState.set(eq.id, st);
       }
       st.runningMs = eq.status === 'running' ? st.runningMs + SCAN_MS : 0;
 
-      if (!counters || !(sig in counters)) {
+      if (!counters || !(sig in counters) || nowUs === undefined) {
         // Daemon not running (dev box, or not installed yet) — no live data,
         // so don't guess an RPM and don't fault on missing infrastructure.
         st.rpm = undefined;
@@ -885,15 +926,26 @@ export class Mill {
       }
 
       const chan = counters[sig];
-      const dtMs = now - st.prevAtMs;
-      if (dtMs > 0) {
-        const pulsesPerRev = (eq.config.pulsesPerRev as number) || 1;
-        st.rpm = ((chan.count - st.prevCount) / pulsesPerRev) * (60000 / dtMs);
-      }
-      st.prevCount = chan.count;
-      st.prevAtMs = now;
-
+      const pulsesPerRev = (eq.config.pulsesPerRev as number) || 1;
       const minRpm = eq.config.minRpm as number | undefined;
+
+      // ageUs and chan.lastEdgeUs are both the daemon's own CLOCK_MONOTONIC
+      // (state.atUs), so their difference is a valid elapsed time even
+      // though neither is comparable to Node's Date.now(). A shaft that's
+      // genuinely stopped must read 0, not keep implying its last live
+      // speed forever — derive the stopped cutoff from minRpm (2x the edge
+      // period that speed implies) when it's configured, so a channel
+      // that's merely slow doesn't nuisance-trip to "stopped" before the
+      // stall fault below would've fired anyway; fall back to a flat 2s
+      // for a channel with no minRpm configured.
+      const ageUs = nowUs - chan.lastEdgeUs;
+      const stoppedUs = typeof minRpm === 'number' && minRpm > 0
+        ? (60_000_000 * pulsesPerRev / minRpm) * 2
+        : 2_000_000;
+      st.rpm = chan.intervalUs > 0 && chan.lastEdgeUs > 0 && ageUs < stoppedUs
+        ? 60_000_000 / (chan.intervalUs * pulsesPerRev)
+        : 0;
+
       const startupDelay = delayMs(eq.config.rotationStartupDelay);
       if (
         typeof minRpm === 'number' && minRpm > 0 &&
@@ -1695,8 +1747,14 @@ export class Mill {
   }
 
   private rackFaultShutdown(mismatched: string[]) {
-    this.raiseFault('OMRON', 'CRITICAL',
-      `Rack mismatch: ${mismatched.join('; ')}`, 'E-OM-01');
+    this.ioFaultShutdown('E-OM-01', `Rack mismatch: ${mismatched.join('; ')}`);
+  }
+
+  // Shared fail-safe response for any I/O-layer fault (rack mismatch, or
+  // the EtherCAT bus itself going unhealthy — see updateBusHealth): raise
+  // the fault, then stop the same things a rack mismatch always stopped.
+  private ioFaultShutdown(code: string, message: string) {
+    this.raiseFault('OMRON', 'CRITICAL', message, code);
     this.abortRefills();
     for (const eq of this.equipment.values()) {
       if (eq.equipmentType === 'hammermill') this.pauseHammermill(eq);
@@ -1704,12 +1762,14 @@ export class Mill {
     if (this.activeBatch && !['COMPLETED', 'FAULTED', 'IDLE', 'PAUSED'].includes(this.activeBatch.state)) {
       this.activeBatch.previousState = this.activeBatch.state;
       this.activeBatch.state = 'PAUSED';
-      this.activeBatch.faultReason = 'I/O rack mismatch — cards missing or wrong type';
+      this.activeBatch.faultReason = message;
     }
   }
 
-  private clearRackFault() {
-    const idx = this.faults.findIndex(f => f.code === 'E-OM-01' && f.active);
+  private clearRackFault() { this.clearFault('E-OM-01'); }
+
+  private clearFault(code: string) {
+    const idx = this.faults.findIndex(f => f.code === code && f.active);
     if (idx >= 0) {
       this.faults[idx].active = false;
       this.faults[idx].clearedAt = new Date().toISOString();

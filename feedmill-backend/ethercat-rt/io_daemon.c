@@ -22,12 +22,22 @@
  * once per scan; it never touches raw PDOs. This program does no
  * control logic of its own — that stays in src/mill.ts.
  *
- * FAIL-SAFE: if the command file stops being updated (Node backend
+ * FAIL-SAFE: if the command file stops being re-affirmed (Node backend
  * down, or the link between them broken) for COMMAND_STALE_US, every
  * DO/AO is forced to zero/off regardless of its last commanded value —
  * do not rely on EtherCAT output state alone as a safety function
  * (see omron_nx_ethercat_linux_configuration.md's commissioning
- * restrictions).
+ * restrictions). Freshness is driven by a sequence number INSIDE the
+ * command file (see reader_thread), not file mtime, and the daemon
+ * carries no output state across its own restart — every DO/AO starts
+ * at 0 until the first fully-valid command image is parsed.
+ *
+ * BUS VALIDITY: every cycle gates on ms.link_up && ds.wc_state ==
+ * EC_WC_COMPLETE (see run_cycle) before touching inputs or outputs from
+ * domain_pd — an incomplete working counter no longer silently reads
+ * garbage or writes a command into a half-exchanged image. The result
+ * is published as "healthy" in the state file for the backend to act on
+ * (src/mill.ts's updateBusHealth) rather than just displaying stale data.
  *
  * CONFIG IS GENERATED, NOT HAND-WRITTEN: feedmill-backend writes this
  * program's config file itself (generateIoConf()/syncIoConf() in
@@ -39,12 +49,12 @@
  * compiled or run against real IgH headers/hardware in this session.
  * CONFIRMED on real hardware (an NX-ECC203 + NX-OD5256 + NX-ID5442): the DI
  * read path works end to end (16 points sharing one 0x6022:01 entry,
- * addressed per-bit). The DO write path did NOT energize the real output
- * despite the software reporting it forced ON — diagnosed as re-
- * registering the same PDO entry once per channel instead of once per
- * entry (see setup_ethercat()'s registered[] cache, added as the fix) —
- * NOT yet re-confirmed against real hardware after that fix. Before
- * trusting it:
+ * addressed per-bit), and the DO write path with the PDO dedup fix
+ * (registered[] cache) plus the command-heartbeat fix (ioDaemon.ts
+ * always rewriting, see git history) — forced outputs no longer dropped
+ * out ~2s after being set. The bus-validity gate, sequence-based command
+ * protocol, and edge-interval RPM fields in this revision are NOT yet
+ * re-confirmed against real hardware. Before trusting it:
  *
  *   1. Build on the Debian target once the IgH master + dev headers
  *      are installed (the install/install.sh script does this):
@@ -93,7 +103,6 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
-#include <sys/stat.h>
 #include <ecrt.h>
 
 #define MAX_CHANNELS 256
@@ -115,6 +124,7 @@ typedef struct {
     bool       last_state;     /* DI only — edge detection */
     uint64_t   count;          /* DI+counted only — accessed via __atomic builtins from both threads */
     uint64_t   last_edge_us;
+    uint64_t   edge_interval_us; /* DI+counted only — time since the PREVIOUS edge, for RPM; 0 until a 2nd edge arrives */
     int32_t    value;          /* current reading (DI 0/1, AI raw int16) or desired output (DO/AO) — atomic */
 } channel_t;
 
@@ -133,6 +143,16 @@ static long cycle_us = 4000;
 static char state_path[256] = "/run/feedmill/io-state.json";
 static char command_path[256] = "/run/feedmill/io-command.txt";
 static volatile bool running = true;
+static uint64_t daemon_start_us = 0; /* captured once in main(); published so the backend can detect a daemon restart */
+
+/* Bus health + diagnostic counters, written every cycle by the RT thread
+ * (atomic stores only, no I/O) and read/logged by the writer thread —
+ * keeps even the once-a-second diagnostic fprintf off the RT path. */
+static volatile unsigned diag_link_up = 0;
+static volatile unsigned diag_slaves = 0;
+static volatile unsigned diag_wc = 0;
+static volatile unsigned diag_wc_state = 0;
+static volatile bool bus_healthy = false; /* false until the first fully-healthy cycle */
 
 static void on_signal(int sig) { (void)sig; running = false; }
 
@@ -228,10 +248,24 @@ static void *writer_thread(void *arg) {
     (void)arg;
     char tmp_path[280];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", state_path);
+    uint64_t last_diag_us = 0;
     while (running) {
+        bool healthy = __atomic_load_n(&bus_healthy, __ATOMIC_RELAXED);
+        uint64_t now = now_us();
+        if (now - last_diag_us >= 1000000) {
+            fprintf(stderr, "io_daemon: link=%u slaves=%u wc=%u wc_state=%u healthy=%u\n",
+                    __atomic_load_n(&diag_link_up, __ATOMIC_RELAXED),
+                    __atomic_load_n(&diag_slaves, __ATOMIC_RELAXED),
+                    __atomic_load_n(&diag_wc, __ATOMIC_RELAXED),
+                    __atomic_load_n(&diag_wc_state, __ATOMIC_RELAXED),
+                    healthy);
+            last_diag_us = now;
+        }
+
         FILE *f = fopen(tmp_path, "w");
         if (f) {
-            fprintf(f, "{\"atUs\":%llu,\"inputs\":{", (unsigned long long)now_us());
+            fprintf(f, "{\"atUs\":%llu,\"daemonStartUs\":%llu,\"healthy\":%s,\"inputs\":{",
+                    (unsigned long long)now, (unsigned long long)daemon_start_us, healthy ? "true" : "false");
             bool first = true;
             for (int i = 0; i < n_channels; i++) {
                 channel_t *c = &channels[i];
@@ -249,9 +283,10 @@ static void *writer_thread(void *arg) {
                 if (!(c->dir == DIR_DI && c->counted)) continue;
                 uint64_t cnt = __atomic_load_n(&c->count, __ATOMIC_RELAXED);
                 uint64_t edge = __atomic_load_n(&c->last_edge_us, __ATOMIC_RELAXED);
-                fprintf(f, "%s\"%s\":{\"count\":%llu,\"lastEdgeUs\":%llu}",
+                uint64_t interval = __atomic_load_n(&c->edge_interval_us, __ATOMIC_RELAXED);
+                fprintf(f, "%s\"%s\":{\"count\":%llu,\"lastEdgeUs\":%llu,\"intervalUs\":%llu}",
                         first ? "" : ",", c->signal_id,
-                        (unsigned long long)cnt, (unsigned long long)edge);
+                        (unsigned long long)cnt, (unsigned long long)edge, (unsigned long long)interval);
                 first = false;
             }
             fprintf(f, "}}\n");
@@ -281,30 +316,68 @@ static void force_outputs_safe(void) {
     }
 }
 
+/* Freshness is driven by a sequence number INSIDE the command file (first
+ * line, "seq <N>"), not the file's mtime: st_mtime is only 1-second
+ * resolution, so a start immediately followed by a stop within the same
+ * wall-clock second could leave the daemon never noticing the second
+ * write. Re-reading unconditionally every poll instead makes mtime
+ * irrelevant. The whole file must parse cleanly (seq line + every
+ * non-comment line a well-formed "output <sig> <val>") before ANY of it
+ * is applied or the watchdog deadline is refreshed — a malformed or
+ * half-written image is rejected outright rather than applied line-by-
+ * line as it's parsed (which used to let the RT thread see a mix of an
+ * old and new command on a torn read). */
+typedef struct { char sig[32]; int32_t val; } pending_output_t;
+
 static void *reader_thread(void *arg) {
     (void)arg;
-    time_t last_mtime = 0;
     uint64_t last_applied_us = now_us();
+    uint64_t last_seq = 0;
+    bool have_seq = false;
     while (running) {
-        struct stat st;
-        if (stat(command_path, &st) == 0) {
-            if (st.st_mtime != last_mtime) {
-                last_mtime = st.st_mtime;
-                last_applied_us = now_us();
-                FILE *f = fopen(command_path, "r");
-                if (f) {
-                    char line[256];
-                    while (fgets(line, sizeof(line), f)) {
-                        char kw[16], sig[32]; long val;
-                        if (line[0] == '#' || line[0] == '\n') continue;
-                        if (sscanf(line, "%15s %31s %ld", kw, sig, &val) == 3 && strcmp(kw, "output") == 0) {
-                            channel_t *c = find_output_channel(sig);
-                            if (c) __atomic_store_n(&c->value, (int32_t)val, __ATOMIC_RELAXED);
-                        }
-                    }
-                    fclose(f);
+        FILE *f = fopen(command_path, "r");
+        if (f) {
+            char line[256];
+            bool ok = true;
+            bool got_seq = false;
+            uint64_t seq = 0;
+            static pending_output_t pending[MAX_CHANNELS];
+            int n_pending = 0;
+            while (ok && fgets(line, sizeof(line), f)) {
+                if (line[0] == '#' || line[0] == '\n') continue;
+                char kw[16];
+                if (sscanf(line, "%15s", kw) != 1) continue;
+                if (strcmp(kw, "seq") == 0) {
+                    unsigned long long v;
+                    if (sscanf(line, "%15s %llu", kw, &v) != 2) { ok = false; break; }
+                    seq = v; got_seq = true;
+                } else if (strcmp(kw, "output") == 0) {
+                    char sig[32]; long val;
+                    if (sscanf(line, "%15s %31s %ld", kw, sig, &val) != 3) { ok = false; break; }
+                    if (n_pending >= MAX_CHANNELS) { ok = false; break; }
+                    snprintf(pending[n_pending].sig, sizeof(pending[n_pending].sig), "%s", sig);
+                    pending[n_pending].val = (int32_t)val;
+                    n_pending++;
+                } else {
+                    ok = false; break; /* unrecognized line — reject the whole image, don't guess */
                 }
             }
+            fclose(f);
+            if (ok && got_seq && (!have_seq || seq != last_seq)) {
+                for (int i = 0; i < n_pending; i++) {
+                    channel_t *c = find_output_channel(pending[i].sig);
+                    if (c) __atomic_store_n(&c->value, pending[i].val, __ATOMIC_RELAXED);
+                }
+                last_seq = seq;
+                have_seq = true;
+                last_applied_us = now_us();
+            } else if (ok && got_seq && seq == last_seq) {
+                /* Same command as last poll, re-affirmed — still proof of life. */
+                last_applied_us = now_us();
+            }
+            /* malformed image: neither applied nor treated as a heartbeat —
+             * last_applied_us is left alone so a persistently bad file
+             * still trips the stale-command fail-safe below. */
         }
         if (now_us() - last_applied_us > COMMAND_STALE_US) {
             force_outputs_safe(); /* Node backend isn't updating commands — fail safe, not last-known-good */
@@ -432,48 +505,55 @@ static void run_cycle(void) {
     ecrt_master_receive(master);
     ecrt_domain_process(domain);
 
-    /* Working-counter visibility this daemon never had before: AL state
-     * alone (INIT/PREOP/SAFEOP/OP) doesn't guarantee every registered PDO
-     * entry is actually part of a complete exchange each cycle. Logged at
-     * most once a second -- cheap state reads every cycle, the fprintf
-     * itself is rare/bounded, not a steady-state RT cost. */
-    static uint64_t last_diag_us = 0;
-    uint64_t now = now_us();
-    if (now - last_diag_us >= 1000000) {
-        ec_master_state_t ms;
-        ec_domain_state_t ds;
-        ecrt_master_state(master, &ms);
-        ecrt_domain_state(domain, &ds);
-        fprintf(stderr, "io_daemon: link=%u slaves=%u wc=%u wc_state=%u\n",
-                ms.link_up, ms.slaves_responding, ds.working_counter, ds.wc_state);
-        last_diag_us = now;
-    }
+    /* Per-cycle bus-validity gate: AL state alone (INIT/PREOP/SAFEOP/OP)
+     * doesn't guarantee every registered PDO entry is actually part of a
+     * complete exchange THIS cycle. Previously this was only logged once a
+     * second and never consulted — inputs were read and outputs written
+     * from domain_pd regardless of whether the exchange behind them was
+     * complete. Now every read/write is gated: unhealthy means DI/AI/SCALE
+     * hold their last good value (no live update) and DO/AO are forced to
+     * 0 in the image, not whatever was last commanded — the published
+     * "healthy" flag (writer_thread) is how the backend tells it apart
+     * from a stale-but-plausible reading and inhibits control on it. */
+    ec_master_state_t ms;
+    ec_domain_state_t ds;
+    ecrt_master_state(master, &ms);
+    ecrt_domain_state(domain, &ds);
+    bool healthy = ms.link_up && ds.wc_state == EC_WC_COMPLETE;
+    __atomic_store_n(&bus_healthy, healthy, __ATOMIC_RELAXED);
+    __atomic_store_n(&diag_link_up, ms.link_up, __ATOMIC_RELAXED);
+    __atomic_store_n(&diag_slaves, ms.slaves_responding, __ATOMIC_RELAXED);
+    __atomic_store_n(&diag_wc, ds.working_counter, __ATOMIC_RELAXED);
+    __atomic_store_n(&diag_wc_state, ds.wc_state, __ATOMIC_RELAXED);
 
     uint64_t t = now_us();
     for (int i = 0; i < n_channels; i++) {
         channel_t *c = &channels[i];
         switch (c->dir) {
         case DIR_DI: {
+            if (!healthy) break;
             bool state = read_bit(c->offset, c->bit);
             if (c->counted && state && !c->last_state) {
+                uint64_t prev_edge = __atomic_load_n(&c->last_edge_us, __ATOMIC_RELAXED);
                 __atomic_fetch_add(&c->count, 1, __ATOMIC_RELAXED);
                 __atomic_store_n(&c->last_edge_us, t, __ATOMIC_RELAXED);
+                if (prev_edge) __atomic_store_n(&c->edge_interval_us, t - prev_edge, __ATOMIC_RELAXED);
             }
             c->last_state = state;
             __atomic_store_n(&c->value, state ? 1 : 0, __ATOMIC_RELAXED);
             break;
         }
         case DIR_AI:
-            __atomic_store_n(&c->value, read_i16(c->offset), __ATOMIC_RELAXED);
+            if (healthy) __atomic_store_n(&c->value, read_i16(c->offset), __ATOMIC_RELAXED);
             break;
         case DIR_SCALE:
-            __atomic_store_n(&c->value, read_i32(c->offset), __ATOMIC_RELAXED);
+            if (healthy) __atomic_store_n(&c->value, read_i32(c->offset), __ATOMIC_RELAXED);
             break;
         case DIR_DO:
-            write_bit(c->offset, c->bit, __atomic_load_n(&c->value, __ATOMIC_RELAXED) != 0);
+            write_bit(c->offset, c->bit, healthy && __atomic_load_n(&c->value, __ATOMIC_RELAXED) != 0);
             break;
         case DIR_AO:
-            write_i16(c->offset, (int16_t)__atomic_load_n(&c->value, __ATOMIC_RELAXED));
+            write_i16(c->offset, healthy ? (int16_t)__atomic_load_n(&c->value, __ATOMIC_RELAXED) : 0);
             break;
         }
     }
@@ -487,6 +567,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s <config-file>\n", argv[0]);
         return 1;
     }
+    daemon_start_us = now_us();
     load_config(argv[1]);
 
     signal(SIGINT, on_signal);

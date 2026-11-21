@@ -17,10 +17,13 @@ export const rawToPct = (raw: number): number => (raw / NX_ANALOG_FULL_SCALE) * 
 export interface RotationChannelState {
   count: number;
   lastEdgeUs: number;
+  intervalUs: number; // time between the last two edges, in the daemon's own clock; 0 until a 2nd edge arrives
 }
 
 interface IoStateFile {
-  atUs: number;
+  atUs: number; // daemon's CLOCK_MONOTONIC at write time -- compare only against other *Us fields from this same file, never against Date.now()
+  daemonStartUs: number; // changes across a daemon restart; callers use this to detect one (see mill.ts's updateBusHealth)
+  healthy: boolean; // per-cycle bus validity (link up + complete working counter) -- false means inputs/rotation below are frozen at last-good, not live
   inputs: Record<string, SignalValue>;
   rotation: Record<string, RotationChannelState>;
 }
@@ -42,19 +45,21 @@ export function readIoState(): IoStateFile | null {
   }
 }
 
+let seq = 0;
+
 /**
  * Writes every DO/AO signal's desired value for the io_daemon to apply on
  * its next cycle. Analog values are converted from the engineering-unit
  * percentages mill.ts works in to the daemon's raw PDO counts (see
  * NX_ANALOG_FULL_SCALE above). Always writes (tmp+rename) even when the
- * content is unchanged: io_daemon.c's reader thread treats the file's
- * mtime as a liveness heartbeat and force-zeros every output after 2s
- * without an mtime change (COMMAND_STALE_US) — skipping the write on
- * unchanged content would starve that heartbeat and the daemon would
- * zero a steadily-commanded output 2s after it was set.
+ * commanded values are unchanged, with an incrementing `seq` as the first
+ * line: io_daemon.c's reader thread treats that sequence number, not the
+ * file's mtime, as its liveness heartbeat (mtime is only 1-second
+ * resolution, which can hide a command that changes twice in the same
+ * second) and force-zeros every output after 2s without it advancing.
  */
 export function writeIoCommand(outputs: Record<string, SignalValue>, signals: SignalDef[]): void {
-  const lines: string[] = [];
+  const lines: string[] = [`seq ${++seq}`];
   for (const sig of signals) {
     if (sig.direction !== 'DO' && sig.direction !== 'AO') continue;
     const v = outputs[sig.id];

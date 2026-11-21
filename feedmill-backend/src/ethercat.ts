@@ -19,6 +19,17 @@ export interface EthercatSlave {
   name: string;
 }
 
+// shortcut: every call below is synchronous (execFileSync) and blocks the
+// WHOLE Node event loop for the subprocess's duration, including the
+// mill's own 100ms scan timer and any WebSocket traffic — not just the
+// caller. verifyEthercatRack/syncIoConf run from explicit, infrequent user
+// actions (Read Rack, reconfigure), so the stall is bounded and visible;
+// checkRackPresence runs on rackWatchdogCheck's unconditional 3s timer in
+// mill.ts, so it stalls the scan loop on every tick. Upgrade to converge
+// on when the scan's own measured jitter (see io_daemon.c's P1 timing
+// finding) demands it — would need runEthercat and every caller async
+// (execFile, not execFileSync), which ripples into mill.ts's command
+// dispatch; not done here. See ethercat-io-audit.md's P1 timing finding.
 function runEthercat(args: string[]): { out: string | null; error?: string } {
   try {
     return { out: execFileSync('ethercat', args, { encoding: 'utf8', timeout: 3000 }) };
@@ -98,6 +109,32 @@ function getRackPdoEntries(position: number): PdoEntry[] {
     if (inRange) entries.push({ index, subindex: parseInt(m[2], 16), bits: Number(m[3]), dir });
   }
   return entries;
+}
+
+// Confirmed module idents from CoE 0xF050 ("Detected module ident list"),
+// keyed by physical slot number as the SDO subindex (1-63) — confirmed
+// against a real NX-ECC203 via a standalone bench tool, not this program.
+// Only models listed here get a real per-slot identity check in
+// verifyEthercatRack(); everything else falls back to the PDO-count-based
+// allocation check (allocateRackEntries) alone, which can't tell a wrong
+// card from a right one of the same category/width — add a model here
+// only once its ident is confirmed against real hardware.
+const NX_CARD_IDENTS: Record<string, number> = {
+  'NX-OD5256': 0x00135256,
+  'NX-ID5442': 0x00115442,
+};
+
+// shortcut: `ethercat upload`'s exact output format for a uint32 SDO
+// wasn't re-verified against a live box in this pass (only the 0xF050
+// index:subindex scheme itself was, via the user's own bench tool) —
+// Number() parses either a bare decimal or a "0x"-prefixed hex string, so
+// this should survive either convention, but if getSlotModuleIdent always
+// returns null on real hardware, check the raw CLI output here first.
+function getSlotModuleIdent(slot: number): number | null {
+  const { out } = runEthercat(['upload', '-p', '0', '-t', 'uint32', '0xf050', String(slot)]);
+  if (out === null) return null;
+  const n = Number(out.trim());
+  return Number.isFinite(n) ? n : null;
 }
 
 interface SlotAllocation {
@@ -181,7 +218,27 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
     return { ...card, actual: coupler.name, status: alloc.status, pdoEntries: alloc.pdoEntries };
   });
 
-  return { cards, warnings };
+  // PDO-count allocation (above) can accept the wrong card if it's the same
+  // category/width as the one expected — it has no notion of slot identity.
+  // Cross-check against 0xF050 for every model we have a confirmed ident
+  // for; a mismatch overrides an otherwise-"ok" allocation.
+  const identifiedCards = cards.map(card => {
+    if (card.status !== 'ok') return card;
+    const expectedIdent = NX_CARD_IDENTS[card.model];
+    if (expectedIdent === undefined) return card; // no confirmed ident for this model — can't verify beyond PDO-count allocation
+    const actualIdent = getSlotModuleIdent(card.slot);
+    if (actualIdent === null) {
+      warnings.push(`${card.model} in slot ${card.slot}: could not read module identity (0xF050) to verify — relying on PDO-count allocation only`);
+      return card;
+    }
+    if (actualIdent !== expectedIdent) {
+      warnings.push(`${card.model} in slot ${card.slot}: module identity 0x${actualIdent.toString(16)} does not match expected 0x${expectedIdent.toString(16)} — wrong card in this slot`);
+      return { ...card, status: 'mismatch' as const };
+    }
+    return card;
+  });
+
+  return { cards: identifiedCards, warnings };
 }
 
 /** Cheap, poll-safe rack presence check for the watchdog — same coupler-
@@ -218,6 +275,17 @@ export function checkRackPresence(om: OmronConfig): { cards: IoRackCard[]; unrea
     cards: om.cards.map(card => ({ ...card, actual: coupler.name, status: allocations.get(card.slot)!.status })),
   };
 }
+
+// Analog (AI/AO) and load-cell (SCALE) channels need a per-model confirmed
+// PDO map, engineering range/encoding and failure behavior — unlike a
+// digital point, a wrong assumption here can silently report or command
+// the wrong physical quantity rather than just failing to toggle. Nothing
+// is listed yet: no analog or RS1201 card has been bench-verified. Add a
+// model here only once its actual PDO map and scaling are confirmed
+// against the installed module (see ethercat-io-audit.md's P1 analog
+// finding) — until then, generateIoConf excludes it from io.conf entirely
+// rather than generating a channel against an unverified guess.
+const VERIFIED_ANALOG_MODELS = new Set<string>([]);
 
 /** Builds the io_daemon's full channel config from every signal currently
  * mapped to a rack address (see buildSignals() in mill.ts) — the daemon has
@@ -256,6 +324,7 @@ export function generateIoConf(
     if (!card) { warnings.push(`${sc.name}: no card in slot ${sc.rackSlot}`); continue; }
     const def = NX_CARD_CATALOG.find(d => d.model === card.model);
     if (!def || def.category !== 'scale') { warnings.push(`${sc.name}: ${card.model} is not a load cell card`); continue; }
+    if (!VERIFIED_ANALOG_MODELS.has(card.model)) { warnings.push(`${sc.name}: ${card.model} is not yet bench-verified for production use — excluded from io.conf (see ethercat-io-audit.md)`); continue; }
     const alloc = allocations.get(card.slot);
     if (!alloc || alloc.status !== 'ok' || !alloc.pdoEntries) { warnings.push(`${sc.name}: ${card.model} in slot ${sc.rackSlot} — not enough PDO entries discovered; re-run Read Rack`); continue; }
     // RS1201 convention, unverified: the weight value is the card's one allocated entry.
@@ -278,6 +347,10 @@ export function generateIoConf(
     if (!card) { warnings.push(`${sig.id}: no card in slot ${slot}`); continue; }
     const def = NX_CARD_CATALOG.find(d => d.model === card.model);
     if (!def || def.category !== sig.direction) { warnings.push(`${sig.id}: ${card.model} is not a ${sig.direction} card`); continue; }
+    if ((sig.direction === 'AI' || sig.direction === 'AO') && !VERIFIED_ANALOG_MODELS.has(card.model)) {
+      warnings.push(`${sig.id}: ${card.model} is not yet bench-verified for production use — excluded from io.conf (see ethercat-io-audit.md)`);
+      continue;
+    }
     const alloc = allocations.get(slot);
     if (!alloc || alloc.status !== 'ok' || !alloc.pdoEntries) { warnings.push(`${sig.id}: ${card.model} in slot ${slot} — not enough PDO entries discovered; re-run Read Rack`); continue; }
 
