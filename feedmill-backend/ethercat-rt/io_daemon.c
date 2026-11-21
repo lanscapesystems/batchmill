@@ -22,15 +22,18 @@
  * once per scan; it never touches raw PDOs. This program does no
  * control logic of its own — that stays in src/mill.ts.
  *
- * FAIL-SAFE: if the command file stops being re-affirmed (Node backend
- * down, or the link between them broken) for COMMAND_STALE_US, every
- * DO/AO is forced to zero/off regardless of its last commanded value —
- * do not rely on EtherCAT output state alone as a safety function
+ * FAIL-SAFE: if the command file's sequence number stops ADVANCING (Node
+ * backend down, or the link between them broken) for COMMAND_STALE_US,
+ * every DO/AO is forced to zero/off regardless of its last commanded
+ * value — do not rely on EtherCAT output state alone as a safety function
  * (see omron_nx_ethercat_linux_configuration.md's commissioning
- * restrictions). Freshness is driven by a sequence number INSIDE the
- * command file (see reader_thread), not file mtime, and the daemon
- * carries no output state across its own restart — every DO/AO starts
- * at 0 until the first fully-valid command image is parsed.
+ * restrictions). Freshness is driven by that sequence number INSIDE the
+ * command file (see reader_thread), not file mtime; re-reading an
+ * UNCHANGED seq must NOT refresh the deadline (an earlier revision did,
+ * which meant a dead backend's last command could never go stale at
+ * all). The daemon also carries no output state across its own restart —
+ * every DO/AO starts at 0 until the first fully-valid command image is
+ * parsed.
  *
  * BUS VALIDITY: every cycle gates on ms.link_up && ds.wc_state ==
  * EC_WC_COMPLETE (see run_cycle) before touching inputs or outputs from
@@ -371,13 +374,17 @@ static void *reader_thread(void *arg) {
                 last_seq = seq;
                 have_seq = true;
                 last_applied_us = now_us();
-            } else if (ok && got_seq && seq == last_seq) {
-                /* Same command as last poll, re-affirmed — still proof of life. */
-                last_applied_us = now_us();
             }
-            /* malformed image: neither applied nor treated as a heartbeat —
-             * last_applied_us is left alone so a persistently bad file
-             * still trips the stale-command fail-safe below. */
+            /* seq unchanged (Node hasn't written since our last poll — the
+             * normal case, since this thread polls every 20ms and Node
+             * writes every ~100ms) or a malformed image: last_applied_us is
+             * left alone either way. Re-reading a STATIC file proves only
+             * that the file still exists, not that Node is still alive —
+             * refreshing the deadline on an unchanged seq (an earlier
+             * version of this code did) would mean a dead backend's last
+             * command, including a forced-ON output, could never trip the
+             * stale-command fail-safe at all. Only a seq that actually
+             * ADVANCES counts as proof of life. */
         }
         if (now_us() - last_applied_us > COMMAND_STALE_US) {
             force_outputs_safe(); /* Node backend isn't updating commands — fail safe, not last-known-good */

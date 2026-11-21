@@ -14,7 +14,10 @@ AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK
 LimitRTPRIO=99
 LimitMEMLOCK=infinity
 RuntimeDirectory=feedmill
-User=root
+# The backend writes io-command.txt in this runtime directory.
+User=feedmill
+Group=feedmill
+SupplementaryGroups=ethercat
 
 [Install]
 WantedBy=multi-user.target
