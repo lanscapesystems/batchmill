@@ -192,6 +192,23 @@ if [[ "${FEEDMILL_UPDATE:-0}" != 1 ]]; then # web updates run offline; packages 
   apt-get install -y -qq --no-install-recommends \
     build-essential autoconf automake libtool pkg-config git rsync nginx curl unzip openssl \
     "linux-headers-$(uname -r)" >/dev/null
+
+  # better-sqlite3 needs Node 22+, newer than Debian 13's own nodejs package.
+  # Use NodeSource's signed apt repo (key into a dedicated keyring, repo scoped
+  # to it) rather than piping their setup script into a root shell.
+  node_ok() { command -v node >/dev/null && [[ "$(node -v | sed 's/^v//' | cut -d. -f1)" -ge 22 ]]; }
+  if ! node_ok; then
+    log "installing Node.js 22 from the NodeSource apt repo"
+    apt-get install -y -qq --no-install-recommends ca-certificates gnupg >/dev/null
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg
+    chmod 0644 /etc/apt/keyrings/nodesource.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+      >/etc/apt/sources.list.d/nodesource.list
+    apt-get update -qq
+    apt-get install -y -qq nodejs >/dev/null
+    hash -r # pick up the new /usr/bin/node
+  fi
 fi
 command -v node >/dev/null || die "node is not installed — install Node.js 22+ first, then re-run"
 NODE_BIN="$(command -v node)"
