@@ -30,10 +30,10 @@ const DISCHARGE_TIMEOUT_MS = 60000;
 const delayMs = (sec: unknown, fallbackSec = 0) => Math.max(0, Number(sec ?? fallbackSec) || 0) * 1000;
 const EDITABLE_STATES = new Set(['IDLE', 'READY']);
 // Per-device input bypasses ("Overrides" in the sidebar): the input is ignored as if it were not assigned.
-const BYPASSABLE = ['runConfirmAux', 'vfdAuxInput', 'analogLoadInput', 'rotationPulseInput', 'openLimitInput', 'closedLimitInput',
+const BYPASSABLE = ['runConfirmAux', 'vfdAuxInput', 'motorAuxInput', 'analogLoadInput', 'rotationPulseInput', 'openLimitInput', 'closedLimitInput',
   'highLevelInput', 'lowLevelInput', 'fullSensor', 'lowSensor'];
 // Faults that latch their equipment in 'fault' until reset (restored on boot if the equipment state was lost).
-const TRIP_CODES = ['E-MT-01', 'E-MT-02', 'E-MT-03', 'E-LD-01', 'E-LD-03', 'E-GT-01', 'W-GT-02'];
+const TRIP_CODES = ['E-MT-01', 'E-MT-02', 'E-MT-03', 'E-LD-01', 'E-LD-03', 'E-GT-01', 'E-GT-03', 'W-GT-02'];
 type LoadMon = { avgSize: number; avg: MovingAverage; hiWarn: OnDelay; hiPause: OnDelay; pid: LoadPid; tuner?: RelayTuner; tuneBase?: number; tuneWasAuto?: boolean };
 
 // One hammermill refill cycle: all path equipment is requested at once and runs until the destination high switch.
@@ -47,11 +47,11 @@ interface Refill {
 }
 
 const PORT_LABELS: Record<string, string> = {
-  runOutput: 'Run', runConfirmAux: 'Run FB', openOutput: 'Open', closeOutput: 'Close',
-  openLimitInput: 'Open FB', closedLimitInput: 'Closed FB',
+  runOutput: 'Run', runConfirmAux: 'Run FB', openOutput: 'P1', closeOutput: 'P2',
+  openLimitInput: 'P1 FB', closedLimitInput: 'P2 FB',
   highLevelInput: 'High Level', lowLevelInput: 'Low Level', fullSensor: 'Full', lowSensor: 'Low',
   analogSpeedOutput: 'Speed', analogLoadInput: 'Load', rotationPulseInput: 'Rotation',
-  vfdRunOutput: 'VFD Run', vfdAuxInput: 'VFD Aux',
+  vfdRunOutput: 'VFD Run', vfdAuxInput: 'VFD Aux', motorAuxInput: 'Motor Aux',
 };
 
 export class Mill {
@@ -136,6 +136,8 @@ export class Mill {
         this.pauseHammermill(eq);
       }
     }
+    // gates no longer have Hand (they have P1 / P2): a saved Hand selection becomes Off
+    for (const eq of this.equipment.values()) if (eq.equipmentType === 'gate' && eq.mode === 'Hand') eq.mode = 'Off';
     this.restoreTripLatches();
     const recovered = loadActiveBatch();
     if (recovered && !['COMPLETED', 'FAULTED', 'IDLE'].includes(recovered.state)) {
@@ -241,7 +243,9 @@ export class Mill {
         const eq = this.equipment.get(cmd.targetId ?? '');
         if (!eq) return reject('Unknown equipment');
         const mode = cmd.parameters?.mode as EquipmentMode | undefined;
-        if (!mode || !['Auto', 'Hand', 'Off'].includes(mode)) return reject('Invalid mode');
+        if (eq.equipmentType === 'bin' || eq.equipmentType === 'finished_bin') return reject('Bins have no HOA (no motor)');
+        const allowed = eq.equipmentType === 'gate' ? ['P1', 'P2', 'Auto', 'Off'] : ['Hand', 'Auto', 'Off'];
+        if (!mode || !allowed.includes(mode)) return reject('Invalid mode');
         // A hammermill mid-refill may be switched Off (HOA): the refill then does its controlled stop.
         const pausingMill = eq.equipmentType === 'hammermill' && mode === 'Off' && !!eq.owner?.startsWith('REFILL-');
         if (eq.owner && mode !== 'Auto' && !pausingMill) return reject('Equipment owned by batch ' + eq.owner);
@@ -505,8 +509,11 @@ export class Mill {
         f.active = false;
         f.clearedAt = new Date().toISOString();
         persistFault(f);
+        // Only clearing a trip fault releases the equipment's latch, and only when no other trip fault is still active on it.
         const eq = this.equipment.get(f.equipment);
-        if (eq && eq.status === 'fault') { eq.status = 'not_running'; eq.faultReason = undefined; eq.faultTimerMs = 0; }
+        if (eq && eq.status === 'fault' && TRIP_CODES.includes(f.code) && !this.faults.some(x => x.active && x.equipment === eq.id && TRIP_CODES.includes(x.code))) {
+          eq.status = 'not_running'; eq.faultReason = undefined; eq.faultTimerMs = 0;
+        }
         return ok();
       }
 
@@ -517,8 +524,10 @@ export class Mill {
         eq.status = 'not_running';
         eq.faultReason = undefined;
         eq.faultTimerMs = 0;
-        const f = this.faults.find(f => f.equipment === eq.id && f.active);
-        if (f) { f.active = false; f.clearedAt = new Date().toISOString(); persistFault(f); }
+        // clear every active trip fault of this equipment (not warnings): a left-over one would re-latch it after a restart
+        for (const f of this.faults) {
+          if (f.equipment === eq.id && f.active && TRIP_CODES.includes(f.code)) { f.active = false; f.clearedAt = new Date().toISOString(); persistFault(f); }
+        }
         return ok();
       }
 
@@ -994,7 +1003,13 @@ export class Mill {
       if (v !== undefined && sig.direction === 'AI' && typeof v === 'number') {
         // 32767 = wire break (W522 §6-2): hold nothing, fault it, never present it as a reading
         const code = `W-AI-${sig.id}`;
-        if (v === NX_ANALOG_DISCONNECT_RAW) { this.aiDisconnected.add(sig.id); this.raiseFault('OMRON', 'WARNING', `${sig.id}: analog input open circuit (sensor disconnected)`, code); continue; }
+        if (v === NX_ANALOG_DISCONNECT_RAW) {
+          this.aiDisconnected.add(sig.id);
+          // an open channel nobody is using is normal: only a point mapped to equipment is a fault
+          if (sig.equipmentId) this.raiseFault('OMRON', 'WARNING', `${sig.id}: analog input open circuit (sensor disconnected)`, code);
+          else this.clearFault(code);
+          continue;
+        }
         this.aiDisconnected.delete(sig.id);
         this.clearFault(code);
         v = rawToPct(v, fullScaleFor(sig.id, this.omronConfig.cards));
@@ -1175,7 +1190,7 @@ export class Mill {
 
     if (!usable || eq.mode === 'Off') eq.request = false;
     else if (eq.mode === 'Hand') eq.request = true;
-    // Auto: keep the request set by the batch engine / refill
+    else if (!eq.owner) eq.request = false; // Auto only runs on a request from a batch / refill; a Hand request must not carry over
 
     if (!usable) {
       eq.runCmd = false; // a fault or disable drops the run command at once
@@ -1451,21 +1466,34 @@ export class Mill {
     const openLimit = this.byp(eq, 'openLimitInput') ? undefined : eq.config.openLimitInput as string | undefined;
     const closedLimit = this.byp(eq, 'closedLimitInput') ? undefined : eq.config.closedLimitInput as string | undefined;
     const timeout = delayMs(eq.config.positionTimeout, 5);
+    // Motor gate (dual outputs to a reversing starter): the output is only needed while moving, so it drops once the limit
+    // switch confirms the position; the starter's aux must be on while an output is on.
+    const motor = eq.config.motorGate === true && !!closeOutput;
+    const auxSig = motor && !this.byp(eq, 'motorAuxInput') ? eq.config.motorAuxInput as string | undefined : undefined;
 
     const openFb = openLimit ? !!this.ioInputs[openLimit] : undefined;
     const closedFb = closedLimit ? !!this.ioInputs[closedLimit] : undefined;
 
-    // Gates hold position unless a sequence commands them.
-    // request=true → open, request=false with owner → close, no owner → hold outputs
-    const hasOwner = !!(eq.owner || eq.mode === 'Hand');
+    // P1 / P2 are the gate's two outlets (what each one feeds comes from the flow path). Coil 1 / limit 1 is P1 (openOutput /
+    // openLimitInput), coil 2 / limit 2 is P2. Auto goes to the outlet its owner (batch / refill) needs. Released, a
+    // single-coil valve falls back to P2 (spring return); a double-coil or motorized gate stays where it was. Off drives nothing.
+    const single = !closeOutput;
+    let want: 'open' | 'close' | undefined = eq.mode === 'P1' ? 'open' : eq.mode === 'P2' ? 'close'
+      : eq.mode === 'Auto' ? (eq.owner && eq.request ? (eq.gatePort === 2 ? 'close' : 'open') : single ? 'close' : eq.gateLast) : undefined;
+    if (want && eq.mode !== 'Off') eq.gateLast = want;
+    // E-stop: only a motorized gate is shut off (its output drops, and it carries on once the e-stop is released); valves keep their state.
+    if (motor && !this.estopOk()) want = undefined;
+    if (eq.status === 'fault' && eq.faultReason === 'Motor starter feedback timeout') want = undefined; // nothing is driven until reset
 
-    if (eq.request && hasOwner) {
-      this.out(openOutput, true);
+    let driving = false;
+    if (want === 'open') {
+      driving = !(motor && openFb);
+      this.out(openOutput, driving);
       this.out(closeOutput, false);
       if (openFb) {
         eq.gatePosition = 'open';
         eq.feedback = true;
-        eq.status = 'running';
+        if (eq.status !== 'fault') eq.status = 'running';
         eq.positionTimerMs = 0;
       } else if (openLimit) {
         eq.gatePosition = 'moving';
@@ -1478,11 +1506,12 @@ export class Mill {
       } else {
         eq.gatePosition = 'open';
         eq.feedback = true;
-        eq.status = 'running';
+        if (eq.status !== 'fault') eq.status = 'running';
       }
-    } else if (!eq.request && hasOwner) {
+    } else if (want === 'close') {
+      driving = !(motor && closedFb === true);
       this.out(openOutput, false);
-      this.out(closeOutput, true);
+      this.out(closeOutput, driving);
       if (closedFb !== undefined) {
         if (closedFb) {
           eq.gatePosition = 'closed';
@@ -1503,21 +1532,67 @@ export class Mill {
         eq.status = eq.status === 'fault' ? 'fault' : 'not_running';
       }
     } else {
-      // No owner — hold outputs, just read feedback for position display
+      // Off (or a starter trip): both outputs de-energized, just read feedback for position display
+      this.out(openOutput, false);
+      this.out(closeOutput, false);
       if (openFb) eq.gatePosition = 'open';
       else if (closedFb) eq.gatePosition = 'closed';
       else if (openFb === undefined && closedFb === undefined) { /* no sensors, keep last known */ }
       else eq.gatePosition = 'unknown';
       eq.positionTimerMs = 0;
     }
+
+    if (auxSig && driving && !this.ioInputs[auxSig]) {
+      eq.faultTimerMs += SCAN_MS;
+      if (eq.faultTimerMs >= delayMs(eq.config.starterFaultDelay ?? this.globalConfig.motorStarterFaultDelay, 0.5) && eq.status !== 'fault') {
+        eq.status = 'fault';
+        eq.faultReason = 'Motor starter feedback timeout';
+        this.raiseFault(eq.id, 'CRITICAL', `${eq.name}: motor starter feedback timeout`, 'E-GT-03');
+      }
+    } else eq.faultTimerMs = 0;
   }
 
   // ── batch engine ──
+
+  // Which outlet of a gate (1 = P1, 2 = P2) leads to the target, following the flow path; undefined if neither does.
+  private gatePortToward(gate: EquipmentRuntime, target: string): 1 | 2 | undefined {
+    for (const port of [1, 2] as const) {
+      const seen = new Set<string>();
+      const queue = this.connections.filter(c => c.from === gate.id && c.fromPort === `out${port}`).map(c => c.to);
+      while (queue.length) {
+        const n = queue.shift()!;
+        if (n === target) return port;
+        if (seen.has(n)) continue;
+        seen.add(n);
+        for (const c of this.connections) if (c.from === n) queue.push(c.to);
+      }
+    }
+    return undefined;
+  }
+
+  // PLC HOA: a sequence only drives equipment that is in Auto; anything else holds the batch with a reason (nothing is claimed).
+  private batchHold(b: BatchRuntime): string | null {
+    const need: (EquipmentRuntime | undefined)[] = [];
+    if (['READY', 'DOSING', 'MIXING'].includes(b.state)) need.push(this.findEquipmentByType('mixer'));
+    if (b.state === 'DOSING') { const st = b.dosingSteps[b.dosingIndex]; if (st?.augerId) need.push(this.equipment.get(st.augerId)); }
+    if (['ROUTE_PRECHECK', 'DISCHARGING'].includes(b.state)) need.push(this.findGateForDischarge());
+    const bad = need.find(e => e && e.owner !== b.id && e.mode !== 'Auto'); // equipment the batch already owns cannot leave Auto
+    return bad ? `Waiting: ${bad.id} is not in Auto` : null;
+  }
 
   private advanceBatch() {
     const b = this.activeBatch;
     if (!b) return;
     const prevState = b.state;
+
+    if (['READY', 'DOSING', 'MIXING', 'ROUTE_PRECHECK', 'DISCHARGING'].includes(b.state)) {
+      // equipment this batch owns tripped: stop and wait (Resume after the operator resets it) instead of feeding blind
+      const tripped = Array.from(this.equipment.values()).find(e => e.owner === b.id && e.status === 'fault');
+      if (tripped) { this.pauseActiveBatch(); b.faultReason = `${tripped.id} faulted - reset it, then Resume`; return; }
+      const hold = this.batchHold(b);
+      if (hold) { b.faultReason = hold; return; }
+      if (b.faultReason?.endsWith('is not in Auto')) b.faultReason = undefined;
+    }
 
     switch (b.state) {
       case 'VALIDATING': {
@@ -1568,6 +1643,7 @@ export class Mill {
         if (gate) {
           gate.owner = b.id;
           gate.request = true;
+          gate.gatePort = this.gatePortToward(gate, b.destination) ?? 1;
         }
         b.state = 'DISCHARGING';
         b.dischargeStartTime = Date.now();
@@ -1584,7 +1660,7 @@ export class Mill {
           break;
         }
         const gate = this.findGateForDischarge();
-        if (gate) { gate.owner = b.id; gate.request = true; }
+        if (gate) { gate.owner = b.id; gate.request = true; gate.gatePort = this.gatePortToward(gate, b.destination) ?? 1; }
         const scale = this.getMixerScale();
         if (scale && scale.weight < 10 && scale.stable) {
           b.state = 'CLEAROUT';
@@ -1938,6 +2014,8 @@ export class Mill {
       if (id !== hm.id && (eq.mode !== 'Auto' || eq.status === 'disabled')) return;
     }
     for (const id of ids) this.equipment.get(id)!.owner = `REFILL-${hm.id}`;
+    const hops = [...path.downstream, path.dest]; // each gate on the way takes the outlet that leads to the next hop
+    path.downstream.forEach((id, i) => { const g = this.equipment.get(id); if (g?.equipmentType === 'gate') g.gatePort = this.gatePortToward(g, hops[i + 1]) ?? 1; });
     this.refills.set(hm.id, { state: 'STARTING', path: ids, dest: path.dest, startedAt: Date.now() });
   }
 

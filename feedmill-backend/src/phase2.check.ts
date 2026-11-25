@@ -72,7 +72,7 @@ const aug: any = mk('A-9', 'auger', { runOutput: 'A9_OUT', runConfirmAux: 'A9_AU
 m.ioInputs.A9_AUX = false; scan(10); assert.equal(aug.status, 'fault', 'no aux feedback faults');
 cmd('ResetEquipmentFault', 'A-9'); cmd('SetEquipmentMode', 'A-9', { mode: 'Hand' });
 cmd('SetBypass', 'A-9', { key: 'runConfirmAux', value: true }); scan(10); assert.equal(aug.status, 'running', 'aux bypassed: runs without feedback');
-const gt: any = mk('G-1', 'gate', { openOutput: 'G_O', closeOutput: 'G_C', openLimitInput: 'G_OL', closedLimitInput: 'G_CL', positionTimeout: 0.3 }); gt.request = true; m.equipment.set('G-1', gt);
+const gt: any = mk('G-1', 'gate', { openOutput: 'G_O', closeOutput: 'G_C', openLimitInput: 'G_OL', closedLimitInput: 'G_CL', positionTimeout: 0.3 }); gt.mode = 'P1'; m.equipment.set('G-1', gt);
 m.ioInputs.G_OL = false; m.ioInputs.G_CL = false; scan(8); assert.equal(gt.status, 'fault', 'open limit never made');
 cmd('ResetEquipmentFault', 'G-1'); cmd('SetBypass', 'G-1', { key: 'openLimitInput', value: true }); scan(3);
 assert.equal(gt.gatePosition, 'open'); assert.notEqual(gt.status, 'fault', 'limit bypassed');
@@ -163,8 +163,8 @@ assert.ok(kept() && kept()!.active, 'raised fault is stored');
 cmd('AcknowledgeFault', m.faults.find((f: any) => f.code === 'T-KEEP').id); assert.ok(kept()!.acknowledgedAt, 'acknowledge stored');
 cmd('ClearFault', m.faults.find((f: any) => f.code === 'T-KEEP').id); assert.ok(!kept()!.active, 'cleared fault stored');
 const rq: any = mk('RQ', 'auger', { runOutput: 'RQ_OUT' }); rq.status = 'fault'; m.equipment.set('RQ', rq);
-m.raiseFault('RQ', 'CRITICAL', 'trip', 'T-RESET'); cmd('ResetEquipmentFault', 'RQ');
-assert.ok(!loadFaults().find((f: any) => f.code === 'T-RESET')!.active, 'equipment reset is stored too');
+m.raiseFault('RQ', 'CRITICAL', 'trip', 'E-MT-01'); cmd('ResetEquipmentFault', 'RQ');
+assert.ok(!loadFaults().find((f: any) => f.equipment === 'RQ' && f.code === 'E-MT-01')!.active, 'equipment reset is stored too');
 
 // level switches on the shared debounce: the high switch is slow to cover, the low switch slow to uncover, the other way immediate
 const bn: any = mk('B-1', 'bin', { highLevelInput: 'LV_HI', lowLevelInput: 'LV_LO', binFullStopDelay: 0.3, binLowRestartDelay: 0.3 }); m.equipment.set('B-1', bn);
@@ -185,11 +185,117 @@ const lt: any = mk('LT', 'auger', { runOutput: 'LT_OUT' }); lt.mode = 'Hand'; m.
 m.raiseFault('LT', 'CRITICAL', `${lt.name}: starter feedback timeout`, 'E-MT-01'); m.restoreTripLatches();
 assert.equal(lt.status, 'fault'); assert.equal(lt.mode, 'Off'); assert.equal(lt.faultReason, 'starter feedback timeout');
 
+// an open analog channel is a fault only when it is mapped to equipment
+m.signals.push({ id: 'U_AI', direction: 'AI', label: 'Analog Input' });
+const openFault = () => m.faults.some((f: any) => f.code === 'W-AI-U_AI' && f.active);
+m.readRealInputs({ inputs: { U_AI: 32767 } }); assert.equal(openFault(), false, 'unmapped open channel: no fault');
+m.signals.find((s: any) => s.id === 'U_AI').equipmentId = 'HM-1'; m.readRealInputs({ inputs: { U_AI: 32767 } });
+assert.equal(openFault(), true, 'mapped open channel: fault');
+m.signals.find((s: any) => s.id === 'U_AI').equipmentId = undefined; m.readRealInputs({ inputs: { U_AI: 32767 } });
+assert.equal(openFault(), false, 'unmapping clears it');
+
+// Hand -> Auto with nothing requesting: the motor stops (after its stop delay); with an owner's request it keeps running
+const hb: any = mk('HB', 'auger', { runOutput: 'HB_OUT', runConfirmAux: 'HB_AUX', stopDelay: 0.3 }); hb.mode = 'Off'; m.equipment.set('HB', hb);
+const hfollow = () => { m.ioInputs.HB_AUX = m.ioOutputs.HB_OUT === true; m.scan(); };
+cmd('SetEquipmentMode', 'HB', { mode: 'Hand' }); for (let i = 0; i < 10; i++) hfollow();
+assert.equal(hb.status, 'running'); assert.equal(hb.request, true);
+cmd('SetEquipmentMode', 'HB', { mode: 'Auto' }); for (let i = 0; i < 2; i++) hfollow();
+assert.equal(hb.request, false, 'Hand request does not carry into Auto'); assert.equal(hb.runCmd, true, 'still inside its stop delay');
+for (let i = 0; i < 6; i++) hfollow(); assert.equal(hb.runCmd, false, 'stops once the stop delay ends'); assert.equal(m.ioOutputs.HB_OUT, false);
+hb.owner = 'BATCH-X'; hb.request = true; for (let i = 0; i < 6; i++) hfollow(); assert.equal(hb.runCmd, true, 'an owner request still runs it in Auto');
+hb.owner = undefined; hb.request = false; cmd('SetEquipmentMode', 'HB', { mode: 'Off' });
+
+// faults vs. latches: clearing a warning must not un-trip equipment; Reset clears the trip fault itself, not just the newest one
+const ft: any = mk('FT', 'auger', { runOutput: 'FT_OUT', runConfirmAux: 'FT_AUX' }); m.equipment.set('FT', ft); m.ioInputs.FT_AUX = false; scan(8);
+assert.equal(ft.status, 'fault');
+m.raiseFault('FT', 'WARNING', 'warn', 'W-TEST'); cmd('ClearFault', m.faults.find((f: any) => f.code === 'W-TEST').id);
+assert.equal(ft.status, 'fault', 'clearing a warning leaves the trip latched');
+m.raiseFault('FT', 'WARNING', 'warn2', 'W-TEST2'); m.ioInputs.FT_AUX = true; cmd('ResetEquipmentFault', 'FT');
+assert.equal(ft.status, 'not_running');
+assert.ok(!m.faults.some((f: any) => f.equipment === 'FT' && f.code === 'E-MT-01' && f.active), 'the trip fault is the one cleared');
+assert.ok(m.faults.some((f: any) => f.code === 'W-TEST2' && f.active), 'the unrelated warning stays');
+// clearing the trip fault from the list releases the latch
+ft.mode = 'Hand'; m.ioInputs.FT_AUX = false; scan(8); assert.equal(ft.status, 'fault');
+cmd('ClearFault', m.faults.find((f: any) => f.equipment === 'FT' && f.code === 'E-MT-01' && f.active).id); assert.equal(ft.status, 'not_running');
+// a gate's open-timeout fault stays latched when the limit arrives later
+const gl: any = mk('GL', 'gate', { openOutput: 'GL_O', closeOutput: 'GL_C', openLimitInput: 'GL_OL', positionTimeout: 0.3 }); gl.mode = 'Auto'; gl.owner = 'BX'; gl.request = true; m.equipment.set('GL', gl);
+m.ioInputs.GL_OL = false; scan(6); assert.equal(gl.status, 'fault'); m.ioInputs.GL_OL = true; scan(3); assert.equal(gl.status, 'fault', 'gate fault is a latch');
+gl.owner = undefined; gl.request = false;
+
+// the batch drives only equipment in Auto, and pauses when equipment it owns trips
+m.equipment.delete('MX-1');
+const ag: any = mk('AG', 'auger', { runOutput: 'AG_OUT', runConfirmAux: 'AG_AUX' }); ag.mode = 'Off'; m.equipment.set('AG', ag); m.ioInputs.AG_AUX = true;
+m.activeBatch = { id: 'BT', recipeId: 'R', recipeName: 'R', targetMass: 100, destination: 'BIN', state: 'DOSING', startedAt: new Date().toISOString(), dosingIndex: 0,
+  dosingSteps: [{ ingredientId: 'I', ingredientName: 'I', sourceBinId: 'SB', augerId: 'AG', target: 50, actual: 0, unit: 'lbs', state: 'pending', baselineWeight: 0, settleStartTime: 0, cutoffStartTime: 0 }],
+  mixTimeRemainingMs: 0, mixTimeTotalMs: 0, dischargeStartTime: 0 };
+scan(5); assert.equal(m.activeBatch.state, 'DOSING'); assert.equal(m.activeBatch.faultReason, 'Waiting: AG is not in Auto'); assert.equal(ag.owner, undefined, 'nothing claimed');
+cmd('SetEquipmentMode', 'AG', { mode: 'Auto' }); scan(15);
+assert.equal(ag.owner, 'BT'); assert.equal(m.activeBatch.faultReason, undefined, 'hold clears itself'); assert.equal(ag.runCmd, true);
+m.ioInputs.AG_AUX = false; scan(10);
+assert.ok(['PAUSING', 'PAUSED'].includes(m.activeBatch.state), `batch pauses when its auger trips (${m.activeBatch.state})`);
+assert.match(m.activeBatch.faultReason, /AG faulted/);
+m.releaseEquipment('BT'); m.activeBatch = null;
+
+// gates: P1 (open) / P2 (closed) / Auto / Off instead of Hand; bins have no HOA
+const gp: any = mk('GP', 'gate', { openOutput: 'GP_O', closeOutput: 'GP_C', openLimitInput: 'GP_OL', closedLimitInput: 'GP_CL', positionTimeout: 5 }); gp.mode = 'Off'; m.equipment.set('GP', gp);
+assert.equal(cmd('SetEquipmentMode', 'GP', { mode: 'Hand' }).accepted, false, 'a gate has no Hand');
+assert.equal(cmd('SetEquipmentMode', 'MX-9', { mode: 'P1' }).accepted, false);
+assert.equal(cmd('SetEquipmentMode', 'GP', { mode: 'P1' }).accepted, true); scan(2); assert.equal(m.ioOutputs.GP_O, true); assert.equal(m.ioOutputs.GP_C, false);
+cmd('SetEquipmentMode', 'GP', { mode: 'P2' }); scan(2); assert.equal(m.ioOutputs.GP_O, false); assert.equal(m.ioOutputs.GP_C, true);
+cmd('SetEquipmentMode', 'GP', { mode: 'Off' }); scan(2); assert.equal(m.ioOutputs.GP_O, false); assert.equal(m.ioOutputs.GP_C, false, 'Off drives nothing');
+const bnn: any = mk('BN', 'bin', {}); m.equipment.set('BN', bnn);
+for (const md of ['Hand', 'Auto', 'Off', 'P1']) assert.equal(cmd('SetEquipmentMode', 'BN', { mode: md }).accepted, false, `bin rejects ${md}`);
+// after a batch / refill: a single-coil valve returns to P2 (output off); a double-coil gate stays where it was
+const gr: any = mk('GR', 'gate', { actuatorType: 'dual', openOutput: 'GR_O', closeOutput: 'GR_C' }); gr.mode = 'Auto'; gr.owner = 'BT2'; gr.request = true; m.equipment.set('GR', gr);
+scan(3); assert.equal(m.ioOutputs.GR_O, true); gr.request = false; gr.owner = undefined; scan(3);
+assert.equal(m.ioOutputs.GR_O, true, 'double-coil gate stays at P1'); assert.equal(m.ioOutputs.GR_C, false);
+const gs: any = mk('GS', 'gate', { actuatorType: 'single', openOutput: 'GS_O' }); gs.mode = 'Auto'; gs.owner = 'BT2'; gs.request = true; m.equipment.set('GS', gs);
+scan(3); assert.equal(m.ioOutputs.GS_O, true); gs.request = false; gs.owner = undefined; scan(3);
+assert.equal(m.ioOutputs.GS_O, false, 'single-coil valve falls back to P2');
+// P1/P2 follow the flow path: the owner gets the outlet that leads to its target
+const gw: any = mk('GW', 'gate', { actuatorType: 'dual', openOutput: 'GW_O', closeOutput: 'GW_C' }); gw.mode = 'Auto'; m.equipment.set('GW', gw);
+m.connections.push({ from: 'GW', fromPort: 'out1', to: 'DA', toPort: 'inlet' }, { from: 'DA', fromPort: 'out1', to: 'DX', toPort: 'inlet' }, { from: 'GW', fromPort: 'out2', to: 'DB', toPort: 'inlet' });
+assert.equal(m.gatePortToward(gw, 'DA'), 1); assert.equal(m.gatePortToward(gw, 'DX'), 1, 'multi-hop'); assert.equal(m.gatePortToward(gw, 'DB'), 2); assert.equal(m.gatePortToward(gw, 'NOPE'), undefined);
+gw.owner = 'BT3'; gw.request = true; gw.gatePort = m.gatePortToward(gw, 'DB'); scan(3);
+assert.equal(m.ioOutputs.GW_C, true, 'P2 selected for DB'); assert.equal(m.ioOutputs.GW_O, false);
+gw.owner = undefined; gw.request = false; scan(3); assert.equal(m.ioOutputs.GW_C, true, 'and it stays there');
+m.connections = m.connections.filter((c: any) => c.from !== 'GW' && c.from !== 'DA');
+const gold: any = mk('GO', 'gate', {}); gold.mode = 'Hand'; m.equipment.set('GO', gold);
+
+// motor gate: output only while moving (drops when the limit confirms), starter aux expected while an output is on
+const gm: any = mk('GM', 'gate', { actuatorType: 'dual', motorGate: true, openOutput: 'GM_O', closeOutput: 'GM_C', openLimitInput: 'GM_OL', closedLimitInput: 'GM_CL', motorAuxInput: 'GM_AUX', positionTimeout: 5 });
+gm.mode = 'Off'; m.equipment.set('GM', gm); m.ioInputs.GM_OL = false; m.ioInputs.GM_CL = true; m.ioInputs.GM_AUX = true;
+cmd('SetEquipmentMode', 'GM', { mode: 'P1' }); scan(3);
+assert.equal(m.ioOutputs.GM_O, true, 'driving open'); assert.notEqual(gm.status, 'fault');
+m.ioInputs.GM_CL = false; m.ioInputs.GM_OL = true; scan(2);
+assert.equal(m.ioOutputs.GM_O, false, 'output drops once the open limit confirms'); assert.equal(gm.gatePosition, 'open'); assert.equal(gm.status, 'running');
+m.ioInputs.GM_AUX = false; scan(10); assert.notEqual(gm.status, 'fault', 'no aux expected once the output is off');
+cmd('SetEquipmentMode', 'GM', { mode: 'P2' }); m.ioInputs.GM_OL = false; scan(3);
+assert.equal(m.ioOutputs.GM_C, true, 'driving closed'); assert.notEqual(gm.status, 'fault', 'still inside the fault delay'); scan(6);
+assert.equal(gm.status, 'fault', 'starter aux never came on while driving'); assert.equal(gm.faultReason, 'Motor starter feedback timeout');
+assert.ok(m.faults.some((f: any) => f.code === 'E-GT-03' && f.equipment === 'GM' && f.active));
+assert.equal(m.ioOutputs.GM_C, false, 'a starter fault stops driving'); cmd('ResetEquipmentFault', 'GM'); assert.equal(gm.status, 'not_running');
+cmd('SetBypass', 'GM', { key: 'motorAuxInput', value: true }); scan(10); assert.notEqual(gm.status, 'fault', 'aux bypassed: no starter fault');
+m.ioInputs.GM_CL = true; scan(2); assert.equal(m.ioOutputs.GM_C, false, 'closed limit confirms, output drops'); assert.equal(gm.gatePosition, 'closed');
+cmd('SetEquipmentMode', 'GM', { mode: 'Off' });
+// a non-motor gate keeps its output on after the limit
+cmd('SetEquipmentMode', 'GP', { mode: 'P1' }); m.ioInputs.GP_OL = true; scan(3); assert.equal(m.ioOutputs.GP_O, true, 'plain gate keeps the output on'); cmd('SetEquipmentMode', 'GP', { mode: 'Off' });
+
 // each I/O point reports what it is configured as
 m.signals.push({ id: 'HM_OUT', direction: 'DO', label: 'Digital Output' }, { id: 'TAGX', direction: 'DI', label: 'Digital Input' }); m.globalConfig.estopInput = 'TAGX';
 const tag = (id: string) => m.getSnapshot().io.signals.find((s: any) => s.id === id).assignment;
 assert.equal(tag('HM_OUT'), 'HM-1 Run'); assert.equal(tag('TAGX'), 'E-Stop');
 assert.equal(cmd('SetGlobalConfig', undefined, { key: 'stateColor_fault', value: 'red' }).accepted, false, 'colour must be #rrggbb');
 assert.equal(cmd('SetGlobalConfig', undefined, { key: 'stateColor_fault', value: '#B71C1C' }).accepted, true);
+// e-stop: a motor gate's output drops (and resumes on release); coil valves keep their state
+m.signals.push({ id: 'ES2', direction: 'DI', label: 'estop' }); m.globalConfig.estopInput = 'ES2'; m.ioInputs.ES2 = true;
+cmd('SetBypass', 'GM', { key: 'motorAuxInput', value: false }); gm.status = 'not_running'; gm.faultReason = undefined;
+m.ioInputs.GM_AUX = true; m.ioInputs.GM_OL = false; m.ioInputs.GM_CL = false; cmd('SetEquipmentMode', 'GM', { mode: 'P1' });
+gr.owner = 'BT4'; gr.request = true; gr.gatePort = 1;
+scan(3); assert.equal(m.ioOutputs.GM_O, true, 'motor gate driving'); assert.equal(m.ioOutputs.GR_O, true);
+m.ioInputs.ES2 = false; scan(3);
+assert.equal(m.ioOutputs.GM_O, false, 'e-stop drops the motor gate output'); assert.equal(m.ioOutputs.GR_O, true, 'a double-coil valve is not affected');
+m.ioInputs.ES2 = true; scan(3); assert.equal(m.ioOutputs.GM_O, true, 'motor gate carries on after release');
+cmd('SetEquipmentMode', 'GM', { mode: 'Off' }); gr.owner = undefined; gr.request = false; delete m.globalConfig.estopInput;
 console.log('phase2 checks passed');
 process.exit(0);

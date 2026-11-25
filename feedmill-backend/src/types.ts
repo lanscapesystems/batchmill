@@ -11,7 +11,8 @@ export interface SignalDef {
 }
 
 export type EquipmentStatus = 'not_running' | 'running' | 'fault' | 'warning' | 'disabled';
-export type EquipmentMode = 'Auto' | 'Hand' | 'Off';
+// Motors: Hand / Off / Auto. Gates: P1 (open) / P2 (closed) / Off / Auto. Bins have no HOA (no motor).
+export type EquipmentMode = 'Auto' | 'Hand' | 'Off' | 'P1' | 'P2';
 
 export interface EquipmentRuntime {
   id: string;
@@ -32,6 +33,8 @@ export interface EquipmentRuntime {
   faultTimerMs: number;
   loadAmps?: number;          // averaged motor current from config.analogLoadInput, scaled min/maxAmps (runtime only)
   loadDisconnected?: boolean;
+  gatePort?: 1 | 2;           // gate: which outlet (P1 / P2) its owner needs, chosen from the flow path
+  gateLast?: 'open' | 'close'; // gate: last position driven (a double-coil / motor gate stays there when released)
   vfdStartMs?: number;        // master VFD: how long the starter has been confirmed (runtime)
   vfdCmd?: boolean;           // master VFD run output wanted (starter confirmed for vfdStartDelay)
   loadAtRunning?: boolean;    // relay autotune in progress (runtime)

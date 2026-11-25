@@ -172,7 +172,7 @@ interface SlotAllocation {
 // ONE entry — every point is a bit within it. Analog/scale cards consume
 // one entry PER CHANNEL (unverified — no real analog dump seen yet, but
 // unlike digital bits, analog values can't share a word).
-function allocateRackEntries(cards: IoRackCard[], inputEntries: PdoEntry[], outputEntries: PdoEntry[]): Map<number, SlotAllocation> {
+export function allocateRackEntries(cards: IoRackCard[], inputEntries: PdoEntry[], outputEntries: PdoEntry[]): Map<number, SlotAllocation> {
   const sorted = [...cards].sort((a, b) => a.slot - b.slot);
   let inIdx = 0, outIdx = 0;
   const bySlot = new Map<number, SlotAllocation>();
@@ -186,7 +186,15 @@ function allocateRackEntries(cards: IoRackCard[], inputEntries: PdoEntry[], outp
     // W521: 8/16/32-point digital cards expose ONE packed BYTE/WORD/DWORD entry,
     // but 2/4-point cards (NX-IA3117, NX-OC2633...) expose one 1-bit BOOL entry
     // per point — so consume entries until their bits cover the card's points.
-    let take = def.category === 'scale' ? 3 : def.points; // W565 §6-2-1 default input map: 6000 Detection Status, 6001 Executing Status, 6002 Gross Weight DINT
+    let take = def.points;
+    // W565 §6-2-1 default input map: +0 Detection Status, +1 Executing Status, +2 Gross Weight DINT. On a Slave Terminal each NX
+    // unit's data objects sit in their own 0x20-wide block, 0x6000 + (unit number - 1) * 0x20 (W519 A-7-3), so only the offset
+    // inside the block is fixed, never the absolute index. A unit consumes every entry of its block (calibration entries can be added).
+    if (def.category === 'scale') {
+      const block = (i: number) => i >> 5;
+      take = 0;
+      while (start + take < pool.length && block(pool[start + take].index) === block(pool[start].index)) take++;
+    }
     if (def.category === 'DI' || def.category === 'DO') {
       take = 0;
       for (let bits = 0; bits < def.points && start + take < pool.length; take++) bits += pool[start + take].bits;
@@ -196,7 +204,7 @@ function allocateRackEntries(cards: IoRackCard[], inputEntries: PdoEntry[], outp
     const covered = def.category === 'DI' || def.category === 'DO'
       ? slice.reduce((n, e) => n + e.bits, 0) >= def.points
       : def.category === 'scale'
-        ? slice.length === 3 && slice[2].index === 0x6002 && slice[2].bits === 32
+        ? slice.length >= 3 && slice[0].index % 0x20 === 0 && slice[1].index % 0x20 === 1 && slice[2].index % 0x20 === 2 && slice[2].bits === 32
         : slice.length === take;
     bySlot.set(card.slot, covered ? { status: 'ok', pdoEntries: slice } : { status: 'missing' });
   }

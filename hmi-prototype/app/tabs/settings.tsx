@@ -856,15 +856,17 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
       return <>
         {row('Actuator Type', editing
           ? <select value={(v('actuatorType', 'single') as string)} onChange={e => setCfg('actuatorType', e.target.value)} style={inputStyle}>
-              <option value="single">Single</option>
-              <option value="dual">Dual</option>
+              <option value="single">Single coil</option>
+              <option value="dual">Double coil</option>
             </select>
-          : <span style={{ color: 'var(--fg-bright)', fontSize: '12px' }}>{v('actuatorType', 'single') === 'dual' ? 'Dual' : 'Single'}</span>
+          : <span style={{ color: 'var(--fg-bright)', fontSize: '12px' }}>{v('actuatorType', 'single') === 'dual' ? 'Double coil' : 'Single coil'}</span>
         )}
-        {row('Open Output', ioSel(ioPools.do, 'openOutput'))}
-        {v('actuatorType') === 'dual' && row('Close Output', ioSel(ioPools.do, 'closeOutput'))}
-        {row('Open Limit Input', ioSel(ioPools.di, 'openLimitInput'))}
-        {row('Closed Limit Input', ioSel(ioPools.di, 'closedLimitInput'))}
+        {row('P1 Output', ioSel(ioPools.do, 'openOutput'))}
+        {v('actuatorType') === 'dual' && row('P2 Output', ioSel(ioPools.do, 'closeOutput'))}
+        {v('actuatorType') === 'dual' && row('Motor Gate', check('motorGate', 'Motor Gate (output drops once the limit switch confirms)'))}
+        {v('actuatorType') === 'dual' && v('motorGate') && row('Motor Starter Aux Input', ioSel(ioPools.di, 'motorAuxInput'))}
+        {row('P1 Limit Input', ioSel(ioPools.di, 'openLimitInput'))}
+        {row('P2 Limit Input', ioSel(ioPools.di, 'closedLimitInput'))}
         {row('Position Timeout', numIn('positionTimeout', 5, 's', 0.1))}
       </>;
 

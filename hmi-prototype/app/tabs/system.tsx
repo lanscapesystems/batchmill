@@ -242,9 +242,20 @@ export function SystemTab() {
             {/* Name & Type */}
             <div>
               <div style={{ color: 'var(--fg-bright)', fontWeight: 500 }}>{beq?.name ?? selectedItem.name}</div>
-              <div style={{ color: TYPE_COLORS[selectedItem.equipmentType] ?? 'var(--fg-dim)', fontSize: '11px' }}>
-                {EQUIPMENT_DEFS[selectedItem.equipmentType]?.label ?? selectedItem.equipmentType}
-              </div>
+              {selectedItem.equipmentType === 'gate'
+                // what P1 / P2 do is set by the flow path: each outlet and the equipment it feeds
+                ? [1, 2].map(p => {
+                    const to = connections.find(c => c.from === selectedItem.id && c.fromPort === `out${p}`)?.to;
+                    const target = to ? equipment.find(e => e.id === to) : undefined;
+                    return (
+                      <div key={p} style={{ color: TYPE_COLORS.gate, fontSize: '11px' }}>
+                        P{p} → {target ? `${target.id} ${target.name}` : <span style={{ color: 'var(--fg-dim)' }}>not connected</span>}
+                      </div>
+                    );
+                  })
+                : <div style={{ color: TYPE_COLORS[selectedItem.equipmentType] ?? 'var(--fg-dim)', fontSize: '11px' }}>
+                    {EQUIPMENT_DEFS[selectedItem.equipmentType]?.label ?? selectedItem.equipmentType}
+                  </div>}
             </div>
 
             {/* Status */}
@@ -283,18 +294,18 @@ export function SystemTab() {
               <div style={{ color: 'var(--accent)', fontSize: '11px' }}>Owner: {beq.owner}</div>
             )}
 
-            {/* Mode control */}
-            <div style={{ borderTop: '1px solid var(--border)', paddingTop: '8px' }}>
+            {/* Mode control: motors Hand/Auto/Off, gates P1/P2/Auto/Off, bins none (no motor) */}
+            {selectedItem.equipmentType !== 'bin' && selectedItem.equipmentType !== 'finished_bin' && <div style={{ borderTop: '1px solid var(--border)', paddingTop: '8px' }}>
               <div className="mb-2" style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>MODE</div>
               <div className="flex gap-1">
-                {(['Hand', 'Auto', 'Off'] as EquipmentMode[]).map(m => (
+                {((selectedItem.equipmentType === 'gate' ? ['P1', 'P2', 'Auto', 'Off'] : ['Hand', 'Auto', 'Off']) as EquipmentMode[]).map(m => (
                   <button
                     key={m}
                     onClick={() => setMode(m)}
                     className="px-4 py-1.5 text-xs font-medium flex-1"
                     style={{
                       background: liveMode === m
-                        ? (m === 'Hand' ? 'var(--orange)' : m === 'Off' ? 'var(--red)' : 'var(--green)')
+                        ? (m === 'Hand' || m === 'P1' || m === 'P2' ? 'var(--orange)' : m === 'Off' ? 'var(--red)' : 'var(--green)')
                         : 'var(--bg)',
                       color: liveMode === m ? '#000' : 'var(--fg-dim)',
                       border: '1px solid var(--border)',
@@ -306,7 +317,8 @@ export function SystemTab() {
                   </button>
                 ))}
               </div>
-            </div>
+              {selectedItem.equipmentType === 'gate' && <div className="mt-1" style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Auto sends the gate to the outlet a batch or refill needs. When released, a single-coil valve returns to P2; a double-coil or motorized gate stays where it is.</div>}
+            </div>}
 
             {beq && backend?.connected && !!beq.config.analogSpeedOutput && (
               <SpeedField key={beq.id} beq={beq} backend={backend}
@@ -502,12 +514,12 @@ const stepBtn = { ...ghostBtn, width: '26px', height: '26px', fontSize: '14px', 
 
 // The input kinds a device can bypass (backend BYPASSABLE) and how the sidebar names them.
 const BYPASS_LABELS: Record<string, string> = {
-  runConfirmAux: 'Starter aux feedback', vfdAuxInput: 'VFD aux feedback', analogLoadInput: 'Load sensor',
-  rotationPulseInput: 'Rotation sensor', openLimitInput: 'Open limit switch', closedLimitInput: 'Closed limit switch',
+  runConfirmAux: 'Starter aux feedback', vfdAuxInput: 'VFD aux feedback', motorAuxInput: 'Motor starter aux feedback', analogLoadInput: 'Load sensor',
+  rotationPulseInput: 'Rotation sensor', openLimitInput: 'P1 limit switch', closedLimitInput: 'P2 limit switch',
   highLevelInput: 'High level switch', lowLevelInput: 'Low level switch', fullSensor: 'Full sensor', lowSensor: 'Low sensor',
 };
 const bypassKeys = (beq: BackendEquipment) =>
-  Object.keys(BYPASS_LABELS).filter(k => !!beq.config[k] && (k !== 'vfdAuxInput' || !!beq.config.masterVfd));
+  Object.keys(BYPASS_LABELS).filter(k => !!beq.config[k] && (k !== 'vfdAuxInput' || !!beq.config.masterVfd) && (k !== 'motorAuxInput' || !!beq.config.motorGate));
 const activeBypasses = (beq: BackendEquipment) => bypassKeys(beq).filter(k => beq.config[`bypass_${k}`] === true).map(k => BYPASS_LABELS[k]);
 
 // Bottom of the sidebar: every bypass this device offers. A bypassed input is ignored as if it were not wired.

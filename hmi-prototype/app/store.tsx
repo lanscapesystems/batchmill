@@ -3,7 +3,8 @@
 import { createContext, useContext, useState, useCallback, type ReactNode } from 'react';
 
 export type EquipmentStatus = 'not_running' | 'running' | 'fault' | 'warning' | 'disabled';
-export type EquipmentMode = 'Auto' | 'Hand' | 'Off';
+// Motors: Hand / Off / Auto. Gates: P1 (open) / P2 (closed) / Off / Auto. Bins have no HOA.
+export type EquipmentMode = 'Auto' | 'Hand' | 'Off' | 'P1' | 'P2';
 
 export interface EquipmentItem {
   id: string;
