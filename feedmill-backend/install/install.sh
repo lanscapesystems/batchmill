@@ -5,11 +5,12 @@
 # project's checkout (the monorepo root, so hmi-prototype/ is a sibling of
 # feedmill-backend/), after it's been copied onto the real machine:
 #
-#   sudo ./install/install.sh <ethercat-nic>
+#   sudo ./install/install.sh [ethercat-nic]
 #
-# <ethercat-nic> is the network interface wired to the EtherCAT bus (e.g.
+# [ethercat-nic] is the network interface wired to the EtherCAT bus (e.g.
 # eth1) — it can't be auto-detected, since a machine may have several NICs
-# and only one is on the bus.
+# and only one is on the bus. Leave it off and the installer lists the
+# machine's wired NICs and asks which one to build the IgH master for.
 #
 # Layout (every run builds a NEW release; nothing in a live release is edited):
 #   /opt/feedmill/releases/<id>/{app,hmi,ethercat-rt}   root-owned, read-only
@@ -84,7 +85,8 @@ ensure_rt_kernel() {
   if rt_running; then log "PREEMPT_RT kernel running ($(uname -r))"; return; fi
   local arch model pkg image cand reason="" installed
   arch="$(dpkg --print-architecture)"
-  model="$(tr -d '\0' </proc/device-tree/model 2>/dev/null || true)"
+  # absent on x86; guard with -r because a failed `<` redirect prints its error before a trailing 2>/dev/null applies
+  model=""; [[ -r /proc/device-tree/model ]] && model="$(tr -d '\0' </proc/device-tree/model)"
   log "running kernel $(uname -r) is NOT PREEMPT_RT (arch $arch${model:+, $model})"
 
   # an RT kernel from an earlier run that simply hasn't been booted yet
@@ -131,9 +133,53 @@ ensure_rt_kernel() {
   esac
 }
 
-[[ $(id -u) -eq 0 ]] || die "run as root (sudo $0 <ethercat-nic>)"
+# Lists the wired NICs and asks which one is on the EtherCAT bus. The pick is
+# handed to the EtherCAT master, so it stops carrying normal network traffic —
+# hence the extra confirmation for a NIC that has an address or the default route.
+select_nic() { # prompts on stderr, prints the chosen NIC on stdout
+  local cands=() d n i mac st drv ips def prev pick sel
+  def="$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  prev="$(sed -n 's/^IFACE=//p' /etc/feedmill-update/install.env 2>/dev/null | head -n1)"
+  for d in /sys/class/net/*; do
+    [[ -e "$d/device" && ! -d "$d/wireless" ]] && cands+=("${d##*/}") # physical wired only: no lo/bridge/veth/vlan/wifi
+  done
+  [[ ${#cands[@]} -gt 0 ]] || die "no physical wired network interfaces found"
+  echo "Wired network interfaces. The one you pick is handed to the EtherCAT master" >&2
+  echo "and stops carrying normal network traffic:" >&2
+  for i in "${!cands[@]}"; do
+    n="${cands[$i]}"; d="/sys/class/net/$n"
+    mac="$(<"$d/address")"; st="$(<"$d/operstate")"
+    drv="$(basename "$(readlink -f "$d/device/driver" 2>/dev/null)")"
+    ips="$(ip -4 -o addr show dev "$n" 2>/dev/null | awk '{print $4}' | paste -sd, -)"
+    printf '  %d) %-10s %s  %-7s %-10s %s%s%s
+' "$((i + 1))" "$n" "$mac" "$st" "$drv" "${ips:-no IPv4}"       "$([[ "$n" == "$def" ]] && echo '  <- default route')" "$([[ "$n" == "$prev" ]] && echo '  <- used by the last install')" >&2
+  done
+  [[ -r /dev/tty ]] || die "no terminal to ask on — pass the NIC name: $0 <nic>"
+  while :; do
+    printf 'Select NIC [1-%d or name]%s: ' "${#cands[@]}" "${prev:+ (Enter = $prev)}" >&2
+    { read -r pick </dev/tty; } 2>/dev/null || die "no terminal to ask on — pass the NIC name: $0 <nic>"
+    [[ -n "$pick" ]] || pick="$prev"
+    sel=""
+    for i in "${!cands[@]}"; do
+      [[ "$pick" == "$((i + 1))" || "$pick" == "${cands[$i]}" ]] && sel="${cands[$i]}"
+    done
+    [[ -n "$sel" ]] && break
+    echo "  not a listed interface" >&2
+  done
+  ips="$(ip -4 -o addr show dev "$sel" 2>/dev/null | awk '{print $4}' | paste -sd, -)"
+  if [[ -n "$ips" || "$sel" == "$def" ]]; then
+    echo "WARNING: $sel has ${ips:-the default route}${ips:+ ($ips)}. Giving it to EtherCAT removes it from normal networking —" >&2
+    echo "if it is your only connection you will lose SSH/HMI access to this machine." >&2
+    printf "Type 'yes' to use %s anyway: " "$sel" >&2
+    { read -r pick </dev/tty; } 2>/dev/null || die "no terminal to ask on"
+    [[ "$pick" == yes ]] || die "aborted — pick a NIC that is dedicated to the EtherCAT bus"
+  fi
+  echo "$sel"
+}
+
+[[ $(id -u) -eq 0 ]] || die "run as root (sudo $0 [ethercat-nic])"
 IFACE="${1:-}"
-[[ -n "$IFACE" ]] || die "usage: $0 <ethercat-nic>   (e.g. $0 eth1)"
+[[ -n "$IFACE" ]] || IFACE="$(select_nic)" || exit 1
 [[ -d "/sys/class/net/$IFACE" ]] || die "no such network interface: $IFACE"
 MAC="$(cat "/sys/class/net/$IFACE/address")"
 
