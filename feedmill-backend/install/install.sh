@@ -90,7 +90,7 @@ ensure_rt_kernel() {
   log "running kernel $(uname -r) is NOT PREEMPT_RT (arch $arch${model:+, $model})"
 
   # an RT kernel from an earlier run that simply hasn't been booted yet
-  installed="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-*-rt-*' 2>/dev/null | awk '$1=="ii"{print $2; exit}')"
+  installed="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 'linux-image-*-rt-*' 2>/dev/null | awk '$1=="ii"{print $2; exit}' || true)"
   if [[ -n "$installed" ]]; then
     [[ "${ASSUME_RT:-}" == skip ]] && return
     pin_rt_boot
@@ -99,9 +99,10 @@ ensure_rt_kernel() {
     exit 10
   fi
 
+  # NB: every lookup below ends in `|| true` — with set -e + pipefail an empty/failed query would abort the installer silently
   # which RT kernel fits this hardware?
   pkg="linux-image-rt-$arch"
-  cand="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/{print $2}')"
+  cand="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/{print $2}' || true)"
   case "$arch" in amd64 | arm64) ;; *) reason="Debian ships no RT kernel for $arch" ;; esac
   # Pi boards need the Raspberry Pi kernel flavour; the generic arm64 RT image may not boot there
   [[ -z "$reason" && "$model" == *"Raspberry Pi"* ]] && reason="$model needs a board-specific kernel; the generic $pkg may not boot on it"
@@ -119,7 +120,7 @@ ensure_rt_kernel() {
     return
   fi
 
-  image="$(apt-cache depends "$pkg" | awk '/Depends: linux-image-/{print $2; exit}')"
+  image="$(apt-cache depends "$pkg" | awk '/Depends: linux-image-/{print $2; exit}' || true)"
   echo "Matched for this machine: $pkg -> ${image:-$pkg} ($cand), with linux-headers-rt-$arch." >&2
   echo "Installing a kernel needs a reboot; this installer will stop afterwards and must be re-run." >&2
   case "$(rt_choice "Install the PREEMPT_RT kernel now?")" in
@@ -138,8 +139,8 @@ ensure_rt_kernel() {
 # hence the extra confirmation for a NIC that has an address or the default route.
 select_nic() { # prompts on stderr, prints the chosen NIC on stdout
   local cands=() d n i mac st drv ips def prev pick sel
-  def="$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-  prev="$(sed -n 's/^IFACE=//p' /etc/feedmill-update/install.env 2>/dev/null | head -n1)"
+  def="$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)"
+  prev="$(sed -n 's/^IFACE=//p' /etc/feedmill-update/install.env 2>/dev/null | head -n1 || true)"
   for d in /sys/class/net/*; do
     [[ -e "$d/device" && ! -d "$d/wireless" ]] && cands+=("${d##*/}") # physical wired only: no lo/bridge/veth/vlan/wifi
   done
@@ -150,7 +151,7 @@ select_nic() { # prompts on stderr, prints the chosen NIC on stdout
     n="${cands[$i]}"; d="/sys/class/net/$n"
     mac="$(<"$d/address")"; st="$(<"$d/operstate")"
     drv="$(basename "$(readlink -f "$d/device/driver" 2>/dev/null)")"
-    ips="$(ip -4 -o addr show dev "$n" 2>/dev/null | awk '{print $4}' | paste -sd, -)"
+    ips="$(ip -4 -o addr show dev "$n" 2>/dev/null | awk '{print $4}' | paste -sd, - || true)"
     printf '  %d) %-10s %s  %-7s %-10s %s%s%s
 ' "$((i + 1))" "$n" "$mac" "$st" "$drv" "${ips:-no IPv4}"       "$([[ "$n" == "$def" ]] && echo '  <- default route')" "$([[ "$n" == "$prev" ]] && echo '  <- used by the last install')" >&2
   done
@@ -166,7 +167,7 @@ select_nic() { # prompts on stderr, prints the chosen NIC on stdout
     [[ -n "$sel" ]] && break
     echo "  not a listed interface" >&2
   done
-  ips="$(ip -4 -o addr show dev "$sel" 2>/dev/null | awk '{print $4}' | paste -sd, -)"
+  ips="$(ip -4 -o addr show dev "$sel" 2>/dev/null | awk '{print $4}' | paste -sd, - || true)"
   if [[ -n "$ips" || "$sel" == "$def" ]]; then
     echo "WARNING: $sel has ${ips:-the default route}${ips:+ ($ips)}. Giving it to EtherCAT removes it from normal networking —" >&2
     echo "if it is your only connection you will lose SSH/HMI access to this machine." >&2
