@@ -5,7 +5,7 @@ Requires=ethercat.service
 
 [Service]
 Type=simple
-ExecStart=/opt/feedmill/ethercat-rt/io-daemon /etc/feedmill/io.conf
+ExecStart=/opt/feedmill/current/ethercat-rt/io-daemon /etc/feedmill/io.conf
 Restart=on-failure
 RestartSec=2
 # Needed for mlockall()/SCHED_FIFO in io_daemon.c without running as root:

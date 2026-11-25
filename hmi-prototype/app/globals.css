@@ -30,3 +30,8 @@ body {
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* Faults tab alert: pulses red while any fault is active */
+@keyframes fault-flash { 0%, 100% { background: var(--red); color: #fff; } 50% { background: transparent; color: var(--red); } }
+.fault-flash { animation: fault-flash 1s steps(1, end) infinite; }
+@media (prefers-reduced-motion: reduce) { .fault-flash { animation: none; background: var(--red); color: #fff; } }

@@ -21,6 +21,16 @@ export interface BackendEquipment {
   speed?: number;
   refillState?: 'STARTING' | 'FILLING' | 'STOPPING';
   gatePosition?: string;
+  state?: string; // PLC-style motor display state (off, auto_stopped, auto_running, hand_running, bypass, alarm, fault, disabled)
+  loadAmps?: number;
+  loadDisconnected?: boolean;
+  loadControlAuto?: boolean;
+  loadAtRunning?: boolean;
+  loadAtMsg?: string;
+  enabled?: boolean;
+  runSecondsTotal?: number;
+  runSeconds?: number;
+  runSecondsResetAt?: string;
 }
 
 export interface BackendBatch {
@@ -53,6 +63,7 @@ export interface BackendSignal {
   label: string;
   equipmentId?: string;
   port?: string;
+  assignment?: string; // what the point is configured as, e.g. "A-1 Run", "E-Stop"
 }
 
 export interface BackendScaleReading {
@@ -75,6 +86,7 @@ export interface BackendScaleConfig {
   rackSlot: number;
   zeroOffset: number;
   ratedMvV: number;
+  calibration?: { mode: 'theoretical' | 'zero' | 'span'; at: string; standardWeight?: number };
   capacity: number;
   resolution: number;
   freshnessTimeout: number;
@@ -131,6 +143,7 @@ interface BackendState {
   globalConfig: Record<string, string | number>;
   networkInterfaces: string[];
   commissioningMode: boolean;
+  horn: { on: boolean; silenced: boolean };
   sendCommand: (action: string, targetId?: string, parameters?: Record<string, unknown>) => Promise<CommandResult>;
 }
 
@@ -147,6 +160,7 @@ const EMPTY_DATA: SnapshotData = {
   globalConfig: {},
   networkInterfaces: [],
   commissioningMode: false,
+  horn: { on: false, silenced: false },
 };
 
 function parseSnapshot(d: Record<string, any>): SnapshotData { // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -169,6 +183,7 @@ function parseSnapshot(d: Record<string, any>): SnapshotData { // eslint-disable
     globalConfig: d.globalConfig ?? {},
     networkInterfaces: d.networkInterfaces ?? [],
     commissioningMode: d.commissioningMode ?? false,
+    horn: d.horn ?? { on: false, silenced: false },
   };
 }
 
@@ -187,6 +202,9 @@ const BACKEND_WS = typeof window !== 'undefined'
   ? (new URLSearchParams(window.location.search).get('backend') ??
      `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/hmi`)
   : 'ws://localhost:3001/ws/hmi';
+
+// REST base (trend data) follows the same host as the WebSocket, including the ?backend= dev override.
+export const BACKEND_HTTP = BACKEND_WS.replace(/^ws/, 'http').replace(/\/ws\/hmi$/, '');
 
 export function BackendProvider({ children }: { children: ReactNode }) {
   const [connected, setConnected] = useState(false);

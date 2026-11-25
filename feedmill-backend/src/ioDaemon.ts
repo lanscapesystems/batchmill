@@ -1,18 +1,27 @@
 import { readFileSync, renameSync, statSync, writeFileSync } from 'fs';
-import type { SignalDef, SignalValue } from './types.js';
+import type { IoRackCard, SignalDef, SignalValue } from './types.js';
+import { NX_CARD_CATALOG } from './types.js';
 
 const STATE_PATH = process.env.FEEDMILL_IO_STATE_PATH ?? '/run/feedmill/io-state.json';
 const COMMAND_PATH = process.env.FEEDMILL_IO_COMMAND_PATH ?? '/run/feedmill/io-command.txt';
 const STALE_MS = 500; // the daemon's writer thread refreshes every 20ms; anything older means it isn't running
 
-// Omron NX analog I/O's commonly documented unipolar raw-count convention
-// (0 = 0%, 27648 = 100%) — PLACEHOLDER. The real scale depends on each
-// module's configured range (4-20mA vs 0-20mA, unipolar vs ±10V bipolar);
-// confirm against the actual module config before trusting this for
-// anything beyond bench testing.
-const NX_ANALOG_FULL_SCALE = 27648;
-export const pctToRaw = (pct: number): number => Math.round((pct / 100) * NX_ANALOG_FULL_SCALE);
-export const rawToPct = (raw: number): number => (raw / NX_ANALOG_FULL_SCALE) * 100;
+// Raw-count scaling per W522 (NX-AD/DA, 1/8000-resolution "xx03" models): 4-20mA
+// maps 0..8000 and +-10V maps -4000..+4000; the catalog's fullScale is the
+// count at 100% (0-10V half for the voltage cards, since mill.ts commands 0-100%).
+// Assumes each channel keeps its factory default range (4-20mA / +-10V) — a
+// different Ch Range Setting (0x5003) on the card would change the scale.
+const DEFAULT_FULL_SCALE = 8000;
+export const NX_ANALOG_DISCONNECT_RAW = 32767; // W522 §6-2: AI reads 32767 when a 4-20mA input is below 1.2mA (wire break)
+const fullScaleFor = (sigId: string, cards: IoRackCard[]): number => {
+  const slot = Number(/^A[IO]:(\d+)\./.exec(sigId)?.[1]);
+  const model = cards.find(c => c.slot === slot)?.model;
+  return NX_CARD_CATALOG.find(d => d.model === model)?.fullScale ?? DEFAULT_FULL_SCALE;
+};
+export const pctToRaw = (pct: number, fullScale: number): number =>
+  Math.round((Math.min(100, Math.max(0, pct)) / 100) * fullScale);
+export const rawToPct = (raw: number, fullScale: number): number => (raw / fullScale) * 100;
+export { fullScaleFor };
 
 export interface RotationChannelState {
   count: number;
@@ -51,20 +60,20 @@ let seq = 0;
  * Writes every DO/AO signal's desired value for the io_daemon to apply on
  * its next cycle. Analog values are converted from the engineering-unit
  * percentages mill.ts works in to the daemon's raw PDO counts (see
- * NX_ANALOG_FULL_SCALE above). Always writes (tmp+rename) even when the
+ * fullScaleFor above). Always writes (tmp+rename) even when the
  * commanded values are unchanged, with an incrementing `seq` as the first
  * line: io_daemon.c's reader thread treats that sequence number, not the
  * file's mtime, as its liveness heartbeat (mtime is only 1-second
  * resolution, which can hide a command that changes twice in the same
  * second) and force-zeros every output after 2s without it advancing.
  */
-export function writeIoCommand(outputs: Record<string, SignalValue>, signals: SignalDef[]): void {
+export function writeIoCommand(outputs: Record<string, SignalValue>, signals: SignalDef[], cards: IoRackCard[]): void {
   const lines: string[] = [`seq ${++seq}`];
   for (const sig of signals) {
     if (sig.direction !== 'DO' && sig.direction !== 'AO') continue;
     const v = outputs[sig.id];
     if (v === undefined) continue;
-    const raw = sig.direction === 'DO' ? (v ? 1 : 0) : pctToRaw(v as number);
+    const raw = sig.direction === 'DO' ? (v ? 1 : 0) : pctToRaw(v as number, fullScaleFor(sig.id, cards));
     lines.push(`output ${sig.id} ${raw}`);
   }
   const text = lines.join('\n') + '\n';

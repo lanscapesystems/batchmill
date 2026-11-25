@@ -8,12 +8,14 @@ import {
   EQUIPMENT_DEFS,
 } from './types.js';
 import { listCandidateNics } from './network.js';
-import { verifyEthercatRack, syncIoConf, checkRackPresence } from './ethercat.js';
-import { readIoState, writeIoCommand } from './ioDaemon.js';
+import { verifyEthercatRack, syncIoConf, checkRackPresence, clearCouplerErrors, runRs1201Calibration, type ScaleCalStep } from './ethercat.js';
+import { MovingAverage, OnDelay, LoadPid, RelayTuner, scaleLinear } from './loadControl.js';
+import { Debounce } from './monitors.js';
+import { readIoState, writeIoCommand, rawToPct, fullScaleFor, NX_ANALOG_DISCONNECT_RAW } from './ioDaemon.js';
 import { loadConfig, saveConfig, type MillConfig } from './config.js';
 import {
   openDb, closeDb, persistBatch, clearActiveBatch, loadActiveBatch,
-  archiveBatch, postInventoryEvent, persistFault,
+  archiveBatch, postInventoryEvent, persistFault, loadFaults,
 } from './db.js';
 
 const SCAN_MS = 100;
@@ -27,6 +29,12 @@ const DISCHARGE_TIMEOUT_MS = 60000;
 // All delay settings are stored in seconds (0.1 s steps, like a 100 ms PLC timer); the scan runs in ms.
 const delayMs = (sec: unknown, fallbackSec = 0) => Math.max(0, Number(sec ?? fallbackSec) || 0) * 1000;
 const EDITABLE_STATES = new Set(['IDLE', 'READY']);
+// Per-device input bypasses ("Overrides" in the sidebar): the input is ignored as if it were not assigned.
+const BYPASSABLE = ['runConfirmAux', 'vfdAuxInput', 'analogLoadInput', 'rotationPulseInput', 'openLimitInput', 'closedLimitInput',
+  'highLevelInput', 'lowLevelInput', 'fullSensor', 'lowSensor'];
+// Faults that latch their equipment in 'fault' until reset (restored on boot if the equipment state was lost).
+const TRIP_CODES = ['E-MT-01', 'E-MT-02', 'E-MT-03', 'E-LD-01', 'E-LD-03', 'E-GT-01', 'W-GT-02'];
+type LoadMon = { avgSize: number; avg: MovingAverage; hiWarn: OnDelay; hiPause: OnDelay; pid: LoadPid; tuner?: RelayTuner; tuneBase?: number; tuneWasAuto?: boolean };
 
 // One hammermill refill cycle: all path equipment is requested at once and runs until the destination high switch.
 // Each motor's start/stop delay does the sequencing (downstream short start delay / long stop delay).
@@ -66,6 +74,18 @@ export class Mill {
   // Outputs are staged during the scan and written to the I/O image once, at the end (computeOutputs), like a PLC.
   private outImage: Record<string, boolean | number> = {};
   private out(sig: string | undefined, value: boolean | number) { if (sig) this.outImage[sig] = value; }
+  // A signal shared by several motors (a common VFD run output) is on while any of them wants it.
+  private outOr(sig: string | undefined, value: boolean) { if (sig) this.outImage[sig] = this.outImage[sig] === true || value; }
+  // Forcing an OUTPUT is the commissioning tool: never while a batch is in progress or a hammermill is enabled.
+  // (Input overrides are not guarded; they energize nothing.)
+  private outputForcesActive() {
+    return Object.keys(this.ioOverrides).some(id => { const d = this.signals.find(s => s.id === id)?.direction; return d === 'DO' || d === 'AO'; });
+  }
+  private forceBlockedReason(): string | null {
+    if (this.activeBatch && !['COMPLETED', 'FAULTED', 'IDLE'].includes(this.activeBatch.state)) return 'A batch is in progress';
+    if (Array.from(this.equipment.values()).some(e => e.equipmentType === 'hammermill' && e.enabled)) return 'A hammermill is enabled - disable it first';
+    return null;
+  }
   private rotationState = new Map<string, { runningMs: number; rpm?: number }>();
   private lastDaemonStartUs: number | null = null; // detects an io_daemon restart (see updateBusHealth)
   ioOverrides: Record<string, SignalValue> = {};
@@ -80,12 +100,28 @@ export class Mill {
   private faultSeq = 300;
   private batchSeq = 2000;
   private batchPersistCounter = 0;
+  private persistTicks = 0;
+  private aiDisconnected = new Set<string>();
+  private loadMon = new Map<string, LoadMon>();
+  // 1 Hz load trend per motor, last 10 minutes (served by GET /api/v1/trend/:id, not pushed in the snapshot)
+  private trends = new Map<string, { t: number; a: number; s?: number; sp?: number }[]>();
+  private trendTicks = 0;
+  // Alarm horn (PLC R137-R143): beeps while any fault is active, a silence (HMI or input) toggles it, a NEW fault re-arms it,
+  // and it silences itself after hornAutoSilenceSec.
+  private hornSilenced = false;
+  private hornAutoMs = 0;
+  private hornPhaseOn = true;
+  private hornPhaseMs = 0;
+  private hornInPrev = false;
+  private hornOn = false;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
   private rackWatchdogHandle: ReturnType<typeof setInterval> | null = null;
   private onChange?: () => void;
 
   constructor() {
     openDb();
+    this.faults = loadFaults(); // the fault list stays through a power cycle
+    this.faultSeq = Math.max(this.faultSeq, ...this.faults.map(f => (parseInt(f.id.replace(/\D/g, ''), 10) || 0) + 1));
     const cfg = loadConfig();
     if (cfg) {
       this.applyConfig(cfg);
@@ -97,11 +133,10 @@ export class Mill {
     // Hammermills default to paused on startup
     for (const eq of this.equipment.values()) {
       if (eq.equipmentType === 'hammermill') {
-        eq.mode = 'Off';
-        eq.status = 'disabled';
-        eq.request = false;
+        this.pauseHammermill(eq);
       }
     }
+    this.restoreTripLatches();
     const recovered = loadActiveBatch();
     if (recovered && !['COMPLETED', 'FAULTED', 'IDLE'].includes(recovered.state)) {
       if (recovered.state !== 'PAUSED') {
@@ -158,7 +193,7 @@ export class Mill {
     for (const eq of cfg.equipment) {
       // saved equipment is the whole runtime object: drop pre-request-bit fields and start with no run request
       for (const k of ['commanded', 'stopping', 'stopDelayTimerMs']) delete (eq as unknown as Record<string, unknown>)[k];
-      Object.assign(eq, { request: false, runCmd: false, startTimerMs: 0, stopTimerMs: 0 });
+      Object.assign(eq, { request: false, runCmd: false, startTimerMs: 0, stopTimerMs: 0, loadControlAuto: false });
       this.equipment.set(eq.id, eq);
     }
     this.connections = cfg.connections;
@@ -207,18 +242,11 @@ export class Mill {
         if (!eq) return reject('Unknown equipment');
         const mode = cmd.parameters?.mode as EquipmentMode | undefined;
         if (!mode || !['Auto', 'Hand', 'Off'].includes(mode)) return reject('Invalid mode');
-        // A hammermill mid-refill may be switched Off: the refill then does its controlled stop.
+        // A hammermill mid-refill may be switched Off (HOA): the refill then does its controlled stop.
         const pausingMill = eq.equipmentType === 'hammermill' && mode === 'Off' && !!eq.owner?.startsWith('REFILL-');
         if (eq.owner && mode !== 'Auto' && !pausingMill) return reject('Equipment owned by batch ' + eq.owner);
+        // A tripped motor stays tripped until ResetEquipmentFault; changing mode no longer clears it.
         eq.mode = mode;
-        if (mode === 'Off' || mode === 'Hand') {
-          if (eq.status === 'fault') { eq.status = 'not_running'; eq.faultReason = undefined; eq.faultTimerMs = 0; }
-        }
-        if (eq.equipmentType === 'hammermill' && !pausingMill) {
-          // Off = paused ('disabled'); Auto/Hand = enabled.
-          if (mode === 'Off') this.pauseHammermill(eq);
-          else if (eq.status === 'disabled') { eq.status = 'not_running'; eq.faultTimerMs = 0; }
-        }
         return ok();
       }
 
@@ -226,6 +254,7 @@ export class Mill {
         const eq = this.equipment.get(cmd.targetId ?? '');
         if (!eq) return reject('Unknown equipment');
         if (!eq.config.analogSpeedOutput) return reject('No analog speed output assigned');
+        if (Array.from(this.equipment.values()).some(e => (e.loadControlAuto || e.loadAtRunning) && e.config.loadControlFeeder === eq.id)) return reject('Speed is under load control or autotune (switch it to Manual first)');
         const speed = cmd.parameters?.speed;
         if (typeof speed !== 'number' || !Number.isFinite(speed)) return reject('Missing speed');
         const [lo, hi] = this.speedLimits(eq);
@@ -280,6 +309,7 @@ export class Mill {
         const batch = this.queue.find(b => b.id === cmd.targetId && (b.state === 'IDLE' || b.state === 'READY'));
         if (!batch) return reject('Batch not found or not startable');
         if (this.activeBatch) return reject('Another batch is active');
+        if (!this.estopOk()) return reject('E-stop active'); if (this.outputForcesActive()) return reject('Clear the forced outputs first');
         batch.state = 'VALIDATING';
         batch.startedAt = new Date().toISOString();
         this.activeBatch = batch;
@@ -289,12 +319,7 @@ export class Mill {
 
       case 'PauseBatch': {
         if (!this.activeBatch) return reject('No active batch');
-        const b = this.activeBatch;
-        if (['COMPLETED', 'FAULTED', 'PAUSED', 'PAUSING', 'IDLE'].includes(b.state)) return reject('Cannot pause in state ' + b.state);
-        b.previousState = b.state;
-        b.state = 'PAUSING';
-        this.initiateEquipmentStop(b.id);
-        persistBatch(b);
+        if (!this.pauseActiveBatch()) return reject('Cannot pause in state ' + this.activeBatch.state);
         return ok();
       }
 
@@ -302,6 +327,7 @@ export class Mill {
         if (!this.activeBatch) return reject('No active batch');
         const b = this.activeBatch;
         if (b.state !== 'PAUSED') return reject('Batch not paused');
+        if (!this.estopOk()) return reject('E-stop active'); if (this.outputForcesActive()) return reject('Clear the forced outputs first');
         b.faultReason = undefined;
         b.state = b.previousState ?? 'DOSING';
         persistBatch(b);
@@ -363,6 +389,99 @@ export class Mill {
         return ok();
       }
 
+      case 'SetHammermillEnabled': {
+        const eq = this.equipment.get(cmd.targetId ?? '');
+        if (!eq || eq.equipmentType !== 'hammermill') return reject('Hammermill not found');
+        if (cmd.parameters?.enabled) {
+          if (!this.estopOk()) return reject('E-stop active'); if (this.outputForcesActive()) return reject('Clear the forced outputs first');
+          this.enableHammermill(eq);
+        } else if (eq.owner?.startsWith('REFILL-')) eq.enabled = false; // mid-refill: the refill does its controlled stop
+        else this.pauseHammermill(eq);
+        return ok();
+      }
+
+      case 'SetLoadControl': {
+        const eq = this.equipment.get(cmd.targetId ?? '');
+        if (!eq) return reject('Unknown equipment');
+        const p = cmd.parameters ?? {};
+        if (typeof p.setpoint === 'number' && Number.isFinite(p.setpoint) && p.setpoint >= 0) eq.config.loadSetpointAmps = p.setpoint;
+        if (typeof p.auto === 'boolean' && eq.loadAtRunning) return reject('Autotune is running (cancel it first)');
+        if (p.auto === true) {
+          const feeder = this.equipment.get(String(eq.config.loadControlFeeder ?? ''));
+          if (!feeder?.config.analogSpeedOutput) return reject('Load control needs a feeder with an analog speed output');
+          if (!(Number(eq.config.maxAmps ?? 0) > Number(eq.config.minAmps ?? 0))) return reject('Load input needs Min/Max Amps');
+          if (!(Number(eq.config.loadSetpointAmps ?? 0) > 0)) return reject('Set a load setpoint first');
+          if (this.byp(eq, 'analogLoadInput')) return reject('Load monitoring is bypassed');
+          eq.loadControlAuto = true;
+        } else if (p.auto === false) eq.loadControlAuto = false;
+        this.persistConfig();
+        return ok();
+      }
+
+      // Per-machine load settings that are safe to change while the mill runs (the general config edit is blocked mid-batch).
+      case 'SetLoadConfig': {
+        const eq = this.equipment.get(cmd.targetId ?? '');
+        const v = cmd.parameters?.values as Record<string, unknown> | undefined;
+        if (!eq || !v || typeof v !== 'object') return reject('Unknown equipment');
+        const NUM = ['hiWarnAmps', 'hiPauseAmps', 'loadLimitDelay', 'loadSetpointAmps', 'loadKp', 'loadTiSec', 'loadTdSec', 'loadAtStepPct', 'loadAtHyst', 'loadAtGain'];
+        for (const [k, val] of Object.entries(v)) {
+          if (NUM.includes(k)) { if (typeof val !== 'number' || !Number.isFinite(val) || val < 0) return reject(`${k} must be a number >= 0`); }
+          else return reject(`Not a runtime setting: ${k}`);
+        }
+        const merged = { ...eq.config, ...v };
+        if (Number(merged.hiWarnAmps ?? 0) > 0 && Number(merged.hiPauseAmps ?? 0) > 0 && Number(merged.hiWarnAmps) >= Number(merged.hiPauseAmps)) return reject('High warning must be below the high limit');
+        Object.assign(eq.config, v);
+        this.persistConfig();
+        return ok();
+      }
+
+      case 'SetBypass': {
+        const eq = this.equipment.get(cmd.targetId ?? '');
+        const key = String(cmd.parameters?.key ?? '');
+        const value = cmd.parameters?.value;
+        if (!eq) return reject('Unknown equipment');
+        if (!BYPASSABLE.includes(key) || typeof value !== 'boolean') return reject('Not a bypassable input');
+        if (value && !eq.config[key]) return reject('That input is not assigned on this equipment');
+        if (value) eq.config[`bypass_${key}`] = true; else delete eq.config[`bypass_${key}`];
+        this.persistConfig();
+        return ok();
+      }
+
+      case 'StartLoadAutotune': {
+        const eq = this.equipment.get(cmd.targetId ?? '');
+        const m = eq && this.loadMon.get(eq.id);
+        if (!eq || !m) return reject('No load input on this equipment');
+        const feeder = this.equipment.get(String(eq.config.loadControlFeeder ?? ''));
+        if (!feeder?.config.analogSpeedOutput) return reject('Load control needs a feeder with an analog speed output');
+        if (this.byp(eq, 'analogLoadInput')) return reject('Load monitoring is bypassed');
+        if (eq.loadAmps === undefined) return reject('No load reading');
+        if (eq.status !== 'running' || feeder.status !== 'running') return reject('Run the mill and feeder first');
+        const sp = Number(eq.config.loadSetpointAmps ?? 0);
+        if (!(sp > 0)) return reject('Set a load setpoint first');
+        const [lo, hi] = this.speedLimits(feeder);
+        const base = feeder.speed ?? 100;
+        m.tuneBase = base;
+        m.tuneWasAuto = !!eq.loadControlAuto;
+        m.tuner = new RelayTuner(sp, base, Number(eq.config.loadAtStepPct ?? 10), Number(eq.config.loadAtHyst ?? 1), lo, hi, eq.loadAmps);
+        eq.loadControlAuto = false;
+        eq.loadAtRunning = true;
+        eq.loadAtMsg = 'Autotune running';
+        return ok();
+      }
+
+      case 'CancelLoadAutotune': {
+        const eq = this.equipment.get(cmd.targetId ?? '');
+        const m = eq && this.loadMon.get(eq.id);
+        if (!eq || !m?.tuner) return reject('No autotune running');
+        this.endTune(eq, m, 'Autotune cancelled', this.equipment.get(String(eq.config.loadControlFeeder ?? '')));
+        return ok();
+      }
+
+      case 'SilenceHorn': {
+        this.toggleHornSilence();
+        return ok();
+      }
+
       case 'SetHammermillDestination': {
         const eq = this.equipment.get(cmd.targetId ?? '');
         if (!eq || eq.equipmentType !== 'hammermill') return reject('Hammermill not found');
@@ -399,7 +518,16 @@ export class Mill {
         eq.faultReason = undefined;
         eq.faultTimerMs = 0;
         const f = this.faults.find(f => f.equipment === eq.id && f.active);
-        if (f) { f.active = false; f.clearedAt = new Date().toISOString(); }
+        if (f) { f.active = false; f.clearedAt = new Date().toISOString(); persistFault(f); }
+        return ok();
+      }
+
+      case 'ResetRunHours': {
+        const eq = this.equipment.get(cmd.targetId ?? '');
+        if (!eq) return reject('Unknown equipment');
+        eq.runSeconds = 0;
+        eq.runSecondsResetAt = new Date().toISOString();
+        this.persistConfig();
         return ok();
       }
 
@@ -409,6 +537,8 @@ export class Mill {
         if (!sig || val === undefined) return reject('Missing signal or value');
         const sigDef = this.signals.find(s => s.id === sig);
         const isOutput = sigDef?.direction === 'DO' || sigDef?.direction === 'AO';
+        const blocked = isOutput ? this.forceBlockedReason() : null;
+        if (blocked) return reject(`Cannot force an output: ${blocked}`);
         if (isOutput && !this.commissioningMode) {
           return reject('Enable commissioning mode to force an output');
         }
@@ -444,6 +574,48 @@ export class Mill {
         if (this.omronConfig.couplerType === 'none') return reject('No coupler configured');
         this.readOmronRack();
         this.persistConfig(); // discoveredRack must survive a restart, or every reboot would need a fresh Read Rack
+        return ok();
+      }
+
+      case 'ClearEthercatErrors': {
+        if (this.omronConfig.couplerType !== 'NX-ECC') return reject('Only supported for NX-ECC couplers');
+        const r = clearCouplerErrors();
+        if (!r.ok) return reject(`Could not clear coupler errors: ${r.error ?? 'unknown'}`);
+        this.readOmronRack(); // re-read so the rack status/warnings reflect what's still wrong
+        this.persistConfig();
+        return ok();
+      }
+
+      case 'CalibrateScale': {
+        // mode 'theoretical': load-cell rated capacity + mV/V from the scale's config (W565 equivalent-input calibration).
+        // mode 'zero' / 'span': actual-load calibration — empty scale then 'zero'; standard weight on then 'span'.
+        const guardErr = this.guardConfigEdit();
+        if (guardErr) return reject(guardErr);
+        const sc = this.scaleConfigs.find(s => s.id === cmd.targetId);
+        if (!sc || sc.connectionType !== 'rs1201') return reject('Not an RS1201 scale');
+        if (this.omronConfig.couplerType !== 'NX-ECC') return reject('Requires an NX-ECC coupler');
+        const mode = cmd.parameters?.mode;
+        const steps: ScaleCalStep[] = [];
+        if (mode === 'theoretical') {
+          const capacity = Number(cmd.parameters?.capacity ?? sc.capacity);
+          const mvv = Number(cmd.parameters?.ratedMvV ?? sc.ratedMvV);
+          if (!(capacity > 0) || !(mvv > 0)) return reject('Set the scale capacity and rated mV/V first');
+          const zb = Number(cmd.parameters?.zeroBalance ?? 0);
+          if (!Number.isFinite(zb)) return reject('Invalid zero balance');
+          steps.push({ cmd: 0x90, data: capacity }, { cmd: 0x91, data: mvv }, { cmd: 0x92, data: zb });
+          sc.capacity = capacity; sc.ratedMvV = mvv; // keep the saved config in step with what the unit was calibrated to
+          if (cmd.parameters?.switchFromActual === true) steps.push({ cmd: 0x40 }); // only needed after a previous actual-load calibration
+        } else if (mode === 'zero') {
+          steps.push({ cmd: 0x20 });
+        } else if (mode === 'span') {
+          const w = Number(cmd.parameters?.standardWeight);
+          if (!(w > 0)) return reject('Enter the standard weight');
+          steps.push({ cmd: 0x93, data: w }, { cmd: 0x30 });
+        } else return reject('Unknown calibration mode');
+        const r = runRs1201Calibration(sc.rackSlot, steps);
+        if (!r.ok) return reject(`Calibration failed: ${r.error}`);
+        sc.calibration = { mode, at: new Date().toISOString(), ...(mode === 'span' ? { standardWeight: Number(cmd.parameters?.standardWeight) } : {}) };
+        this.persistConfig();
         return ok();
       }
 
@@ -527,10 +699,7 @@ export class Mill {
           mode: 'Auto', status: 'not_running', request: false, runCmd: false, feedback: false,
           config: p.config ?? {}, faultTimerMs: 0, positionTimerMs: 0, startTimerMs: 0, stopTimerMs: 0,
         };
-        if (p.equipmentType === 'hammermill') {
-          eq.mode = 'Off';
-          eq.status = 'disabled';
-        }
+        if (p.equipmentType === 'hammermill') this.pauseHammermill(eq);
         this.equipment.set(id, eq);
         if (p.equipmentType === 'bin' || p.equipmentType === 'finished_bin') {
           this.bins.push({
@@ -702,6 +871,7 @@ export class Mill {
       case 'SetGlobalConfig': {
         const p = cmd.parameters as { key: string; value: string | number } | undefined;
         if (!p?.key || p.value === undefined) return reject('Missing key or value');
+        if (p.key.startsWith('stateColor_') && !/^#[0-9a-f]{6}$/i.test(String(p.value))) return reject('Colour must be #rrggbb');
         this.globalConfig[p.key] = p.value;
         return ok();
       }
@@ -789,10 +959,16 @@ export class Mill {
     this.checkLevelSensors();
     this.updateRefills();
     this.updateEquipmentStates();
+    this.updateLoadMonitors();
     this.updateRotationSensors(ioState);
+    this.updateLoadControl();
     this.applyAugerSpeeds();
     this.advanceBatch();
+    this.sampleTrends();
+    this.updateHorn();
     this.computeOutputs();
+    // run-hour counters change every scan; write them out once a minute (a power cut loses at most that)
+    if (++this.persistTicks >= 600) { this.persistTicks = 0; this.persistConfig(); }
     this.revision++;
     this.onChange?.();
   }
@@ -814,7 +990,15 @@ export class Mill {
     for (const sig of this.signals) {
       if (sig.direction !== 'DI' && sig.direction !== 'AI') continue;
       if (sig.id in this.ioOverrides) continue;
-      const v = state.inputs[sig.id];
+      let v = state.inputs[sig.id];
+      if (v !== undefined && sig.direction === 'AI' && typeof v === 'number') {
+        // 32767 = wire break (W522 §6-2): hold nothing, fault it, never present it as a reading
+        const code = `W-AI-${sig.id}`;
+        if (v === NX_ANALOG_DISCONNECT_RAW) { this.aiDisconnected.add(sig.id); this.raiseFault('OMRON', 'WARNING', `${sig.id}: analog input open circuit (sensor disconnected)`, code); continue; }
+        this.aiDisconnected.delete(sig.id);
+        this.clearFault(code);
+        v = rawToPct(v, fullScaleFor(sig.id, this.omronConfig.cards));
+      }
       if (v !== undefined) this.ioInputs[sig.id] = v;
     }
   }
@@ -861,6 +1045,15 @@ export class Mill {
     }
     // Motor rungs, like nested PLC rungs: run logic upstream-first (a stop delay starts only once the motors feeding it
     // have stopped), then the downstream permissive downstream-first, then feedback/fault/status/outputs.
+    if (!this.estopOk()) {
+      this.raiseFault('ESTOP', 'CRITICAL', 'Emergency stop pressed', 'E-ES-01');
+      this.pauseActiveBatch(); // motors are already dead (motorRunLogic), so PAUSING completes on the next batch tick
+      // Hammermills are disabled (paused) like at startup: the operator must re-enable them, and any refill is dropped.
+      this.abortRefills();
+      for (const eq of this.equipment.values()) {
+        if (eq.equipmentType === 'hammermill' && eq.status !== 'fault' && eq.status !== 'disabled') this.pauseHammermill(eq);
+      }
+    }
     const downstreamFirst = this.motorsDownstreamFirst();
     for (let i = downstreamFirst.length - 1; i >= 0; i--) this.motorRunLogic(downstreamFirst[i]);
     for (const eq of downstreamFirst) this.motorInterlock(eq);
@@ -910,6 +1103,7 @@ export class Mill {
     for (const eq of this.equipment.values()) {
       const sig = eq.config.rotationPulseInput as string | undefined;
       if (!sig) continue;
+      if (this.byp(eq, 'rotationPulseInput')) { const old = this.rotationState.get(eq.id); if (old) old.rpm = undefined; continue; }
 
       let st = this.rotationState.get(eq.id);
       if (!st) {
@@ -967,6 +1161,18 @@ export class Mill {
     this.motorFeedback(eq); // a feedback fault drops the run command in this same scan
     const usable = eq.status !== 'fault' && eq.status !== 'disabled';
 
+    // Like the PLC's FaultIntlTmp: a trip cancels Hand, so the operator's reset can't restart the motor on its own.
+    if (eq.status === 'fault' && eq.mode === 'Hand') eq.mode = 'Off';
+
+    // E-stop: nothing runs, Hand is cancelled (Auto selection survives), and the start timers re-arm on release.
+    if (!this.estopOk()) {
+      if (eq.mode === 'Hand') eq.mode = 'Off';
+      eq.runCmd = false;
+      eq.startTimerMs = 0;
+      eq.stopTimerMs = 0;
+      return;
+    }
+
     if (!usable || eq.mode === 'Off') eq.request = false;
     else if (eq.mode === 'Hand') eq.request = true;
     // Auto: keep the request set by the batch engine / refill
@@ -1000,6 +1206,12 @@ export class Mill {
     }
   }
 
+  // Optional DI wired through the NC e-stop chain (globalConfig.estopInput); true = healthy. Unassigned = no e-stop.
+  private estopOk(): boolean {
+    const sig = this.globalConfig.estopInput as string | undefined;
+    return !sig || !!this.ioInputs[sig];
+  }
+
   private upstreamStopping(eq: EquipmentRuntime): boolean {
     for (const c of this.connections) {
       if (c.to !== eq.id) continue;
@@ -1009,17 +1221,184 @@ export class Mill {
     return false;
   }
 
+  // The PLC's motor status word (DisWd): off / auto stopped / auto running / hand running / bypass / fault / alarm, applied
+  // in the PLC's rung order so the later rule wins. Alarm is kept below Fault (the PLC lets it win; a warning should not hide a trip).
+  private displayState(eq: EquipmentRuntime): string {
+    if (eq.status === 'disabled') return 'disabled';
+    const running = eq.status === 'running';
+    const bypassed = BYPASSABLE.some(k => !!eq.config[k] && this.byp(eq, k));
+    let st = 'off';
+    if (eq.mode === 'Auto') st = running ? 'auto_running' : 'auto_stopped';
+    if (bypassed) st = 'bypass';
+    if (eq.mode === 'Off') st = 'off';
+    if (eq.mode === 'Hand' && running) st = 'hand_running';
+    if (eq.warningReason || this.faults.some(f => f.active && f.equipment === eq.id && f.severity === 'WARNING')) st = 'alarm';
+    if (eq.status === 'fault') st = 'fault';
+    return st;
+  }
+
+  // A trip is a latch. If its fault is still active after a restart but the equipment lost its fault state (power cut
+  // before config.json was written), put the equipment back in 'fault' so it cannot start until the operator resets it.
+  private restoreTripLatches() {
+    for (const f of this.faults) {
+      const eq = f.active && TRIP_CODES.includes(f.code) ? this.equipment.get(f.equipment) : undefined;
+      if (!eq || eq.status === 'fault') continue;
+      eq.status = 'fault';
+      eq.faultReason = f.message.replace(`${eq.name}: `, '');
+      eq.runCmd = false; eq.request = false;
+      if (eq.mode === 'Hand') eq.mode = 'Off';
+    }
+  }
+
+  private byp(eq: EquipmentRuntime, key: string) { return eq.config[`bypass_${key}`] === true; }
+
+  // A protective trip: same latched fault the feedback timeout uses (cleared by ResetEquipmentFault, drops Hand).
+  private tripMotor(eq: EquipmentRuntime, reason: string, code: string) {
+    eq.status = 'fault';
+    eq.faultReason = reason;
+    eq.runCmd = false;
+    this.raiseFault(eq.id, 'CRITICAL', `${eq.name}: ${reason}`, code);
+  }
+
+  // Motor load (amps): moving average of the card's %-of-span, scaled to amps (0% = minAmps, 100% = maxAmps; the % already
+  // uses the configured card's full scale, e.g. NX-AD3203 0..8000). As in the PLC (M40) only HIGH current is watched:
+  // Hi Warn = warning (+horn), Hi Pause = latched fault that trips the motor and drops Hand. A limit of 0 is off. Limits
+  // only count while running, after loadLimitDelay s. A disconnected sensor trips a running motor, unless the operator
+  // set the load-input bypass (monitoring disabled: no limits, no disconnect trip, no load control).
+  private updateLoadMonitors() {
+    for (const eq of this.equipment.values()) {
+      const sig = eq.config.analogLoadInput as string | undefined;
+      const lo = Number(eq.config.minAmps ?? 0), hi = Number(eq.config.maxAmps ?? 0);
+      if (!sig || !this.isMotor(eq) || !(hi > lo)) { eq.loadAmps = undefined; eq.loadDisconnected = undefined; continue; }
+      const avgSize = Math.max(1, Number(eq.config.loadAvgSamples ?? 10));
+      let m = this.loadMon.get(eq.id);
+      if (!m || m.avgSize !== avgSize) {
+        m = { avgSize, avg: new MovingAverage(avgSize), hiWarn: new OnDelay(), hiPause: new OnDelay(), pid: new LoadPid(), tuner: m?.tuner, tuneBase: m?.tuneBase };
+        this.loadMon.set(eq.id, m);
+      }
+      const bypass = this.byp(eq, 'analogLoadInput');
+      const running = eq.status === 'running';
+      eq.loadDisconnected = this.aiDisconnected.has(sig) && !(sig in this.ioOverrides); // an overridden input is a forced value
+      if (eq.loadDisconnected) {
+        eq.loadAmps = undefined;
+        m.avg.reset();
+        if (!bypass && eq.runCmd && eq.status !== 'fault') this.tripMotor(eq, 'load sensor disconnected', 'E-LD-03');
+        continue;
+      }
+      const pct = this.ioInputs[sig];
+      if (typeof pct !== 'number') { eq.loadAmps = undefined; continue; }
+      if (!running) m.avg.reset(); // idle samples must not drag the average down when the motor starts
+      const amps = m.avg.push(scaleLinear(pct, lo, hi));
+      eq.loadAmps = Math.round(amps * 10) / 10;
+
+      const delay = delayMs(eq.config.loadLimitDelay, 2);
+      const lim = (k: string) => Number(eq.config[k] ?? 0);
+      const watch = running && !bypass;
+      const hiWarn = m.hiWarn.tick(watch && lim('hiWarnAmps') > 0 && amps >= lim('hiWarnAmps'), SCAN_MS, delay);
+      const hiPause = m.hiPause.tick(watch && lim('hiPauseAmps') > 0 && amps >= lim('hiPauseAmps'), SCAN_MS, delay);
+
+      eq.warningReason = hiWarn ? 'High load' : undefined;
+      if (hiWarn) this.raiseFault(eq.id, 'WARNING', `${eq.name}: high load warning (${eq.loadAmps} A)`, 'W-LD-01');
+      if (hiPause) this.tripMotor(eq, `high load (${eq.loadAmps} A)`, 'E-LD-01');
+    }
+  }
+
+  private endTune(eq: EquipmentRuntime, m: LoadMon, msg: string, feeder?: EquipmentRuntime) {
+    if (feeder && m.tuneBase !== undefined) feeder.speed = m.tuneBase; // hand the feeder back at the speed it had
+    eq.loadControlAuto = !!m.tuneWasAuto; // like the PLC's PIDAT: control carries on in the mode it was in, with the new constants
+    m.tuner = undefined; m.tuneBase = undefined; m.tuneWasAuto = undefined; m.pid.reset();
+    eq.loadAtRunning = false; eq.loadAtMsg = msg;
+  }
+
+  // Hammermill load control: a velocity-form PID trims the feeder auger's speed to hold the mill's amps at
+  // loadSetpointAmps. Runs only in Auto (loadControlAuto) with the mill and feeder both running; otherwise it tracks
+  // the feeder's current speed so switching to Auto is bumpless. An autotune (relay test) takes the feeder over instead.
+  private updateLoadControl() {
+    for (const eq of this.equipment.values()) {
+      const m = this.loadMon.get(eq.id);
+      if (!m) continue;
+      const feeder = this.equipment.get(String(eq.config.loadControlFeeder ?? ''));
+      const bypass = this.byp(eq, 'analogLoadInput');
+      if (bypass) eq.loadControlAuto = false;
+      const ready = !!feeder?.config.analogSpeedOutput && eq.loadAmps !== undefined && !bypass;
+      const bothRun = eq.status === 'running' && feeder?.status === 'running';
+      if (m.tuner) {
+        if (!ready || !bothRun) { this.endTune(eq, m, 'Autotune aborted: mill, feeder or load input not available', feeder); continue; }
+        const r = m.tuner.step(eq.loadAmps!, SCAN_MS / 1000);
+        feeder!.speed = r.out;
+        if (r.done) {
+          // PLC's ATCalcGain: 1 = fast ... 10 = slow, default 7. Gain 7 keeps the measured values; slower = gentler Kp and longer Ti.
+          const g = Math.min(10, Math.max(1, Number(eq.config.loadAtGain ?? 7)));
+          const kp = Math.round(r.done.kp * (7 / g) * 1000) / 1000, ti = Math.round(r.done.tiSec * (g / 7) * 10) / 10;
+          eq.config.loadKp = kp; eq.config.loadTiSec = ti; eq.config.loadTdSec = 0;
+          this.endTune(eq, m, `Autotune done: Kp ${kp}, Ti ${ti} s (cycle ${r.done.tuSec.toFixed(1)} s). Control is ${m.tuneWasAuto ? 'Auto with the new values' : 'still Manual'}.`, feeder);
+          this.persistConfig();
+        } else if (r.failed) this.endTune(eq, m, `Autotune failed: ${r.failed}`, feeder);
+        continue;
+      }
+      if (!ready || !(eq.loadControlAuto && bothRun)) { m.pid.reset(); continue; }
+      const [lo, hi] = this.speedLimits(feeder!);
+      feeder!.speed = m.pid.step(
+        Number(eq.config.loadSetpointAmps ?? 0), eq.loadAmps!, feeder!.speed ?? 100, SCAN_MS / 1000,
+        { kp: Number(eq.config.loadKp ?? 0), tiSec: Number(eq.config.loadTiSec ?? 0), tdSec: Number(eq.config.loadTdSec ?? 0) }, lo, hi);
+    }
+  }
+
+  private sampleTrends() {
+    if (++this.trendTicks < 10) return;
+    this.trendTicks = 0;
+    const now = Date.now();
+    for (const eq of this.equipment.values()) {
+      if (eq.loadAmps === undefined) continue;
+      const feeder = this.equipment.get(String(eq.config.loadControlFeeder ?? ''));
+      const sp = Number(eq.config.loadSetpointAmps ?? 0);
+      let buf = this.trends.get(eq.id);
+      if (!buf) { buf = []; this.trends.set(eq.id, buf); }
+      buf.push({ t: now, a: eq.loadAmps, s: feeder ? feeder.speed : undefined, sp: sp > 0 ? sp : undefined });
+      if (buf.length > 600) buf.shift();
+    }
+  }
+
+  getTrend(id: string) { return this.trends.get(id) ?? []; }
+
+  private hornRearm() { this.hornSilenced = false; this.hornAutoMs = 0; this.hornPhaseOn = true; this.hornPhaseMs = 0; }
+  private toggleHornSilence() { if (this.hornSilenced) this.hornRearm(); else this.hornSilenced = true; }
+
+  private updateHorn() {
+    const gc = this.globalConfig;
+    const inSig = gc.hornSilenceInput as string | undefined;
+    const inNow = !!(inSig && this.ioInputs[inSig]);
+    if (inNow && !this.hornInPrev) this.toggleHornSilence();
+    this.hornInPrev = inNow;
+    let on = false;
+    if (this.faults.some(f => f.active) && !this.hornSilenced) {
+      const auto = Number(gc.hornAutoSilenceSec ?? 60);
+      this.hornAutoMs += SCAN_MS;
+      if (auto > 0 && this.hornAutoMs >= auto * 1000) this.hornSilenced = true;
+      else {
+        const onMs = delayMs(gc.hornOnSec, 1), offMs = delayMs(gc.hornOffSec, 1);
+        this.hornPhaseMs += SCAN_MS;
+        if (offMs === 0) this.hornPhaseOn = true;
+        else if (this.hornPhaseOn && this.hornPhaseMs >= onMs) { this.hornPhaseOn = false; this.hornPhaseMs = 0; }
+        else if (!this.hornPhaseOn && this.hornPhaseMs >= offMs) { this.hornPhaseOn = true; this.hornPhaseMs = 0; }
+        on = this.hornPhaseOn;
+      }
+    }
+    this.hornOn = on;
+    this.out(gc.hornOutput as string | undefined, on);
+  }
+
   // Master VFD: a second starter that follows the run command and must confirm on its aux input.
   private vfdOf(eq: EquipmentRuntime) {
     return eq.config.masterVfd
-      ? { run: eq.config.vfdRunOutput as string | undefined, aux: eq.config.vfdAuxInput as string | undefined }
+      ? { run: eq.config.vfdRunOutput as string | undefined, aux: this.byp(eq, 'vfdAuxInput') ? undefined : eq.config.vfdAuxInput as string | undefined }
       : undefined;
   }
 
   // Read the run confirmation(s) and time them against the global Motor Starter Fault Delay (same delay for the VFD).
   private motorFeedback(eq: EquipmentRuntime) {
     const runOutput = eq.config.runOutput as string | undefined;
-    const runConfirmAux = eq.config.runConfirmAux as string | undefined;
+    const runConfirmAux = this.byp(eq, 'runConfirmAux') ? undefined : eq.config.runConfirmAux as string | undefined;
     const usable = eq.status !== 'fault' && eq.status !== 'disabled';
 
     if (runConfirmAux && runConfirmAux in this.ioInputs) {
@@ -1030,11 +1409,16 @@ export class Mill {
 
     const vfd = this.vfdOf(eq);
     const vfdOk = !vfd?.aux || !!this.ioInputs[vfd.aux];
+    // Same sequence as the PLC's micros VFD (M11): the starter closes first and the VFD is started only once the starter
+    // has been confirmed for vfdStartDelay (0.7 s); it drops with the run command. Its aux is only expected once it was started.
+    eq.vfdStartMs = vfd && usable && eq.runCmd && eq.feedback ? (eq.vfdStartMs ?? 0) + SCAN_MS : 0;
+    eq.vfdCmd = !!vfd && eq.vfdStartMs >= delayMs(eq.config.vfdStartDelay, 0.7);
 
     if (usable) {
-      if (eq.runCmd && !(eq.feedback && vfdOk)) {
+      if ((eq.runCmd && !eq.feedback) || (eq.vfdCmd && !vfdOk)) {
         eq.faultTimerMs += SCAN_MS;
-        if (eq.faultTimerMs >= delayMs(this.globalConfig.motorStarterFaultDelay, 0.5)) {
+        // per-motor starterFaultDelay overrides the global one (PLC: OLFaultTdSV is an input of each MSFault call)
+        if (eq.faultTimerMs >= delayMs(eq.config.starterFaultDelay ?? this.globalConfig.motorStarterFaultDelay, 0.5)) {
           const starter = !eq.feedback;
           eq.status = 'fault';
           eq.faultReason = starter ? 'Starter feedback timeout' : 'VFD feedback timeout';
@@ -1051,17 +1435,21 @@ export class Mill {
     const vfd = this.vfdOf(eq);
     if (eq.status !== 'fault' && eq.status !== 'disabled') {
       const vfdOk = !vfd?.aux || !!this.ioInputs[vfd.aux];
-      eq.status = eq.runCmd && eq.feedback && vfdOk ? 'running' : 'not_running';
+      eq.status = eq.runCmd && eq.feedback && (!vfd || eq.vfdCmd) && vfdOk ? 'running' : 'not_running';
+    }
+    if (eq.status === 'running') {
+      eq.runSecondsTotal = (eq.runSecondsTotal ?? 0) + SCAN_MS / 1000;
+      eq.runSeconds = (eq.runSeconds ?? 0) + SCAN_MS / 1000;
     }
     this.out(eq.config.runOutput as string | undefined, eq.runCmd);
-    this.out(vfd?.run, eq.runCmd);
+    this.outOr(vfd?.run, !!eq.vfdCmd && eq.runCmd);
   }
 
   private updateGate(eq: EquipmentRuntime) {
     const openOutput = eq.config.openOutput as string | undefined;
     const closeOutput = eq.config.closeOutput as string | undefined;
-    const openLimit = eq.config.openLimitInput as string | undefined;
-    const closedLimit = eq.config.closedLimitInput as string | undefined;
+    const openLimit = this.byp(eq, 'openLimitInput') ? undefined : eq.config.openLimitInput as string | undefined;
+    const closedLimit = this.byp(eq, 'closedLimitInput') ? undefined : eq.config.closedLimitInput as string | undefined;
     const timeout = delayMs(eq.config.positionTimeout, 5);
 
     const openFb = openLimit ? !!this.ioInputs[openLimit] : undefined;
@@ -1374,6 +1762,17 @@ export class Mill {
   }
 
   // Drop the run request of everything the batch owns; each motor stops after its own stop delay.
+  // Pause the running batch: PAUSING releases its equipment once everything has stopped, then it sits PAUSED for Resume.
+  private pauseActiveBatch(): boolean {
+    const b = this.activeBatch;
+    if (!b || ['COMPLETED', 'FAULTED', 'PAUSED', 'PAUSING', 'IDLE'].includes(b.state)) return false;
+    b.previousState = b.state;
+    b.state = 'PAUSING';
+    this.initiateEquipmentStop(b.id);
+    persistBatch(b);
+    return true;
+  }
+
   private initiateEquipmentStop(ownerId: string) {
     for (const eq of this.equipment.values()) {
       if (eq.owner === ownerId) eq.request = false;
@@ -1393,9 +1792,10 @@ export class Mill {
   private levelSwitches(eq: EquipmentRuntime) {
     const fin = eq.equipmentType === 'finished_bin';
     const c = eq.config;
+    const pick = (k: string) => (this.byp(eq, k) ? undefined : c[k] as string | undefined);
     return {
-      hi: { input: (fin ? c.fullSensor : c.highLevelInput) as string | undefined, covered: fin ? 'fullSensorCovered' : 'highLevelCovered', delay: 'binFullStopDelay' },
-      lo: { input: (fin ? c.lowSensor : c.lowLevelInput) as string | undefined, covered: fin ? 'lowSensorCovered' : 'lowLevelCovered', delay: 'binLowRestartDelay' },
+      hi: { input: pick(fin ? 'fullSensor' : 'highLevelInput'), covered: fin ? 'fullSensorCovered' : 'highLevelCovered', delay: 'binFullStopDelay' },
+      lo: { input: pick(fin ? 'lowSensor' : 'lowLevelInput'), covered: fin ? 'lowSensorCovered' : 'lowLevelCovered', delay: 'binLowRestartDelay' },
     };
   }
 
@@ -1407,27 +1807,25 @@ export class Mill {
   // Debounce: the high switch must stay covered for Bin Full Stop Delay before the bin counts as full; the low switch must
   // stay uncovered for Bin Low Restart Delay before it counts as empty. The other direction is immediate.
   // Updated once per scan; before the first scan the raw state is used.
-  private debouncedCovered = new Map<string, { input: string; covered: boolean; pending?: boolean; since: number }>();
+  private debouncedCovered = new Map<string, { input: string; db: Debounce }>();
 
   private updateLevelDebounce(eq: EquipmentRuntime) {
-    const now = Date.now();
     const sws = this.levelSwitches(eq);
-    for (const sw of [sws.hi, sws.lo]) {
+    for (const [isHi, sw] of [[true, sws.hi], [false, sws.lo]] as const) {
       if (!sw.input) continue;
       const key = `${eq.id}:${sw.covered}`;
       const raw = this.rawCovered(eq, sw);
       let d = this.debouncedCovered.get(key);
-      if (!d || d.input !== sw.input) { d = { input: sw.input, covered: raw, since: now }; this.debouncedCovered.set(key, d); }
-      if (raw === d.covered) { d.pending = undefined; continue; }
-      if (d.pending !== raw) { d.pending = raw; d.since = now; }
-      if (now - d.since >= (raw === (sw === sws.hi) ? delayMs(eq.config[sw.delay]) : 0)) { d.covered = raw; d.pending = undefined; }
+      if (!d || d.input !== sw.input) { d = { input: sw.input, db: new Debounce(raw) }; this.debouncedCovered.set(key, d); }
+      const delay = delayMs(eq.config[sw.delay]);
+      d.db.step(raw, SCAN_MS, isHi ? delay : 0, isHi ? 0 : delay); // high: slow to cover; low: slow to uncover
     }
   }
 
   private sensorCovered(eq: EquipmentRuntime, sw: { input?: string; covered: string }): boolean | undefined {
     if (!sw.input) return undefined;
     const d = this.debouncedCovered.get(`${eq.id}:${sw.covered}`);
-    return d && d.input === sw.input ? d.covered : this.rawCovered(eq, sw);
+    return d && d.input === sw.input ? d.db.state : this.rawCovered(eq, sw);
   }
 
   // High switch covered = full. Low switch covered = material above the low point; uncovered = empty.
@@ -1471,10 +1869,17 @@ export class Mill {
 
   // ── hammermill automatic refill ──
 
+  // Enabled/disabled is the operator's main-screen switch and is separate from the HOA mode: an enabled mill in Auto
+  // keeps its destination bin full from the level switches. Disabling leaves the HOA selection alone.
   private pauseHammermill(hm: EquipmentRuntime) {
-    hm.mode = 'Off';
+    hm.enabled = false;
     hm.status = 'disabled';
     hm.request = false;
+  }
+
+  private enableHammermill(hm: EquipmentRuntime) {
+    hm.enabled = true;
+    if (hm.status === 'disabled') { hm.status = 'not_running'; hm.faultTimerMs = 0; }
   }
 
   private abortRefills() {
@@ -1483,7 +1888,7 @@ export class Mill {
   }
 
   private hammermillReady(hm: EquipmentRuntime): boolean {
-    return hm.mode === 'Auto' && !!hm.config.autoEnable
+    return !!hm.enabled && hm.mode === 'Auto' && !!hm.config.autoEnable
       && hm.status !== 'fault' && hm.status !== 'disabled';
   }
 
@@ -1577,7 +1982,7 @@ export class Mill {
       const sigDef = this.signals.find(s => s.id === id);
       if (sigDef?.direction === 'DO' || sigDef?.direction === 'AO') this.ioOutputs[id] = val;
     }
-    writeIoCommand(this.ioOutputs, this.signals);
+    writeIoCommand(this.ioOutputs, this.signals, this.omronConfig.cards);
   }
 
   // ── snapshot ──
@@ -1589,7 +1994,21 @@ export class Mill {
       faultReason: eq.faultReason, warningReason: eq.warningReason, owner: eq.owner,
       config: eq.config, position: eq.position, gatePosition: eq.gatePosition,
       speed: eq.speed, refillState: this.refills.get(eq.id)?.state,
+      state: this.isMotor(eq) ? this.displayState(eq) : undefined,
+      enabled: eq.enabled, loadAmps: eq.loadAmps, loadDisconnected: eq.loadDisconnected, loadControlAuto: eq.loadControlAuto,
+      loadAtRunning: eq.loadAtRunning, loadAtMsg: eq.loadAtMsg,
+      // only motors have run hours; default 0 so the HMI shows the counter (and Reset) before the first run
+      ...(this.isMotor(eq) ? { runSecondsTotal: eq.runSecondsTotal ?? 0, runSeconds: eq.runSeconds ?? 0, runSecondsResetAt: eq.runSecondsResetAt } : {}),
     }));
+
+    // What each I/O point is set to in the configuration (equipment role, or a global like the e-stop / horn).
+    const tags = new Map<string, string>();
+    for (const eq of this.equipment.values()) {
+      for (const [key, label] of Object.entries(PORT_LABELS)) { const id = eq.config[key]; if (id) tags.set(String(id), `${eq.id} ${label}`); }
+    }
+    for (const [key, label] of [['estopInput', 'E-Stop'], ['hornOutput', 'Horn'], ['hornSilenceInput', 'Horn Silence']] as const) {
+      if (this.globalConfig[key]) tags.set(String(this.globalConfig[key]), label);
+    }
 
     const batchToQueue = (b: BatchRuntime): QueueSnapshot => {
       const totalTarget = b.dosingSteps.reduce((s, st) => s + st.target, 0);
@@ -1625,13 +2044,14 @@ export class Mill {
       recipes: this.recipes,
       ingredients: this.ingredients,
       connections: this.connections,
-      io: { inputs: { ...this.ioInputs }, outputs: { ...this.ioOutputs }, signals: this.signals, overrides: { ...this.ioOverrides } },
+      io: { inputs: { ...this.ioInputs }, outputs: { ...this.ioOutputs }, signals: this.signals.map(s => ({ ...s, assignment: tags.get(s.id) })), overrides: { ...this.ioOverrides } },
       scales: { ...this.scales },
       scaleConfigs: this.scaleConfigs,
       omronConfig: { ...this.omronConfig, cards: this.omronConfig.cards.map(c => ({ ...c })) },
       globalConfig: { ...this.globalConfig },
       networkInterfaces: this.networkInterfaces,
       commissioningMode: this.commissioningMode,
+      horn: { on: this.hornOn, silenced: this.hornSilenced },
     };
   }
 
@@ -1646,6 +2066,7 @@ export class Mill {
     };
     this.faults.unshift(fault);
     persistFault(fault);
+    this.hornRearm();
   }
 
   private readOmronRack() {

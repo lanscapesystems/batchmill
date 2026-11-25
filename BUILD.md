@@ -63,7 +63,7 @@ The backend has no simulated-I/O mode — it only reads/writes real points throu
 
 ## Run (production)
 
-On the real Debian target, use `feedmill-backend/install/install.sh <ethercat-nic>` — it is the one-shot production installer: builds the IgH EtherCAT Master and `io-daemon`, deploys and builds the backend natively (required — `better-sqlite3` is a native addon, so a `node_modules` copied from another OS/arch won't load), and installs/enables three systemd units (`ethercat.service`, `feedmill-io-daemon.service`, `feedmill-backend.service`). Running the backend manually without the daemon/rack is still possible for frontend-only work:
+On the real Debian target, use `feedmill-backend/install/install.sh <ethercat-nic>` — it is the one-shot production installer: builds the IgH EtherCAT Master and `io-daemon`, deploys and builds the backend natively (required — `better-sqlite3` is a native addon, so a `node_modules` copied from another OS/arch won't load), and installs/enables the systemd units (`ethercat.service`, `feedmill-io-daemon.service`, `feedmill-backend.service`, `feedmill-hmi.service`). Each run builds a new read-only release under `/opt/feedmill/releases/`, switches the `current` symlink, health-checks it, and reverts automatically on failure; `sudo feedmill-rollback` flips back to the previous release by hand (code only, not `mill.db`). Running the backend manually without the daemon/rack is still possible for frontend-only work:
 
 ```bash
 cd feedmill-backend && npm start        # node dist/server.js

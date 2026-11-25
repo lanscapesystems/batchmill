@@ -1,8 +1,8 @@
 'use client';
 
-import { useState, useRef, useCallback, type MouseEvent as ReactMouseEvent } from 'react';
+import { useState, useRef, useCallback, useEffect, type ReactNode, type MouseEvent as ReactMouseEvent } from 'react';
 import { useMillStore, EQUIPMENT_DEFS, getPortsForEquipment, FLOW_HIDDEN_TYPES, type EquipmentItem, type EquipmentMode, type PortDef, type Position } from '../store';
-import { useBackend, type BackendEquipment, type BackendSignal } from '../backend';
+import { useBackend, BACKEND_HTTP, type BackendEquipment, type BackendSignal } from '../backend';
 
 const BLOCK_W = 100;
 const BLOCK_H = 50;
@@ -15,7 +15,26 @@ const TYPE_COLORS: Record<string, string> = {
   micro_drag: '#ffa726', gate: '#8d6e63', auger: '#29b6f6',
 };
 
-function blockFill(eq: EquipmentItem, backendEq?: BackendEquipment): string {
+// Motor display states = the PLC's motor status word. The colours here are the defaults; Settings > General can override
+// each one (globalConfig stateColor_<state>, #rrggbb).
+export const STATE_STYLE: Record<string, { label: string; color: string }> = {
+  off:          { label: 'OFF',          color: '#4a148c' },
+  auto_stopped: { label: 'AUTO STOPPED', color: '#424242' },
+  auto_running: { label: 'AUTO RUNNING', color: '#2e7d32' },
+  hand_running: { label: 'HAND RUNNING', color: '#1565c0' },
+  bypass:       { label: 'BYPASS',       color: '#f9a825' },
+  alarm:        { label: 'ALARM',        color: '#e65100' },
+  fault:        { label: 'FAULT',        color: '#b71c1c' },
+  disabled:     { label: 'DISABLED',     color: '#4a148c' },
+};
+
+export function stateColor(state: string, globalConfig?: Record<string, string | number>): string {
+  const custom = globalConfig?.[`stateColor_${state}`];
+  return typeof custom === 'string' && /^#[0-9a-f]{6}$/i.test(custom) ? custom : STATE_STYLE[state].color;
+}
+
+function blockFill(eq: EquipmentItem, backendEq?: BackendEquipment, globalConfig?: Record<string, string | number>): string {
+  if (backendEq?.state && STATE_STYLE[backendEq.state]) return stateColor(backendEq.state, globalConfig);
   const status = backendEq?.status ?? eq.status;
   const mode = backendEq?.mode ?? eq.mode;
   if (status === 'fault') return '#b71c1c';
@@ -23,6 +42,24 @@ function blockFill(eq: EquipmentItem, backendEq?: BackendEquipment): string {
   if (mode === 'Off' || status === 'disabled') return '#4a148c';
   if (status === 'running') return '#2e7d32';
   return '#424242';
+}
+
+// Motor load for display: % of the motor's FLA (amps come from the analog scaling), or amps when no FLA is set.
+function loadText(be: BackendEquipment): string {
+  if (be.loadDisconnected) return 'NO SENSOR';
+  if (be.loadAmps === undefined) return '—';
+  const fla = Number(be.config.motorFla ?? 0);
+  return fla > 0 ? `${Math.round((be.loadAmps / fla) * 100)}%` : `${be.loadAmps} A`;
+}
+
+// Live number under a box's id: motor load (A) and/or the weight of its scale (lb).
+function boxReadout(be: BackendEquipment | undefined, scales: Record<string, { weight: number; valid: boolean }> | undefined): string | undefined {
+  if (!be) return undefined;
+  const parts: string[] = [];
+  const scale = be.config.scaleId ? scales?.[String(be.config.scaleId)] : undefined;
+  if (be.config.scaleId) parts.push(scale?.valid ? `${Math.round(scale.weight)} lb` : '— lb');
+  if (be.config.analogLoadInput) parts.push(loadText(be));
+  return parts.length ? parts.join(' · ') : undefined;
 }
 
 function portPosition(pos: Position, port: PortDef, allPorts: PortDef[]): { x: number; y: number } {
@@ -144,7 +181,7 @@ export function SystemTab() {
               const pos = scaledPositions[eq.id];
               if (!pos) return null;
               const ports = getPortsForEquipment(eq);
-              const fill = blockFill(eq, backendEqMap.get(eq.id));
+              const fill = blockFill(eq, backendEqMap.get(eq.id), backend?.globalConfig);
               const isSel = selectedEq === eq.id;
 
               return (
@@ -158,9 +195,17 @@ export function SystemTab() {
                     style={{ cursor: 'pointer' }}
                     onClick={(e) => { e.stopPropagation(); setSelectedEq(eq.id); }}
                   />
-                  <text x={pos.x + BLOCK_W / 2} y={pos.y + BLOCK_H / 2 + 6} textAnchor="middle"
-                    fill="#fff" fontSize="16" fontWeight="700"
-                    fontFamily="Roboto, sans-serif" pointerEvents="none">{eq.id}</text>
+                  {(() => {
+                    const readout = boxReadout(backendEqMap.get(eq.id), backend?.connected ? backend.scales : undefined);
+                    return (<>
+                      <text x={pos.x + BLOCK_W / 2} y={pos.y + (readout ? 24 : BLOCK_H / 2 + 6)} textAnchor="middle"
+                        fill="#fff" fontSize="16" fontWeight="700"
+                        fontFamily="Roboto, sans-serif" pointerEvents="none">{eq.id}</text>
+                      {readout && <text x={pos.x + BLOCK_W / 2} y={pos.y + 42} textAnchor="middle"
+                        fill="#fff" fontSize="13" fontWeight="500"
+                        fontFamily="Roboto, sans-serif" pointerEvents="none">{readout}</text>}
+                    </>);
+                  })()}
 
                   {ports.map(port => {
                     const pp = portPosition(pos, port, ports);
@@ -204,14 +249,34 @@ export function SystemTab() {
 
             {/* Status */}
             <div className="flex items-center gap-2">
-              <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: blockFill(selectedItem, beq) }} />
+              <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: blockFill(selectedItem, beq, backend?.globalConfig) }} />
               <span style={{ color: 'var(--fg-bright)', fontSize: '12px', fontWeight: 500 }}>
-                {liveStatus === 'not_running' ? 'STOPPED' : liveStatus.toUpperCase()}
+                {beq?.state && STATE_STYLE[beq.state] ? STATE_STYLE[beq.state].label : liveStatus === 'not_running' ? 'STOPPED' : liveStatus.toUpperCase()}
               </span>
             </div>
 
             {beq?.faultReason && (
               <div style={{ color: 'var(--red)', fontSize: '11px' }}>{beq.faultReason}</div>
+            )}
+
+            {beq?.warningReason && (
+              <div style={{ color: 'var(--orange)', fontSize: '11px' }}>{beq.warningReason}</div>
+            )}
+
+            {beq && activeBypasses(beq).length > 0 && (
+              <div style={{ color: 'var(--orange)', fontSize: '11px', fontWeight: 600 }}>Bypassed: {activeBypasses(beq).join(', ')}</div>
+            )}
+
+            {beq && backend?.connected && !!beq.config.analogLoadInput && (
+              <LoadPanel key={beq.id} beq={beq} backend={backend} />
+            )}
+
+            {beq && backend?.connected && beq.runSecondsTotal !== undefined && (
+              <div className="flex items-center gap-2" style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>
+                <span>Run {(beq.runSeconds ?? 0) / 3600 | 0}.{Math.floor(((beq.runSeconds ?? 0) % 3600) / 360)} h since {beq.runSecondsResetAt ? new Date(beq.runSecondsResetAt).toLocaleDateString() : 'install'} · total {((beq.runSecondsTotal ?? 0) / 3600).toFixed(1)} h</span>
+                <button onClick={() => backend.sendCommand('ResetRunHours', selectedItem.id)}
+                  style={{ background: 'transparent', color: 'var(--fg-dim)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer', fontSize: '11px' }}>Reset</button>
+              </div>
             )}
 
             {beq?.owner && (
@@ -244,12 +309,8 @@ export function SystemTab() {
             </div>
 
             {beq && backend?.connected && !!beq.config.analogSpeedOutput && (
-              <SpeedField key={beq.id} beq={beq} backend={backend} />
-            )}
-
-            {/* Full I/O signal listing with overrides */}
-            {backend?.connected && (
-              <IOSignalList equipmentId={selectedItem.id} backend={backend} />
+              <SpeedField key={beq.id} beq={beq} backend={backend}
+                locked={backend.equipment.some(e => (e.loadControlAuto || e.loadAtRunning) && e.config.loadControlFeeder === beq.id) ? `Speed is set by ${backend.equipment.find(e => e.config.loadControlFeeder === beq.id && (e.loadControlAuto || e.loadAtRunning))?.id} load control. Switch it to Manual to set it by hand.` : undefined} />
             )}
 
             {liveStatus === 'fault' && backend?.connected && (
@@ -261,6 +322,8 @@ export function SystemTab() {
                 Reset Fault
               </button>
             )}
+
+            {beq && backend?.connected && <OverridesPanel beq={beq} backend={backend} />}
           </div>
         </div>
         );
@@ -272,7 +335,7 @@ export function SystemTab() {
 
 export type Backend = NonNullable<ReturnType<typeof useBackend>>;
 
-function SpeedField({ beq, backend }: { beq: BackendEquipment; backend: Backend }) {
+function SpeedField({ beq, backend, locked }: { beq: BackendEquipment; backend: Backend; locked?: string }) {
   const min = Number(beq.config.speedMinLimit ?? 0);
   const max = Number(beq.config.speedMaxLimit ?? 100);
   const [draft, setDraft] = useState<string | null>(null); // null = show the backend's value
@@ -291,7 +354,7 @@ function SpeedField({ beq, backend }: { beq: BackendEquipment; backend: Backend 
       <div className="mb-2" style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>SPEED SETPOINT</div>
       <div className="flex items-center gap-2">
         <input
-          type="number" value={value} min={min} max={max}
+          type="number" value={value} min={min} max={max} disabled={!!locked}
           onChange={e => setDraft(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter') apply(); }}
           aria-label="Speed setpoint percent"
@@ -299,15 +362,15 @@ function SpeedField({ beq, backend }: { beq: BackendEquipment; backend: Backend 
         />
         <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>%</span>
         <button
-          onClick={apply} disabled={!valid || draft === null}
+          onClick={apply} disabled={!valid || draft === null || !!locked}
           className="px-3 py-1.5 text-xs font-medium"
-          style={{ background: 'var(--accent)', color: '#000', border: 'none', borderRadius: '3px', cursor: 'pointer', fontWeight: 600, opacity: !valid || draft === null ? 0.4 : 1 }}
+          style={{ background: 'var(--accent)', color: '#000', border: 'none', borderRadius: '3px', cursor: 'pointer', fontWeight: 600, opacity: !valid || draft === null || locked ? 0.4 : 1 }}
         >
           Set
         </button>
       </div>
       <div className="mt-1" style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>
-        Allowed {min}–{max}%. Used in Hand and as the normal feed speed in Auto.
+        {locked ?? `Allowed ${min}–${max}%. Used in Hand and as the normal feed speed in Auto.`}
       </div>
     </div>
   );
@@ -316,10 +379,13 @@ function SpeedField({ beq, backend }: { beq: BackendEquipment; backend: Backend 
 // equipmentId filters to one piece of equipment's mapped ports; pass showAll
 // instead to list every rack signal regardless of equipment mapping (used by
 // the Commissioning panel, where nothing may be mapped to equipment yet).
-export function IOSignalList({ equipmentId, backend, showAll }: { equipmentId?: string; backend: Backend; showAll?: boolean }) {
+export function IOSignalList({ equipmentId, backend, showAll, embedded }: { equipmentId?: string; backend: Backend; showAll?: boolean; embedded?: boolean }) {
   const [confirmSignal, setConfirmSignal] = useState<string | null>(null);
   const [confirmValue, setConfirmValue] = useState<boolean>(false);
 
+  // Forcing I/O is refused by the backend too: never during a batch, never with a hammermill enabled.
+  const blocked = backend.activeBatch && !['COMPLETED', 'FAULTED', 'IDLE'].includes(backend.activeBatch.state) ? 'A batch is in progress'
+    : backend.equipment.some(e => e.equipmentType === 'hammermill' && e.enabled) ? 'A hammermill is enabled' : null;
   const signals = showAll ? backend.ioSignals : backend.ioSignals.filter(s => s.equipmentId === equipmentId);
   const outputs = signals.filter(s => s.direction === 'DO' || s.direction === 'AO');
   const inputs = signals.filter(s => s.direction === 'DI' || s.direction === 'AI');
@@ -352,24 +418,27 @@ export function IOSignalList({ equipmentId, backend, showAll }: { equipmentId?: 
     const isOverridden = sig.id in backend.ioOverrides;
     // Forcing an output needs commissioning mode — the backend rejects it
     // otherwise. Hide the control rather than show one that always fails.
-    const canOverride = !isOutput || backend.commissioningMode;
+    const canOverride = !isOutput || backend.commissioningMode || isOverridden;
 
     return (
       <div key={sig.id} className="flex items-center gap-2 py-0.5" style={{ fontSize: '11px' }}>
         <span className="inline-block w-2 h-2 rounded-full flex-shrink-0" style={{ background: on ? 'var(--green)' : 'var(--fg-dim)', opacity: on ? 1 : 0.3 }} />
         <span style={{ color: 'var(--fg-dim)', width: '42px', flexShrink: 0 }}>{sig.id}</span>
         <span style={{ color: on ? 'var(--fg-bright)' : 'var(--fg-dim)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {sig.port ?? sig.label}
+          {showAll ? (sig.assignment
+            ? <span title="Configured as" style={{ color: 'var(--accent)', border: '1px solid var(--border)', borderRadius: '3px', padding: '0 6px' }}>{sig.assignment}</span>
+            : <span style={{ color: 'var(--fg-dim)' }}>unassigned</span>) : (sig.assignment ?? sig.port ?? sig.label)}
         </span>
         <span style={{ color: on ? 'var(--green)' : 'var(--fg-dim)', width: '24px', textAlign: 'right', flexShrink: 0 }}>
           {typeof val === 'number' ? val : (on ? 'ON' : 'OFF')}
         </span>
         {canOverride && (
           <label style={{ flexShrink: 0, cursor: 'pointer', display: 'flex', alignItems: 'center' }}
-            title={isOverridden ? 'Override active — click to release' : isOutput ? 'Force this output (commissioning mode)' : 'Override this input'}>
+            title={isOverridden ? 'Override active — click to release' : blocked && (showAll || isOutput) ? `Forcing is disabled: ${blocked}` : isOutput ? 'Force this output (commissioning mode)' : 'Override this input'}>
             <input
               type="checkbox"
               checked={isOverridden}
+              disabled={!!blocked && !isOverridden && (!!showAll || isOutput)}
               onChange={() => handleOverrideToggle(sig.id, isOverridden, on)}
               style={{ accentColor: 'var(--orange)', width: '12px', height: '12px', cursor: 'pointer' }}
             />
@@ -383,10 +452,11 @@ export function IOSignalList({ equipmentId, backend, showAll }: { equipmentId?: 
 
   return (
     <>
-      <div style={{ borderTop: '1px solid var(--border)', paddingTop: '8px' }}>
-        <div className="mb-1" style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>OUTPUTS</div>
+      <div style={embedded ? undefined : { borderTop: '1px solid var(--border)', paddingTop: '8px' }}>
+ {blocked && (showAll || backend.commissioningMode) && <div className="mb-2" style={{ color: 'var(--orange)', fontSize: '11px' }}>Forcing {showAll ? '' : 'outputs '}is disabled: {blocked.toLowerCase()}. Existing forces can still be released.</div>}
+        <div className="mb-1" style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>{embedded ? 'FORCE OUTPUTS' : 'OUTPUTS'}</div>
         {outputs.length > 0 ? outputs.map(sigRow) : <div style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>None</div>}
-        <div className="mt-2 mb-1" style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>INPUTS</div>
+        <div className="mt-2 mb-1" style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>{embedded ? 'FORCE INPUTS' : 'INPUTS'}</div>
         {inputs.length > 0 ? inputs.map(sigRow) : <div style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>None</div>}
       </div>
 
@@ -423,5 +493,211 @@ export function IOSignalList({ equipmentId, backend, showAll }: { equipmentId?: 
         </div>
       )}
     </>
+  );
+}
+
+const loadInput = { background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: '3px', color: 'var(--fg-bright)', padding: '4px 8px', fontFamily: 'inherit', fontSize: '12px', width: '72px' } as const;
+const ghostBtn = { background: 'transparent', color: 'var(--fg-dim)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer' } as const;
+const stepBtn = { ...ghostBtn, width: '26px', height: '26px', fontSize: '14px', fontWeight: 600, lineHeight: '1', color: 'var(--fg-bright)' } as const;
+
+// The input kinds a device can bypass (backend BYPASSABLE) and how the sidebar names them.
+const BYPASS_LABELS: Record<string, string> = {
+  runConfirmAux: 'Starter aux feedback', vfdAuxInput: 'VFD aux feedback', analogLoadInput: 'Load sensor',
+  rotationPulseInput: 'Rotation sensor', openLimitInput: 'Open limit switch', closedLimitInput: 'Closed limit switch',
+  highLevelInput: 'High level switch', lowLevelInput: 'Low level switch', fullSensor: 'Full sensor', lowSensor: 'Low sensor',
+};
+const bypassKeys = (beq: BackendEquipment) =>
+  Object.keys(BYPASS_LABELS).filter(k => !!beq.config[k] && (k !== 'vfdAuxInput' || !!beq.config.masterVfd));
+const activeBypasses = (beq: BackendEquipment) => bypassKeys(beq).filter(k => beq.config[`bypass_${k}`] === true).map(k => BYPASS_LABELS[k]);
+
+// Bottom of the sidebar: every bypass this device offers. A bypassed input is ignored as if it were not wired.
+function OverridesPanel({ beq, backend }: { beq: BackendEquipment; backend: Backend }) {
+  const keys = bypassKeys(beq);
+  const hasSignals = backend.ioSignals.some(s => s.equipmentId === beq.id);
+  if (keys.length === 0 && !hasSignals) return null;
+  return (
+    <div className="flex flex-col gap-2" style={{ borderTop: '1px solid var(--border)', paddingTop: '8px' }}>
+      <div style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>OVERRIDES</div>
+      {keys.length > 0 && <div style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>BYPASS INPUTS</div>}
+      {keys.map(k => {
+        const on = beq.config[`bypass_${k}`] === true;
+        return (
+          <label key={k} className="flex items-center gap-2" style={{ color: on ? 'var(--orange)' : 'var(--fg)', fontSize: '12px' }}>
+            <input type="checkbox" checked={on} style={{ accentColor: 'var(--accent)' }}
+              onChange={e => backend.sendCommand('SetBypass', beq.id, { key: k, value: e.target.checked })} />
+            <span>Bypass {BYPASS_LABELS[k]} <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>({String(beq.config[k])})</span></span>
+          </label>
+        );
+      })}
+      {keys.length > 0 && <div style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>A bypassed input is ignored as if it were not wired: its faults and trips are off until you clear the box.</div>}
+      {hasSignals && <IOSignalList equipmentId={beq.id} backend={backend} embedded />}
+    </div>
+  );
+}
+
+function Modal({ title, children, actions }: { title: string; children: ReactNode; actions: ReactNode }) {
+  return (
+    <div role="dialog" aria-modal="true" aria-label={title} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+      <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: '6px', padding: '16px 20px', maxWidth: '680px', width: '92%' }}>
+        <div style={{ color: 'var(--fg-bright)', fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>{title}</div>
+        <div style={{ color: 'var(--fg)', fontSize: '12px' }}>{children}</div>
+        <div className="flex justify-end gap-2" style={{ marginTop: '12px' }}>{actions}</div>
+      </div>
+    </div>
+  );
+}
+
+// One per-machine load number: shows the backend value, commits on Enter/blur through SetLoadConfig (allowed while running).
+function LoadNum({ beq, backend, k, label, unit, def = 0, step = 1, stepper }: { beq: BackendEquipment; backend: Backend; k: string; label: string; unit?: string; def?: number; step?: number; stepper?: number }) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const cur = Number(beq.config[k] ?? def);
+  const value = draft ?? String(cur);
+  const send = (n: number) => backend.sendCommand('SetLoadConfig', beq.id, { values: { [k]: n } });
+  async function commit() {
+    if (draft === null) return;
+    const n = Number(draft);
+    if (draft.trim() !== '' && Number.isFinite(n) && n >= 0 && n !== cur) await send(n);
+    setDraft(null);
+  }
+  return (
+    <label className="flex items-center justify-between gap-2">
+      <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>{label}</span>
+      <span className="flex items-center gap-1">
+        {stepper && <button type="button" aria-label={`${label} down`} style={stepBtn} onClick={() => send(Math.max(0, Math.round((cur - stepper) * 100) / 100))}>−</button>}
+        <input type="number" min={0} step={step} value={value} style={loadInput}
+          onChange={e => setDraft(e.target.value)} onBlur={commit} onKeyDown={e => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur(); }} />
+        {stepper && <button type="button" aria-label={`${label} up`} style={stepBtn} onClick={() => send(Math.round((cur + stepper) * 100) / 100)}>+</button>}
+        <span style={{ color: 'var(--fg-dim)', fontSize: '11px', width: '14px' }}>{unit}</span>
+      </span>
+    </label>
+  );
+}
+
+type TrendPoint = { t: number; a: number; s?: number; sp?: number };
+
+// Larger trend of the last 10 minutes (backend keeps 1 Hz samples), polled while the dialog is open.
+function TrendModal({ beq, onClose }: { beq: BackendEquipment; onClose: () => void }) {
+  const id = beq.id;
+  const minAmps = Number(beq.config.minAmps ?? 0), maxAmps = Number(beq.config.maxAmps ?? 100);
+  const [pts, setPts] = useState<TrendPoint[]>([]);
+  useEffect(() => {
+    let off = false;
+    const load = async () => {
+      try { const r = await fetch(`${BACKEND_HTTP}/api/v1/trend/${encodeURIComponent(id)}`); const d = await r.json(); if (!off && Array.isArray(d)) setPts(d); } catch {}
+    };
+    load();
+    const h = setInterval(load, 2000);
+    return () => { off = true; clearInterval(h); };
+  }, [id]);
+  const L = 44, W = 640, H = 240;
+  const t0 = pts[0]?.t ?? 0, span = Math.max(1, (pts[pts.length - 1]?.t ?? 0) - t0);
+  const X = (t: number) => L + ((t - t0) / span) * (W - L);
+  const Y = (a: number) => H - ((a - minAmps) / Math.max(0.001, maxAmps - minAmps)) * H;
+  const line = (f: (p: TrendPoint) => number | undefined, scale: (v: number) => number) =>
+    pts.flatMap(p => { const v = f(p); return v === undefined ? [] : [`${X(p.t).toFixed(1)},${Math.max(0, Math.min(H, scale(v))).toFixed(1)}`]; }).join(' ');
+  const sp = pts[pts.length - 1]?.sp;
+  return (
+    <Modal title={`${id} load trend`} actions={<button onClick={onClose} className="px-3 py-1.5 text-xs font-medium" style={ghostBtn}>Close</button>}>
+      {pts.length < 2 ? <div style={{ color: 'var(--fg-dim)' }}>Collecting samples…</div> : (
+        <>
+          <svg viewBox={`0 0 ${W} ${H + 16}`} width="100%" role="img" aria-label="Load trend, last 10 minutes" style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: '3px' }}>
+            {[0, 0.5, 1].map(f => (
+              <g key={f}>
+                <line x1={L} x2={W} y1={H - f * H} y2={H - f * H} stroke="var(--border)" strokeWidth={1} />
+                <text x={L - 4} y={Math.min(H, Math.max(11, H - f * H + 4))} textAnchor="end" fill="var(--fg-dim)" fontSize="11">{Math.round((minAmps + f * (maxAmps - minAmps)) * 10) / 10} A</text>
+              </g>
+            ))}
+            {sp !== undefined && <line x1={L} x2={W} y1={Y(sp)} y2={Y(sp)} stroke="var(--orange)" strokeDasharray="4 3" strokeWidth={1} />}
+            <polyline points={line(p => p.s, v => H - (v / 100) * H)} fill="none" stroke="var(--fg-dim)" strokeWidth={1} />
+            <polyline points={line(p => p.a, Y)} fill="none" stroke="var(--green)" strokeWidth={1.5} />
+            <text x={L} y={H + 13} fill="var(--fg-dim)" fontSize="11">−{Math.round(span / 6000) / 10} min</text>
+            <text x={W} y={H + 13} textAnchor="end" fill="var(--fg-dim)" fontSize="11">now</text>
+          </svg>
+          <div style={{ color: 'var(--fg-dim)', fontSize: '11px', marginTop: '4px' }}>
+            Amps (green) · feeder speed 0–100% (grey){sp !== undefined ? ' · setpoint (dashed)' : ''}
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+// Per-machine load settings live here (Settings only assigns the input, its scaling and the feeder at commissioning).
+// Auto/Manual follows the PLC's PID: Manual tracks the feeder's speed (bumpless), Auto drives it, and the speed is only
+// hand-adjustable (1% steps, like the PLC's MV inc/dec) in Manual.
+function LoadPanel({ beq, backend }: { beq: BackendEquipment; backend: Backend }) {
+  const c = beq.config;
+  const feeder = backend.equipment.find(e => e.id === c.loadControlFeeder);
+  const bypass = c.bypass_analogLoadInput === true;
+  const locked = !!beq.loadControlAuto || !!beq.loadAtRunning;
+  const [confirmTune, setConfirmTune] = useState(false);
+  const [showTrend, setShowTrend] = useState(false);
+  const nf = (k: string, label: string, unit?: string, def = 0, step = 1, stepper?: number) => <LoadNum beq={beq} backend={backend} k={k} label={label} unit={unit} def={def} step={step} stepper={stepper} />;
+  const fMin = Number(feeder?.config.speedMinLimit ?? 0), fMax = Number(feeder?.config.speedMaxLimit ?? 100);
+  const nudge = (d: number) => feeder && backend.sendCommand('SetEquipmentSpeed', feeder.id, { speed: Math.min(fMax, Math.max(fMin, Math.round((feeder.speed ?? 0) + d))) });
+  const modeBtn = (auto: boolean) => {
+    const on = !!beq.loadControlAuto === auto;
+    return (
+      <button key={String(auto)} disabled={bypass || !!beq.loadAtRunning} onClick={() => backend.sendCommand('SetLoadControl', beq.id, { auto })}
+        className="px-2 py-1 text-xs font-medium flex-1"
+        style={{ background: on ? (auto ? 'var(--green)' : 'var(--orange)') : 'var(--bg)', color: on ? '#000' : 'var(--fg-dim)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer', opacity: bypass || beq.loadAtRunning ? 0.5 : 1 }}>
+        {auto ? 'Auto' : 'Manual'}
+      </button>
+    );
+  };
+  return (
+    <div className="flex flex-col gap-2" style={{ borderTop: '1px solid var(--border)', paddingTop: '8px' }}>
+      <div className="flex items-center justify-between">
+        <span style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>LOAD</span>
+        <span style={{ color: beq.loadDisconnected ? 'var(--red)' : 'var(--fg-bright)', fontWeight: 600 }}>
+          {beq.loadDisconnected ? 'Sensor disconnected' : beq.loadAmps === undefined ? '—' : Number(c.motorFla ?? 0) > 0 ? `${loadText(beq)} · ${beq.loadAmps} A` : `${beq.loadAmps} A (set Motor FLA in Settings for %)`}
+        </span>
+      </div>
+      {bypass && <div style={{ color: 'var(--orange)', fontSize: '11px' }}>Load sensor bypassed (see Overrides): no limits, no sensor-fault trip, no load control.</div>}
+      {nf('hiWarnAmps', 'High Warn (0 = off)', 'A')}
+      {nf('hiPauseAmps', 'High Limit trip (0 = off)', 'A')}
+      {nf('loadLimitDelay', 'Limit Delay', 's', 2, 0.1)}
+      {feeder && <>
+        <div style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500, marginTop: '4px' }}>LOAD CONTROL · feeder {feeder.id}</div>
+        {nf('loadSetpointAmps', 'Load Setpoint', 'A', 0, 1, 1)}
+        {nf('loadKp', 'Gain Kp (% per A)', '', 0, 0.05)}
+        {nf('loadTiSec', 'Integral Ti (0 = off)', 's', 0, 0.5)}
+        {nf('loadTdSec', 'Derivative Td (0 = off)', 's', 0, 0.1)}
+        <div className="flex gap-1">{modeBtn(false)}{modeBtn(true)}</div>
+        <div className="flex items-center justify-between gap-2">
+          <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Feeder speed {locked ? '(set by load control)' : ''}</span>
+          <span className="flex items-center gap-1">
+            <button type="button" aria-label="Feeder speed down" style={{ ...stepBtn, opacity: locked ? 0.4 : 1 }} disabled={locked} onClick={() => nudge(-1)}>−</button>
+            <span style={{ color: 'var(--fg-bright)', fontWeight: 600, width: '44px', textAlign: 'center' }}>{Math.round(feeder.speed ?? 0)} %</span>
+            <button type="button" aria-label="Feeder speed up" style={{ ...stepBtn, opacity: locked ? 0.4 : 1 }} disabled={locked} onClick={() => nudge(1)}>+</button>
+          </span>
+        </div>
+        <button onClick={() => (beq.loadAtRunning ? backend.sendCommand('CancelLoadAutotune', beq.id) : setConfirmTune(true))}
+          className="px-2 py-1 text-xs font-medium" style={ghostBtn}>
+          {beq.loadAtRunning ? 'Cancel Autotune' : 'Autotune…'}
+        </button>
+        {nf('loadAtStepPct', 'Autotune speed step', '%', 10)}
+        {nf('loadAtHyst', 'Autotune hysteresis', 'A', 1, 0.1)}
+        {nf('loadAtGain', 'Autotune gain (1 fast – 10 slow)', '', 7)}
+        <div style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>
+          {beq.loadAtMsg ?? 'Autotune needs the mill and feeder running, with the feeder near the speed that gives the setpoint load.'}
+        </div>
+      </>}
+      <button onClick={() => setShowTrend(true)} className="px-2 py-1 text-xs font-medium" style={ghostBtn}>Show Trend</button>
+      {showTrend && <TrendModal beq={beq} onClose={() => setShowTrend(false)} />}
+      {confirmTune && feeder && (
+        <Modal title="Start autotune?" actions={<>
+          <button onClick={() => setConfirmTune(false)} className="px-3 py-1.5 text-xs font-medium" style={ghostBtn}>Cancel</button>
+          <button onClick={() => { setConfirmTune(false); backend.sendCommand('StartLoadAutotune', beq.id); }} className="px-3 py-1.5 text-xs font-medium"
+            style={{ background: 'var(--accent)', color: '#000', border: 'none', borderRadius: '3px', cursor: 'pointer', fontWeight: 600 }}>Start Autotune</button>
+        </>}>
+          <p style={{ marginBottom: '6px' }}>
+            {feeder.id} will be driven ±{Number(c.loadAtStepPct ?? 10)}% around its current speed ({Math.round(feeder.speed ?? 0)}%) so {beq.id}&apos;s load swings around {Number(c.loadSetpointAmps ?? 0)} A, for a few minutes (it gives up after 15).
+          </p>
+          <p style={{ marginBottom: '6px' }}>The high limit still trips the mill. Kp and Ti are replaced with the measured values, then control returns to {beq.loadControlAuto ? 'Auto' : 'Manual'}.</p>
+          <p style={{ color: 'var(--orange)' }}>Make sure it is safe to vary the load on {beq.id}.</p>
+        </Modal>
+      )}
+    </div>
   );
 }

@@ -6,6 +6,7 @@ export interface SignalDef {
   direction: SignalDirection;
   label: string;
   equipmentId?: string;
+  assignment?: string; // what the point is configured as, e.g. "A-1 Run" or "E-Stop" (snapshot only)
   port?: string;
 }
 
@@ -29,6 +30,17 @@ export interface EquipmentRuntime {
   position?: { x: number; y: number };
   speed?: number;    // VFD speed setpoint, % (only used when config.analogSpeedOutput is assigned)
   faultTimerMs: number;
+  loadAmps?: number;          // averaged motor current from config.analogLoadInput, scaled min/maxAmps (runtime only)
+  loadDisconnected?: boolean;
+  vfdStartMs?: number;        // master VFD: how long the starter has been confirmed (runtime)
+  vfdCmd?: boolean;           // master VFD run output wanted (starter confirmed for vfdStartDelay)
+  loadAtRunning?: boolean;    // relay autotune in progress (runtime)
+  loadAtMsg?: string;         // last autotune result
+  loadControlAuto?: boolean;  // load PID trims the feeder's speed (runtime, off at startup)
+  enabled?: boolean;         // hammermill only: the operator's Enable/Disable switch, separate from the HOA mode
+  runSecondsTotal?: number;  // lifetime run time, never reset
+  runSeconds?: number;       // run time since runSecondsResetAt (operator-resettable, like the PLC's RT1)
+  runSecondsResetAt?: string;
   positionTimerMs: number;
   startTimerMs: number;
   stopTimerMs: number;
@@ -187,6 +199,7 @@ export interface StateSnapshot {
   // Gates forcing an output via SetOverride — bench-testing real DO/AO points
   // needs to bypass control logic, which normal operation must never allow.
   commissioningMode: boolean;
+  horn: { on: boolean; silenced: boolean };
 }
 
 export interface QueueSnapshot {
@@ -253,6 +266,7 @@ export interface ScaleConfig {
   // Calibration (RS1201 load cell)
   zeroOffset: number;
   ratedMvV: number;
+  calibration?: { mode: 'theoretical' | 'zero' | 'span'; at: string; standardWeight?: number }; // last RS1201 calibration done from the HMI
   // Common
   capacity: number;
   resolution: number;
@@ -278,6 +292,7 @@ export interface NxCardDef {
   points: number;
   label: string;
   busWatts: number; // NX Bus power consumption (W) — coupler supplies 10W max
+  fullScale?: number; // AI/AO only: raw count at 100% of the span (W522 §6-2/7-2: 1/8000 models, 4-20mA = 0..8000; ±10V models = ±4000, 0-10V half used here)
 }
 
 export const NX_CARD_CATALOG: NxCardDef[] = [
@@ -299,14 +314,14 @@ export const NX_CARD_CATALOG: NxCardDef[] = [
   { model: 'NX-OC4633', category: 'DO', points: 8, label: '8pt Relay Output (indep. contacts)', busWatts: 1.65 },
   { model: 'NX-OC2633', category: 'DO', points: 2, label: '2pt Relay Output (indep. contacts)', busWatts: 0.80 },
   // Analog Input
-  { model: 'NX-AD4203', category: 'AI', points: 8, label: '8ch Current Input (4-20mA)', busWatts: 1.05 },
-  { model: 'NX-AD4603', category: 'AI', points: 8, label: '8ch Voltage Input (±10V)', busWatts: 1.15 },
-  { model: 'NX-AD2203', category: 'AI', points: 2, label: '2ch Current Input (4-20mA)', busWatts: 0.90 },
-  { model: 'NX-AD3203', category: 'AI', points: 4, label: '4ch Current Input (4-20mA)', busWatts: 0.90 },
+  { model: 'NX-AD4203', category: 'AI', points: 8, label: '8ch Current Input (4-20mA)', fullScale: 8000, busWatts: 1.05 },
+  { model: 'NX-AD4603', category: 'AI', points: 8, label: '8ch Voltage Input (±10V)', fullScale: 4000, busWatts: 1.15 },
+  { model: 'NX-AD2203', category: 'AI', points: 2, label: '2ch Current Input (4-20mA)', fullScale: 8000, busWatts: 0.90 },
+  { model: 'NX-AD3203', category: 'AI', points: 4, label: '4ch Current Input (4-20mA)', fullScale: 8000, busWatts: 0.90 },
   // Analog Output
-  { model: 'NX-DA2203', category: 'AO', points: 2, label: '2ch Current Output (4-20mA)', busWatts: 1.40 },
-  { model: 'NX-DA3203', category: 'AO', points: 4, label: '4ch Current Output (4-20mA)', busWatts: 1.80 },
-  { model: 'NX-DA3603', category: 'AO', points: 4, label: '4ch Voltage Output (±10V)', busWatts: 1.80 },
+  { model: 'NX-DA2203', category: 'AO', points: 2, label: '2ch Current Output (4-20mA)', fullScale: 8000, busWatts: 1.40 },
+  { model: 'NX-DA3203', category: 'AO', points: 4, label: '4ch Current Output (4-20mA)', fullScale: 8000, busWatts: 1.80 },
+  { model: 'NX-DA3603', category: 'AO', points: 4, label: '4ch Voltage Output (±10V)', fullScale: 4000, busWatts: 1.80 },
   // Load Cell
   { model: 'NX-RS1201', category: 'scale', points: 1, label: '1ch Load Cell Input (24-bit)', busWatts: 1.70 },
   // Additional NX Bus Power (provides 10W to downstream units)

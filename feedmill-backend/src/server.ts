@@ -6,6 +6,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Mill } from './mill.js';
 import type { Command, StateSnapshot } from './types.js';
 import { reconcileScaleReaders } from './scaleReader.js';
+import { registerUpdateRoutes } from './updateApi.js';
 
 let PKG_VERSION = '0.0.0';
 try { PKG_VERSION = JSON.parse(fs.readFileSync('package.json', 'utf-8')).version; } catch {}
@@ -107,6 +108,10 @@ app.post('/api/v1/commands', (req, res) => {
   res.json(result);
 });
 
+app.get('/api/v1/trend/:id', (req, res) => {
+  res.json(mill.getTrend(req.params.id));
+});
+
 app.get('/api/v1/health', (_req, res) => {
   res.json({
     status: 'ok',
@@ -115,6 +120,8 @@ app.get('/api/v1/health', (_req, res) => {
     revision: mill.revision,
   });
 });
+
+registerUpdateRoutes(app, mill);
 
 app.post('/api/v1/shutdown', (_req, res) => {
   if (mill.activeBatch) {

@@ -129,9 +129,8 @@ export function QueueTab() {
   function handleHmToggle(hmId: string) {
     const beq = backendEqMap.get(hmId);
     const hm = hammermills.find(h => h.id === hmId);
-    const currentMode = beq?.mode ?? hm?.mode ?? 'Auto';
-    const newMode = currentMode === 'Off' ? 'Auto' : 'Off';
-    if (backend?.connected) backend.sendCommand('SetEquipmentMode', hmId, { mode: newMode });
+    const enabled = beq?.enabled ?? (hm?.status !== 'disabled');
+    if (backend?.connected) backend.sendCommand('SetHammermillEnabled', hmId, { enabled: !enabled });
   }
 
   const isPaused = activeBatchEntry?.state === 'PAUSED' || activeBatchEntry?.state === 'PAUSING';
@@ -203,11 +202,10 @@ export function QueueTab() {
               <div className="flex gap-4">
                 {hammermills.map(hm => {
                   const beq = backendEqMap.get(hm.id);
-                  const mode = beq?.mode ?? hm.mode;
                   const status = beq?.status ?? hm.status;
                   const destId = (beq?.config.destination as string | undefined) ?? (hm.config.destination as string | undefined) ?? '';
                   const isBinFull = !!destId && allBins.find(b => b.id === destId)?.levelSwitchState === 'full';
-                  const isOff = mode === 'Off';
+                  const isOff = !(beq?.enabled ?? status !== 'disabled'); // Enable/Disable switch, not the HOA mode
                   const refilling = beq?.refillState;
                   const label = isOff ? (refilling ? 'Stopping' : 'Disabled') : isBinFull ? 'Bin Full' : refilling ? `Refilling (${refilling.toLowerCase()})` : status === 'running' ? 'Running' : status === 'fault' ? 'Faulted' : 'Stopped';
                   const dotColor = isOff ? 'var(--fg-dim)' : isBinFull ? 'var(--orange)' : status === 'running' ? 'var(--green)' : status === 'fault' ? 'var(--red)' : 'var(--fg-dim)';

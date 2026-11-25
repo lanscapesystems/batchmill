@@ -3,7 +3,8 @@
 import { useState, useRef, useCallback, useEffect, type MouseEvent as ReactMouseEvent } from 'react';
 import { useMillStore, EQUIPMENT_DEFS, IO_POOL, getPortsForEquipment, GRID_SNAP, FLOW_HIDDEN_TYPES, GLOBAL_DEFAULTS, type EquipmentItem, type PortDef, type Position, type FlowConnection } from '../store';
 import { useBackend, type BackendScaleConfig, type BackendOmronConfig, type BackendIoRackCard, type BackendCouplerType, type BackendEccModel } from '../backend';
-import { IOSignalList } from './system';
+import { IOSignalList, STATE_STYLE, stateColor } from './system';
+import { UpdateSection } from './update';
 
 function useIOPools(backend: ReturnType<typeof useBackend>) {
   if (!backend?.connected || backend.ioSignals.length === 0) return IO_POOL;
@@ -17,7 +18,7 @@ function useIOPools(backend: ReturnType<typeof useBackend>) {
   };
 }
 
-type SettingsSection = 'equipment' | 'io' | 'global';
+type SettingsSection = 'equipment' | 'io' | 'global' | 'update';
 
 export function SettingsTab() {
   const [section, setSection] = useState<SettingsSection>('equipment');
@@ -25,7 +26,7 @@ export function SettingsTab() {
   return (
     <div className="flex gap-4 h-full">
       <div className="flex flex-col w-40 flex-shrink-0" style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: '3px' }}>
-        {([['equipment', 'Equipment'], ['io', 'I/O Config'], ['global', 'Global']] as [SettingsSection, string][]).map(([key, label]) => (
+        {([['equipment', 'Equipment'], ['io', 'I/O Config'], ['global', 'Global'], ['update', 'Update']] as [SettingsSection, string][]).map(([key, label]) => (
           <button
             key={key}
             onClick={() => setSection(key)}
@@ -46,6 +47,7 @@ export function SettingsTab() {
         {section === 'equipment' && <FlowPathSection />}
         {section === 'io' && <IOSection />}
         {section === 'global' && <GlobalSection />}
+        {section === 'update' && <UpdateSection />}
       </div>
     </div>
   );
@@ -735,6 +737,7 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
       {opts.delays !== false && <>
         {row('Start Delay', numIn('startDelay', 0, 's', 0.1))}
         {row('Stop Delay', numIn('stopDelay', 0, 's', 0.1))}
+         {row('Starter Fault Delay (overrides global)', numIn('starterFaultDelay', Number(GLOBAL_DEFAULTS.motorStarterFaultDelay), 's', 0.1))}
       </>}
       {row('Analog Speed Output', ioSel(ioPools.ao, 'analogSpeedOutput'))}
       {v('analogSpeedOutput') && <>
@@ -782,6 +785,7 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
         {v('masterVfd') && <>
           {row('VFD Run Output', ioSel(ioPools.do, 'vfdRunOutput'))}
           {row('VFD Aux Input', ioSel(ioPools.di, 'vfdAuxInput'))}
+          {row('VFD Start Delay', numIn('vfdStartDelay', 0.7, 's', 0.1))}
         </>}
       </>;
 
@@ -815,7 +819,9 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
           : <span style={{ color: destVal ? 'var(--fg-bright)' : 'var(--fg-dim)', fontSize: '12px' }}>{destVal || 'Not Assigned'}</span>
         )}
         {motorFields({ rotation: true, load: true, delays: true })}
-        {v('analogLoadInput') && row('High Current Pause Setpoint', numIn('highCurrentPauseSetpoint', 0, '%'))}
+        {v('analogLoadInput') && <>
+          {row('Load Control Feeder', ioSel((allEquipment ?? []).filter(e => e.config.analogSpeedOutput).map(e => e.id), 'loadControlFeeder'))}
+        </>}
         {row('Auto Enable', check('autoEnable', 'Auto Enable'))}
         {row('Max Fill Time', numIn('maxFillMinutes', 60, 'min'))}
       </>;
@@ -894,7 +900,9 @@ function IOSection() {
   const [commissioningOpen, setCommissioningOpen] = useState(false);
   const [calOpen, setCalOpen] = useState(false);
   const [calStep, setCalStep] = useState<'zero' | 'span'>('zero');
-  const [calZeroReading, setCalZeroReading] = useState(0);
+  const [calMode, setCalMode] = useState<'theoretical' | 'span'>('theoretical');
+  const [calBusy, setCalBusy] = useState(false);
+  const [calSwitch, setCalSwitch] = useState(false);
   const [calTestWeight, setCalTestWeight] = useState('');
 
   const scaleConfigs = backend?.scaleConfigs ?? [];
@@ -1128,10 +1136,19 @@ function IOSection() {
                   )}
                   <div className="flex items-center justify-between" style={{ marginTop: '4px' }}>
                     <span style={{ fontSize: '11px', color: 'var(--fg-dim)', fontWeight: 600 }}>RACK LAYOUT</span>
-                    <button onClick={() => setConfirmReadRack(true)} className="px-2 py-0.5 text-xs"
-                      style={{ color: 'var(--accent)', background: 'transparent', border: '1px solid var(--accent)', borderRadius: '3px', cursor: 'pointer', fontSize: '11px' }}>
-                      Read from Coupler
-                    </button>
+                    <div className="flex gap-2">
+                      {om.couplerType === 'NX-ECC' && (
+                        <button onClick={() => backend?.sendCommand('ClearEthercatErrors')} className="px-2 py-0.5 text-xs"
+                          title="Clears coupler/NX unit current errors (CoE 0x2002:02). Remove the cause first."
+                          style={{ color: 'var(--accent)', background: 'transparent', border: '1px solid var(--accent)', borderRadius: '3px', cursor: 'pointer', fontSize: '11px' }}>
+                          Clear EtherCAT Errors
+                        </button>
+                      )}
+                      <button onClick={() => setConfirmReadRack(true)} className="px-2 py-0.5 text-xs"
+                        style={{ color: 'var(--accent)', background: 'transparent', border: '1px solid var(--accent)', borderRadius: '3px', cursor: 'pointer', fontSize: '11px' }}>
+                        Read from Coupler
+                      </button>
+                    </div>
                   </div>
                   <table style={{ fontSize: '11px', borderCollapse: 'collapse', width: '100%' }}>
                     <thead>
@@ -1300,80 +1317,85 @@ function IOSection() {
               <>
               <div className="flex gap-2">
                 <div className="flex flex-col gap-1 flex-1">
-                  <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Zero Offset (mV/V)</span>
-                  <div className="flex gap-1">
-                    <input type="number" step="0.0001" value={scaleDraft.zeroOffset} onChange={e => setScaleDraft({ ...scaleDraft, zeroOffset: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }} />
-                    <button onClick={() => {
-                      const reading = backend?.scales[scaleDraft.id];
-                      setScaleDraft({ ...scaleDraft, zeroOffset: reading?.weight ?? 0 });
-                    }} className="px-2 py-1 text-xs font-medium" style={{ background: 'var(--bg-panel)', color: 'var(--fg)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer', whiteSpace: 'nowrap' }}>Zero</button>
-                  </div>
+                  <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Rated Output (mV/V)</span>
+                  <input type="number" step="0.0001" value={scaleDraft.ratedMvV} onChange={e => setScaleDraft({ ...scaleDraft, ratedMvV: Number(e.target.value) })} style={inputStyle} />
                 </div>
                 <div className="flex flex-col gap-1 flex-1">
-                  <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Rated Output (mV/V)</span>
-                  <div className="flex gap-1">
-                    <input type="number" step="0.0001" value={scaleDraft.ratedMvV} onChange={e => setScaleDraft({ ...scaleDraft, ratedMvV: Number(e.target.value) })} style={{ ...inputStyle, flex: 1 }} />
-                    <button onClick={() => {
-                      setCalStep('zero');
-                      setCalZeroReading(0);
-                      setCalTestWeight('');
-                      setCalOpen(true);
-                    }} className="px-2 py-1 text-xs font-medium" style={{ background: 'var(--bg-panel)', color: 'var(--fg)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer', whiteSpace: 'nowrap' }}>Span Cal</button>
-                  </div>
+                  <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>
+                    Calibration{scaleDraft.calibration ? ` — last: ${scaleDraft.calibration.mode}, ${new Date(scaleDraft.calibration.at).toLocaleDateString()}` : ' — not calibrated'}
+                  </span>
+                  <button onClick={() => { setCalMode('theoretical'); setCalStep('zero'); setCalTestWeight(''); setCalSwitch(false); setCalOpen(true); }}
+                    disabled={!backend?.scaleConfigs.some(c => c.id === scaleDraft.id)}
+                    title="Save the scale first; calibration runs on the saved scale"
+                    className="px-2 py-1 text-xs font-medium" style={{ background: 'var(--bg-panel)', color: 'var(--fg)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer' }}>Calibrate…</button>
                 </div>
               </div>
               {calOpen && (
                 <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-                  onClick={e => { if (e.target === e.currentTarget) setCalOpen(false); }}>
-                  <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: '6px', padding: '20px', width: 340, maxWidth: '90vw' }}
+                  onClick={e => { if (e.target === e.currentTarget && !calBusy) setCalOpen(false); }}>
+                  <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: '6px', padding: '16px 20px', width: 360, maxWidth: '90vw' }}
                     onClick={e => e.stopPropagation()}>
-                    <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: 12, color: 'var(--fg)' }}>Span Calibration</div>
+                    <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: 8, color: 'var(--fg-bright)' }}>RS1201 Calibration</div>
+                    <div className="flex gap-2" style={{ marginBottom: 8 }}>
+                      {(['theoretical', 'span'] as const).map(m => (
+                        <button key={m} onClick={() => { setCalMode(m); setCalStep('zero'); }} className="px-3 py-1.5 text-xs font-medium"
+                          style={{ background: calMode === m ? 'var(--accent)' : 'transparent', color: calMode === m ? '#000' : 'var(--fg-dim)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer' }}>
+                          {m === 'theoretical' ? 'Theoretical' : 'Span (actual load)'}
+                        </button>
+                      ))}
+                    </div>
                     <div style={{ fontSize: '11px', color: 'var(--fg-dim)', marginBottom: 8 }}>
-                      Live reading: <strong style={{ color: 'var(--fg)' }}>{(backend?.scales[scaleDraft.id]?.weight ?? 0).toFixed(4)} mV/V</strong>
+                      Live reading: <strong style={{ color: 'var(--fg)' }}>{(backend?.scales[scaleDraft.id]?.weight ?? 0).toFixed(1)} lbs</strong>
                       {backend?.scales[scaleDraft.id]?.stable && <span style={{ color: 'var(--accent)', marginLeft: 6 }}>STABLE</span>}
                     </div>
-                    {calStep === 'zero' ? (
+                    {calMode === 'theoretical' ? (
                       <div className="flex flex-col gap-2">
-                        <div style={{ fontSize: '12px', color: 'var(--fg)' }}>Step 1: Remove all weight from scale</div>
-                        <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>Clear scale platform completely, then press Zero to capture the no-load reading.</div>
-                        <button onClick={() => {
-                          const r = backend?.scales[scaleDraft.id]?.weight ?? 0;
-                          setCalZeroReading(r);
-                          setScaleDraft({ ...scaleDraft, zeroOffset: r });
-                          setCalStep('span');
-                        }} className="px-3 py-1.5 text-xs font-medium"
-                          style={{ background: 'var(--accent)', color: '#000', border: 'none', borderRadius: '3px', cursor: 'pointer', alignSelf: 'flex-start' }}>Zero</button>
+                        <div style={{ fontSize: '12px', color: 'var(--fg)' }}>
+                          Capacity {scaleDraft.capacity} lbs, rated output {scaleDraft.ratedMvV} mV/V (the values in this form), zero balance 0.
+                        </div>
+                        <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>Uses the load cell data sheet instead of a test weight — lower accuracy than a span calibration.</div>
+                        <label style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>
+                          <input type="checkbox" checked={calSwitch} onChange={e => setCalSwitch(e.target.checked)} style={{ accentColor: 'var(--accent)', marginRight: 6 }} />
+                          This unit was previously span-calibrated (switch back to equivalent-input mode)
+                        </label>
+                        <button disabled={calBusy} onClick={async () => {
+                          setCalBusy(true);
+                          await backend?.sendCommand('CalibrateScale', scaleDraft.id, { mode: 'theoretical', capacity: scaleDraft.capacity, ratedMvV: scaleDraft.ratedMvV, switchFromActual: calSwitch });
+                          setCalBusy(false); setCalOpen(false);
+                        }} className="px-3 py-1.5 text-xs font-medium" style={{ background: 'var(--accent)', color: '#000', border: 'none', borderRadius: '3px', cursor: 'pointer', alignSelf: 'flex-start' }}>{calBusy ? 'Working…' : 'Apply'}</button>
+                      </div>
+                    ) : calStep === 'zero' ? (
+                      <div className="flex flex-col gap-2">
+                        <div style={{ fontSize: '12px', color: 'var(--fg)' }}>Step 1: Empty the scale</div>
+                        <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>Remove all material (leave any fixed tare in place), wait for STABLE, then press Zero.</div>
+                        <button disabled={calBusy} onClick={async () => {
+                          setCalBusy(true);
+                          const r = await backend?.sendCommand('CalibrateScale', scaleDraft.id, { mode: 'zero' });
+                          setCalBusy(false);
+                          if (r?.accepted) setCalStep('span');
+                        }} className="px-3 py-1.5 text-xs font-medium" style={{ background: 'var(--accent)', color: '#000', border: 'none', borderRadius: '3px', cursor: 'pointer', alignSelf: 'flex-start' }}>{calBusy ? 'Working…' : 'Zero'}</button>
                       </div>
                     ) : (
                       <div className="flex flex-col gap-2">
-                        <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>Zero captured: {calZeroReading.toFixed(4)} mV/V</div>
-                        <div style={{ fontSize: '12px', color: 'var(--fg)' }}>Step 2: Place test weight on scale</div>
-                        <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>Place a known test weight on the scale and enter the weight below.</div>
+                        <div style={{ fontSize: '12px', color: 'var(--fg)' }}>Step 2: Place the standard weight</div>
                         <div className="flex flex-col gap-1">
-                          <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Test Weight (lbs)</span>
-                          <input type="number" value={calTestWeight} onChange={e => setCalTestWeight(e.target.value)}
-                            style={inputStyle} placeholder="e.g. 1000" autoFocus />
+                          <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Standard Weight (lbs)</span>
+                          <input type="number" value={calTestWeight} onChange={e => setCalTestWeight(e.target.value)} style={inputStyle} placeholder="e.g. 1000" autoFocus />
                         </div>
                         <div className="flex gap-2">
-                          <button onClick={() => {
-                            const tw = parseFloat(calTestWeight);
-                            const raw = backend?.scales[scaleDraft.id]?.weight ?? 0;
-                            const delta = raw - calZeroReading;
-                            if (!tw || tw <= 0 || !scaleDraft.capacity) return;
-                            if (Math.abs(delta) < 0.0001) return;
-                            const mvv = delta * scaleDraft.capacity / tw;
-                            setScaleDraft({ ...scaleDraft, zeroOffset: calZeroReading, ratedMvV: Math.round(mvv * 10000) / 10000 });
-                            setCalOpen(false);
-                          }} className="px-3 py-1.5 text-xs font-medium"
-                            style={{ background: 'var(--accent)', color: '#000', border: 'none', borderRadius: '3px', cursor: 'pointer' }}
-                            disabled={!calTestWeight || parseFloat(calTestWeight) <= 0}>Calibrate</button>
-                          <button onClick={() => setCalStep('zero')} className="px-3 py-1.5 text-xs font-medium"
+                          <button disabled={calBusy || !(parseFloat(calTestWeight) > 0)} onClick={async () => {
+                            setCalBusy(true);
+                            const r = await backend?.sendCommand('CalibrateScale', scaleDraft.id, { mode: 'span', standardWeight: parseFloat(calTestWeight) });
+                            setCalBusy(false);
+                            if (r?.accepted) setCalOpen(false);
+                          }} className="px-3 py-1.5 text-xs font-medium" style={{ background: 'var(--accent)', color: '#000', border: 'none', borderRadius: '3px', cursor: 'pointer' }}>{calBusy ? 'Working…' : 'Calibrate'}</button>
+                          <button onClick={() => setCalStep('zero')} disabled={calBusy} className="px-3 py-1.5 text-xs font-medium"
                             style={{ background: 'transparent', color: 'var(--fg-dim)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer' }}>Back</button>
                         </div>
                       </div>
                     )}
-                    <button onClick={() => setCalOpen(false)} className="px-3 py-1.5 text-xs font-medium mt-3"
-                      style={{ background: 'transparent', color: 'var(--fg-dim)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer', width: '100%' }}>Cancel</button>
+                    <button onClick={() => setCalOpen(false)} disabled={calBusy} className="px-3 py-1.5 text-xs font-medium mt-3"
+                      style={{ background: 'transparent', color: 'var(--fg-dim)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer', width: '100%' }}>Close</button>
                   </div>
                 </div>
               )}
@@ -1521,6 +1543,67 @@ function GlobalSection() {
                 <span style={{ color: 'var(--fg-dim)', fontSize: '12px' }}>s</span>
               </div>
             : <span style={{ color: 'var(--fg-bright)' }}>{globalConfig.motorStarterFaultDelay ?? GLOBAL_DEFAULTS.motorStarterFaultDelay} s</span>}
+        </div>
+        <div className="flex items-center gap-2">
+          <span style={{ color: 'var(--fg-dim)', width: '200px', flexShrink: 0 }}>E-Stop Input (healthy = on)</span>
+          {editing
+            ? <select value={(draft.estopInput as string) ?? ''} onChange={e => setDraft({ ...draft, estopInput: e.target.value })} style={inputStyle}>
+                <option value="">Not Assigned</option>
+                {(backend?.ioSignals ?? []).filter(s => s.direction === 'DI').map(s => <option key={s.id} value={s.id}>{s.id}</option>)}
+              </select>
+            : <span style={{ color: globalConfig.estopInput ? 'var(--fg-bright)' : 'var(--fg-dim)' }}>{(globalConfig.estopInput as string) || 'Not Assigned'}</span>}
+        </div>
+
+        {([['hornOutput', 'Horn Output', 'DO'], ['hornSilenceInput', 'Horn Silence Input', 'DI']] as const).map(([key, label, dir]) => (
+          <div key={key} className="flex items-center gap-2">
+            <span style={{ color: 'var(--fg-dim)', width: '200px', flexShrink: 0 }}>{label}</span>
+            {editing
+              ? <select value={(draft[key] as string) ?? ''} onChange={e => setDraft({ ...draft, [key]: e.target.value })} style={inputStyle}>
+                  <option value="">Not Assigned</option>
+                  {(backend?.ioSignals ?? []).filter(s => s.direction === dir).map(s => <option key={s.id} value={s.id}>{s.id}</option>)}
+                </select>
+              : <span style={{ color: globalConfig[key] ? 'var(--fg-bright)' : 'var(--fg-dim)' }}>{(globalConfig[key] as string) || 'Not Assigned'}</span>}
+          </div>
+        ))}
+        {([['hornAutoSilenceSec', 'Horn Auto-Silence (0 = never)', 60], ['hornOnSec', 'Horn On Time', 1], ['hornOffSec', 'Horn Off Time (0 = steady)', 1]] as const).map(([key, label, def]) => (
+          <div key={key} className="flex items-center gap-2">
+            <span style={{ color: 'var(--fg-dim)', width: '200px', flexShrink: 0 }}>{label}</span>
+            {editing
+              ? <div className="flex items-center gap-1">
+                  <input type="number" step={key === 'hornAutoSilenceSec' ? 1 : 0.1} min={0} value={draft[key] ?? def}
+                    onChange={e => setDraft({ ...draft, [key]: Number(e.target.value) })} style={inputStyle} />
+                  <span style={{ color: 'var(--fg-dim)', fontSize: '12px' }}>s</span>
+                </div>
+              : <span style={{ color: 'var(--fg-bright)' }}>{globalConfig[key] ?? def} s</span>}
+          </div>
+        ))}
+
+        <div style={{ borderTop: '1px solid var(--border)', paddingTop: '8px' }}>
+          <div className="mb-2" style={{ color: 'var(--fg-bright)', fontSize: '12px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.03em' }}>Status Colors</div>
+          <div className="grid gap-x-6 gap-y-2" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))' }}>
+            {Object.entries(STATE_STYLE).map(([state, def]) => {
+              const key = `stateColor_${state}`;
+              const shown = editing ? stateColor(state, draft as Record<string, string | number>) : stateColor(state, globalConfig);
+              return (
+                <div key={state} className="flex items-center gap-2">
+                  <span style={{ color: 'var(--fg-dim)', width: '110px', flexShrink: 0 }}>{def.label}</span>
+                  {editing
+                    ? <>
+                        <input type="color" value={shown} aria-label={`${def.label} colour`} onChange={e => setDraft({ ...draft, [key]: e.target.value })}
+                          style={{ width: '40px', height: '24px', background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: '3px', padding: 0 }} />
+                        <span style={{ color: 'var(--fg-bright)', fontSize: '12px' }}>{shown}</span>
+                        {shown.toLowerCase() !== def.color.toLowerCase() &&
+                          <button type="button" onClick={() => setDraft({ ...draft, [key]: def.color })} className="px-2 py-1 text-xs font-medium"
+                            style={{ background: 'transparent', color: 'var(--fg-dim)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer' }}>Default</button>}
+                      </>
+                    : <>
+                        <span style={{ width: '40px', height: '24px', background: shown, border: '1px solid var(--border)', borderRadius: '3px', display: 'inline-block' }} />
+                        <span style={{ color: 'var(--fg-bright)', fontSize: '12px' }}>{shown}</span>
+                      </>}
+                </div>
+              );
+            })}
+          </div>
         </div>
 
         <div className="flex items-center gap-2" style={{ borderTop: '1px solid var(--border)', paddingTop: '8px' }}>

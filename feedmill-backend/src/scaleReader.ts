@@ -91,12 +91,14 @@ function startSerialReader(mill: Mill, cfg: ScaleConfig): () => void {
 
 // ── RS1201: weight PDO read via the io_daemon's cyclic state file ──
 //
-// UNVALIDATED: the raw-counts-to-weight formula below (zeroOffset/ratedMvV)
-// has not been checked against a real NX-RS1201. The W565 manual's
-// program-driven calibration handshake (Ch1 Calibration Command/Data,
-// polling the Response SID) is NOT implemented — do this via the HMI's
-// commissioning workflow once the module is on the bench, then replace
-// this formula with the module's own calibrated zero/span.
+// W565: 0x6002:01 Gross Weight DINT is already zero/span-calibrated inside the
+// unit (calibrate it with Sysmac Studio, not here) and is weight x 10^(decimal
+// point position setting, default 0) — so with the unit's factory decimal
+// position this is the weight in the calibrated unit. 0x6000:01 Detection
+// Status bits 0-3 (sensor disconnected / under range / over range / ADC error)
+// invalidate the reading. The program-driven calibration handshake (0x7xxx
+// Calibration Command) is NOT implemented. Zero offset / mV/V settings in
+// ScaleConfig are unused for RS1201 for the same reason.
 function startRs1201Reader(mill: Mill, cfg: ScaleConfig): () => void {
   const stable = makeStabilityTracker(cfg);
   const signalId = `SC:${cfg.id}`;
@@ -107,9 +109,11 @@ function startRs1201Reader(mill: Mill, cfg: ScaleConfig): () => void {
       mill.setScale(cfg.id, 0, false, false); // io_daemon not running, or this scale not in its config yet
       return;
     }
-    const weight = (raw - cfg.zeroOffset) * cfg.ratedMvV;
+    const status = state?.inputs[`SS:${cfg.id}`];
+    const faulted = typeof status !== 'number' || (status & 0x0f) !== 0;
+    const weight = raw;
     const now = Date.now();
-    mill.setScale(cfg.id, weight, stable(weight, now), true);
+    mill.setScale(cfg.id, weight, !faulted && stable(weight, now), !faulted);
   }, RS1201_POLL_MS);
   return () => clearInterval(timer);
 }

@@ -57,6 +57,12 @@ function PageInner() {
     <div className="h-full flex flex-col">
       <header className="flex items-center justify-between px-5 py-3" style={{ background: 'var(--bg-panel)', borderBottom: '2px solid var(--border)' }}>
         <span style={{ color: 'var(--fg-bright)', fontWeight: 700, fontSize: '16px', letterSpacing: '0.04em' }}>{siteName}</span>
+        {backend?.connected && activeFaults > 0 && (
+          <button onClick={() => backend.sendCommand('SilenceHorn')} className="px-4 py-1.5 text-xs font-medium uppercase tracking-wide"
+            style={{ background: backend.horn.silenced ? 'transparent' : 'var(--red)', color: backend.horn.silenced ? 'var(--fg-dim)' : '#fff', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer', fontWeight: 600, marginLeft: 'auto', marginRight: '12px' }}>
+            {backend.horn.silenced ? 'Horn Silenced (re-arm)' : 'Silence Horn'}
+          </button>
+        )}
         {activeBatch && backend?.connected && (
           <button
             onClick={() => backend.sendCommand(isPaused ? 'ResumeBatch' : 'PauseBatch')}
@@ -80,10 +86,9 @@ function PageInner() {
           <button
             key={t}
             onClick={() => setTab(t)}
-            className="px-5 py-2.5 text-sm font-medium tracking-wide uppercase"
+            className={`px-5 py-2.5 text-sm font-medium tracking-wide uppercase${t === 'Faults' && activeFaults > 0 ? ' fault-flash' : ''}`}
             style={{
-              background: tab === t ? 'var(--bg)' : 'transparent',
-              color: tab === t ? 'var(--fg-bright)' : 'var(--fg)',
+              ...(t === 'Faults' && activeFaults > 0 ? {} : { background: tab === t ? 'var(--bg)' : 'transparent', color: tab === t ? 'var(--fg-bright)' : 'var(--fg)' }),
               borderBottom: tab === t ? '3px solid var(--accent)' : '3px solid transparent',
               marginBottom: '-2px',
             }}

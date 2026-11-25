@@ -413,16 +413,18 @@ typedef struct {
     uint16_t pdo_index;
     uint8_t pdo_subindex;
     unsigned base_offset;
+    unsigned base_bit; /* bit position IgH returned: nonzero for packed 1-bit BOOL entries (2/4-point cards) */
 } registered_entry_t;
 
 static registered_entry_t registered[MAX_CHANNELS];
 static int n_registered = 0;
 
-static int find_registered(int slave_idx, uint16_t index, uint8_t subindex, unsigned *out_offset) {
+static int find_registered(int slave_idx, uint16_t index, uint8_t subindex, unsigned *out_offset, unsigned *out_bit) {
     for (int i = 0; i < n_registered; i++) {
         if (registered[i].slave_idx == slave_idx && registered[i].pdo_index == index &&
             registered[i].pdo_subindex == subindex) {
             *out_offset = registered[i].base_offset;
+            *out_bit = registered[i].base_bit;
             return 1;
         }
     }
@@ -448,8 +450,8 @@ static void setup_ethercat(void) {
         channel_t *c = &channels[i];
         ec_slave_config_t *sc = slaves[c->slave_idx].sc;
 
-        unsigned base_off;
-        if (!find_registered(c->slave_idx, c->pdo_index, c->pdo_subindex, &base_off)) {
+        unsigned base_off, base_bit;
+        if (!find_registered(c->slave_idx, c->pdo_index, c->pdo_subindex, &base_off, &base_bit)) {
             unsigned bitpos = 0;
             int off = ecrt_slave_config_reg_pdo_entry(sc, c->pdo_index, c->pdo_subindex, domain, &bitpos);
             if (off < 0) {
@@ -461,18 +463,20 @@ static void setup_ethercat(void) {
                 exit(1);
             }
             base_off = (unsigned)off;
+            base_bit = bitpos;
             if (n_registered < MAX_CHANNELS) {
                 registered[n_registered].slave_idx = c->slave_idx;
                 registered[n_registered].pdo_index = c->pdo_index;
                 registered[n_registered].pdo_subindex = c->pdo_subindex;
                 registered[n_registered].base_offset = base_off;
+                registered[n_registered].base_bit = base_bit;
                 n_registered++;
             }
         }
 
         if (c->dir == DIR_DI || c->dir == DIR_DO) {
-            c->offset = base_off + c->cfg_bit / 8;
-            c->bit = c->cfg_bit % 8;
+            c->offset = base_off + (base_bit + c->cfg_bit) / 8;
+            c->bit = (base_bit + c->cfg_bit) % 8;
         } else {
             c->offset = base_off; /* AI/AO/SCALE: the whole registered word/dword, no bit addressing */
             c->bit = 0;

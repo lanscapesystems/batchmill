@@ -168,6 +168,17 @@ const upsertFault = () => db.prepare(`
   VALUES (?,?,?,?,?,?,?,?)
 `);
 
+// Faults survive a power cycle: everything still active, plus recent history, newest first (the order Mill keeps them in).
+export function loadFaults(limit = 500): Fault[] {
+  const rows = db.prepare('SELECT * FROM fault_log ORDER BY (cleared_at IS NULL) DESC, raised_at DESC LIMIT ?').all(limit) as Record<string, unknown>[];
+  return rows.map(r => ({
+    id: r.id as string, severity: r.severity as Fault['severity'], equipment: r.equipment as string,
+    message: r.message as string, code: r.code as string, raisedAt: r.raised_at as string,
+    clearedAt: (r.cleared_at as string | null) ?? null, acknowledgedAt: (r.acknowledged_at as string | null) ?? null,
+    active: r.cleared_at == null,
+  })).sort((a, b) => (a.raisedAt < b.raisedAt ? 1 : a.raisedAt > b.raisedAt ? -1 : 0));
+}
+
 export function persistFault(f: Fault): void {
   upsertFault().run(
     f.id, f.severity, f.equipment, f.message, f.code,

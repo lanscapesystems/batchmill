@@ -130,11 +130,32 @@ const NX_CARD_IDENTS: Record<string, number> = {
 // Number() parses either a bare decimal or a "0x"-prefixed hex string, so
 // this should survive either convention, but if getSlotModuleIdent always
 // returns null on real hardware, check the raw CLI output here first.
-function getSlotModuleIdent(slot: number): number | null {
-  const { out } = runEthercat(['upload', '-p', '0', '-t', 'uint32', '0xf050', String(slot)]);
+// IgH prints an upload as "0x<hex> <decimal>" (e.g. "0x00135256 1266262"), so
+// Number() on the whole line is NaN — take the first token only.
+function sdoUpload(type: 'uint8' | 'uint16' | 'uint32', index: string, sub: string): number | null {
+  const { out } = runEthercat(['upload', '-p', '0', '-t', type, index, sub]);
   if (out === null) return null;
-  const n = Number(out.trim());
+  const n = Number(out.trim().split(/\s+/)[0]);
   return Number.isFinite(n) ? n : null;
+}
+
+function getSlotModuleIdent(slot: number): number | null {
+  return sdoUpload('uint32', '0xf050', String(slot));
+}
+
+/** Number of current errors held by the coupler + NX units (W519 A-5-2:
+ * CoE 0x3809:00 is the error count plus 1). null = could not read. */
+export function readCouplerErrorCount(): number | null {
+  const n = sdoUpload('uint8', '0x3809', '0');
+  return n === null ? null : Math.max(0, n - 1);
+}
+
+/** Clears the coupler's + NX units' current errors by writing 01 to CoE
+ * 0x2002:02 "Sysmac Error Status Clear" (W519 A-5-3). Does not fix the cause —
+ * the same error returns if it's still present. */
+export function clearCouplerErrors(): { ok: boolean; error?: string } {
+  const { out, error } = runEthercat(['download', '-p', '0', '-t', 'uint8', '0x2002', '2', '1']);
+  return out === null ? { ok: false, error } : { ok: true };
 }
 
 interface SlotAllocation {
@@ -160,12 +181,24 @@ function allocateRackEntries(cards: IoRackCard[], inputEntries: PdoEntry[], outp
     if (!def) { bySlot.set(card.slot, { status: 'mismatch' }); continue; }
     if (def.category === 'power') { bySlot.set(card.slot, { status: 'ok' }); continue; }
     const isInput = def.category === 'DI' || def.category === 'AI' || def.category === 'scale';
-    const take = def.category === 'DI' || def.category === 'DO' ? 1 : def.points;
     const pool = isInput ? inputEntries : outputEntries;
     const start = isInput ? inIdx : outIdx;
+    // W521: 8/16/32-point digital cards expose ONE packed BYTE/WORD/DWORD entry,
+    // but 2/4-point cards (NX-IA3117, NX-OC2633...) expose one 1-bit BOOL entry
+    // per point — so consume entries until their bits cover the card's points.
+    let take = def.category === 'scale' ? 3 : def.points; // W565 §6-2-1 default input map: 6000 Detection Status, 6001 Executing Status, 6002 Gross Weight DINT
+    if (def.category === 'DI' || def.category === 'DO') {
+      take = 0;
+      for (let bits = 0; bits < def.points && start + take < pool.length; take++) bits += pool[start + take].bits;
+    }
     const slice = pool.slice(start, start + take);
     if (isInput) inIdx += take; else outIdx += take;
-    bySlot.set(card.slot, slice.length === take ? { status: 'ok', pdoEntries: slice } : { status: 'missing' });
+    const covered = def.category === 'DI' || def.category === 'DO'
+      ? slice.reduce((n, e) => n + e.bits, 0) >= def.points
+      : def.category === 'scale'
+        ? slice.length === 3 && slice[2].index === 0x6002 && slice[2].bits === 32
+        : slice.length === take;
+    bySlot.set(card.slot, covered ? { status: 'ok', pdoEntries: slice } : { status: 'missing' });
   }
   return bySlot;
 }
@@ -203,6 +236,9 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
     warnings.push(`Coupler at position 0 reports "${coupler.name}", expected ${om.eccModel}`);
   }
 
+  const errCount = readCouplerErrorCount();
+  if (errCount) warnings.push(`Coupler/NX units report ${errCount} current error(s) — remove the cause, then Clear EtherCAT Errors`);
+
   const productId = getSlaveProductId(0);
   const rackEntries = getRackPdoEntries(0);
   const inputEntries = rackEntries.filter(e => e.dir === 'input');
@@ -225,8 +261,12 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
   const identifiedCards = cards.map(card => {
     if (card.status !== 'ok') return card;
     const expectedIdent = NX_CARD_IDENTS[card.model];
-    if (expectedIdent === undefined) return card; // no confirmed ident for this model — can't verify beyond PDO-count allocation
     const actualIdent = getSlotModuleIdent(card.slot);
+    if (expectedIdent === undefined) {
+      // no confirmed ident for this model — can't verify beyond PDO-count allocation, but surface what the bus reports so it can be added
+      if (actualIdent !== null) warnings.push(`${card.model} in slot ${card.slot}: identity not in the verified table (bus reports 0x${actualIdent.toString(16).padStart(8, '0')}) — add to NX_CARD_IDENTS once confirmed`);
+      return card;
+    }
     if (actualIdent === null) {
       warnings.push(`${card.model} in slot ${card.slot}: could not read module identity (0xF050) to verify — relying on PDO-count allocation only`);
       return card;
@@ -283,9 +323,12 @@ export function checkRackPresence(om: OmronConfig): { cards: IoRackCard[]; unrea
 // is listed yet: no analog or RS1201 card has been bench-verified. Add a
 // model here only once its actual PDO map and scaling are confirmed
 // against the installed module (see ethercat-io-audit.md's P1 analog
-// finding) — until then, generateIoConf excludes it from io.conf entirely
+// finding). Now populated from W522 (NX-AD/DA) and W565 (NX-RS1201): PDO maps and
+// raw scaling are taken from the manuals; NOT yet bench-tested — until then, generateIoConf excludes it from io.conf entirely
 // rather than generating a channel against an unverified guess.
-const VERIFIED_ANALOG_MODELS = new Set<string>([]);
+const VERIFIED_ANALOG_MODELS = new Set<string>([
+  'NX-AD2203', 'NX-AD3203', 'NX-AD4203', 'NX-AD4603', 'NX-DA2203', 'NX-DA3203', 'NX-DA3603', 'NX-RS1201',
+]);
 
 /** Builds the io_daemon's full channel config from every signal currently
  * mapped to a rack address (see buildSignals() in mill.ts) — the daemon has
@@ -327,11 +370,11 @@ export function generateIoConf(
     if (!VERIFIED_ANALOG_MODELS.has(card.model)) { warnings.push(`${sc.name}: ${card.model} is not yet bench-verified for production use — excluded from io.conf (see ethercat-io-audit.md)`); continue; }
     const alloc = allocations.get(card.slot);
     if (!alloc || alloc.status !== 'ok' || !alloc.pdoEntries) { warnings.push(`${sc.name}: ${card.model} in slot ${sc.rackSlot} — not enough PDO entries discovered; re-run Read Rack`); continue; }
-    // RS1201 convention, unverified: the weight value is the card's one allocated entry.
-    const entry = alloc.pdoEntries[0];
-    const idx = entry.index.toString(16).padStart(4, '0');
-    const sub = entry.subindex.toString(16).padStart(2, '0');
-    channelLines.push(`channel SC:${sc.id} 0 SCALE 0x${idx} 0x${sub} 0`);
+    // W565: entries[2] is 0x6002:01 Gross Weight DINT (already calibrated inside the unit); entries[0] is 0x6000:01 Detection Status (WORD)
+    const [st, , wt] = alloc.pdoEntries;
+    const hex = (e: PdoEntry) => `0x${e.index.toString(16).padStart(4, '0')} 0x${e.subindex.toString(16).padStart(2, '0')}`;
+    channelLines.push(`channel SC:${sc.id} 0 SCALE ${hex(wt)} 0`);
+    channelLines.push(`channel SS:${sc.id} 0 AI ${hex(st)} 0`); // detection status word: bits 0-3 = sensor disconnected / under / over / ADC error
   }
 
   const rotationSignals = new Set(
@@ -357,9 +400,16 @@ export function generateIoConf(
     // Digital cards pack every point into the ONE entry they were allocated,
     // addressed as a bit within it; analog cards get one entry PER point.
     const isDigital = sig.direction === 'DI' || sig.direction === 'DO';
-    const entry = isDigital ? alloc.pdoEntries[0] : alloc.pdoEntries[point];
+    // Walk the card's entries: a packed word holds many points, 1-bit BOOL entries one each.
+    let entry: PdoEntry | undefined, bit = 0;
+    if (isDigital) {
+      bit = point;
+      for (const e of alloc.pdoEntries) {
+        if (bit < e.bits) { entry = e; break; }
+        bit -= e.bits;
+      }
+    } else entry = alloc.pdoEntries[point];
     if (!entry) { warnings.push(`${sig.id}: ${card.model}'s allocated PDO entries have nothing for point ${point}`); continue; }
-    const bit = isDigital ? point : 0;
 
     const index = entry.index.toString(16).padStart(4, '0');
     const subindex = entry.subindex.toString(16).padStart(2, '0');
@@ -407,4 +457,53 @@ export function syncIoConf(
     // e.g. /etc/feedmill isn't writable here (dev machine) — nothing generated
   }
   return warnings;
+}
+
+// ── NX-RS1201 calibration over CoE SDO (W565 §6-2 / §7-4; W519 A-7-3) ──
+// The calibration objects (0x7001 SID, 0x7002 command, 0x7003 REAL data, 0x600A
+// response SID, 0x600B response) aren't in the default PDO map, so they're
+// reached by SDO at the coupler's per-unit shifted index: base + (unit-1)*0x20.
+// UNVERIFIED on hardware (SDO access to these NX objects through the coupler,
+// and `ethercat download -t float`). Blocks the event loop while it runs
+// (same shortcut as runEthercat above) — an explicit operator action, ~<1s.
+export type ScaleCalStep = { cmd: number; data?: number };
+
+const RS1201_CAL_ERRORS: Record<number, string> = {
+  1: 'unit rejected the calibration command',
+  2: 'calibration data out of range',
+  3: 'unit cannot accept calibration now (sensor disconnection test running, calibration busy, or AD conversion error)',
+  4: 'calibration failed (AD error, over/under range during calibration, or non-volatile write failed)',
+};
+
+const sleepMs = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+export function runRs1201Calibration(unit: number, steps: ScaleCalStep[]): { ok: boolean; error?: string } {
+  const at = (base: number) => '0x' + (base + (unit - 1) * 0x20).toString(16);
+  const write = (type: 'uint16' | 'float', base: number, v: number) =>
+    runEthercat(['download', '-p', '0', '-t', type, at(base), '1', String(v)]);
+  const waitSid = (sid: number): boolean => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < 1000) {
+      const r = sdoUpload('uint16', at(0x600a), '1');
+      if (r === sid) return true;
+      sleepMs(20);
+    }
+    return false;
+  };
+
+  let w = write('uint16', 0x7001, 0); // reset SID to 0 first (W565: response SID must follow)
+  if (w.out === null) return { ok: false, error: w.error };
+  if (!waitSid(0)) return { ok: false, error: 'calibration SID did not reset (is the unit in message-enabled/operational state?)' };
+
+  let sid = 0;
+  for (const step of steps) {
+    sid = sid % 255 + 1; // 1..255, wraps back to 1
+    if (step.data !== undefined) { w = write('float', 0x7003, step.data); if (w.out === null) return { ok: false, error: w.error }; }
+    w = write('uint16', 0x7002, step.cmd); if (w.out === null) return { ok: false, error: w.error };
+    w = write('uint16', 0x7001, sid); if (w.out === null) return { ok: false, error: w.error };
+    if (!waitSid(sid)) return { ok: false, error: `no response to calibration command 0x${step.cmd.toString(16)} within 1 s` };
+    const resp = sdoUpload('uint16', at(0x600b), '1');
+    if (resp !== 0) return { ok: false, error: `command 0x${step.cmd.toString(16)}: ${RS1201_CAL_ERRORS[resp ?? -1] ?? `response ${resp}`}` };
+  }
+  return { ok: true };
 }
