@@ -248,6 +248,22 @@ static void load_config(const char *path) {
     }
 }
 
+/* Scheduling diagnostics (published in the state file): cycles that missed their deadline and the longest cycle body. */
+static uint64_t diag_overruns, diag_max_cycle_us;
+
+/* Worker threads (file I/O) must NOT inherit the cyclic thread's SCHED_FIFO priority (pthread_create inherits by
+ * default); a FIFO file writer could starve the cyclic task. */
+static void spawn_worker(pthread_t *t, void *(*fn)(void *)) {
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setinheritsched(&a, PTHREAD_EXPLICIT_SCHED);
+    struct sched_param sp = { .sched_priority = 0 };
+    pthread_attr_setschedpolicy(&a, SCHED_OTHER);
+    pthread_attr_setschedparam(&a, &sp);
+    pthread_create(t, &a, fn, NULL);
+    pthread_attr_destroy(&a);
+}
+
 /* ---- state-file writer thread (non-realtime; the RT thread never touches disk) ---- */
 
 static void *writer_thread(void *arg) {
@@ -270,8 +286,10 @@ static void *writer_thread(void *arg) {
 
         FILE *f = fopen(tmp_path, "w");
         if (f) {
-            fprintf(f, "{\"atUs\":%llu,\"daemonStartUs\":%llu,\"healthy\":%s,\"inputs\":{",
-                    (unsigned long long)now, (unsigned long long)daemon_start_us, healthy ? "true" : "false");
+            fprintf(f, "{\"atUs\":%llu,\"daemonStartUs\":%llu,\"healthy\":%s,\"overruns\":%llu,\"maxCycleUs\":%llu,\"inputs\":{",
+                    (unsigned long long)now, (unsigned long long)daemon_start_us, healthy ? "true" : "false",
+                    (unsigned long long)__atomic_load_n(&diag_overruns, __ATOMIC_RELAXED),
+                    (unsigned long long)__atomic_load_n(&diag_max_cycle_us, __ATOMIC_RELAXED));
             bool first = true;
             for (int i = 0; i < n_channels; i++) {
                 channel_t *c = &channels[i];
@@ -608,8 +626,8 @@ int main(int argc, char **argv) {
          * cleanly on SIGTERM; syncIoConf() restarts this unit once a real
          * config is written, which re-execs main() from the top. */
         pthread_t writer, reader;
-        pthread_create(&writer, NULL, writer_thread, NULL);
-        pthread_create(&reader, NULL, reader_thread, NULL);
+        spawn_worker(&writer, writer_thread);
+        spawn_worker(&reader, reader_thread);
         while (running) usleep(200000);
         pthread_join(writer, NULL);
         pthread_join(reader, NULL);
@@ -631,15 +649,27 @@ int main(int argc, char **argv) {
     }
 
     pthread_t writer, reader;
-    pthread_create(&writer, NULL, writer_thread, NULL);
-    pthread_create(&reader, NULL, reader_thread, NULL);
+    spawn_worker(&writer, writer_thread);
+    spawn_worker(&reader, reader_thread);
 
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
     while (running) {
+        uint64_t t0 = now_us();
         run_cycle();
+        uint64_t took = now_us() - t0;
+        if (took > diag_max_cycle_us) __atomic_store_n(&diag_max_cycle_us, took, __ATOMIC_RELAXED);
         next.tv_nsec += cycle_us * 1000L;
         while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+        struct timespec nowt;
+        clock_gettime(CLOCK_MONOTONIC, &nowt);
+        if (nowt.tv_sec > next.tv_sec || (nowt.tv_sec == next.tv_sec && nowt.tv_nsec > next.tv_nsec)) {
+            /* Missed the deadline: count it and resume at the next FUTURE slot, not back-to-back catch-up cycles. */
+            __atomic_fetch_add(&diag_overruns, 1, __ATOMIC_RELAXED);
+            next = nowt;
+            next.tv_nsec += cycle_us * 1000L;
+            while (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+        }
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
 

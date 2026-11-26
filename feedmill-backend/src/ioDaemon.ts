@@ -32,6 +32,8 @@ export interface RotationChannelState {
 interface IoStateFile {
   atUs: number; // daemon's CLOCK_MONOTONIC at write time -- compare only against other *Us fields from this same file, never against Date.now()
   daemonStartUs: number; // changes across a daemon restart; callers use this to detect one (see mill.ts's updateBusHealth)
+  overruns?: number; // cyclic deadlines missed since daemon start
+  maxCycleUs?: number; // longest cyclic body so far
   healthy: boolean; // per-cycle bus validity (link up + complete working counter) -- false means inputs/rotation below are frozen at last-good, not live
   inputs: Record<string, SignalValue>;
   rotation: Record<string, RotationChannelState>;

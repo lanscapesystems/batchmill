@@ -124,6 +124,7 @@ export class Mill {
   private hornInPrev = false;
   private hornOn = false;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
+  private lastRackCheckMs = 0;
   private rackWatchdogHandle: ReturnType<typeof setInterval> | null = null;
   private onChange?: () => void;
 
@@ -188,6 +189,11 @@ export class Mill {
   private rackWatchdogCheck() {
     const om = this.omronConfig;
     if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return;
+    // The CLI check is synchronous and stalls the mill scan: while the daemon reports a healthy bus (complete working
+    // counter every cycle) re-check identity only once a minute; any doubt goes back to the 3 s cadence.
+    const now = Date.now();
+    if (readIoState()?.healthy && now - this.lastRackCheckMs < 60_000) return;
+    this.lastRackCheckMs = now;
     const result = checkRackPresence(om);
     om.cards = result.cards;
     if (result.unreachable) {
@@ -461,6 +467,8 @@ export class Mill {
         if (!eq) return reject('Unknown equipment');
         if (!BYPASSABLE.includes(key) || typeof value !== 'boolean') return reject('Not a bypassable input');
         if (value && !eq.config[key]) return reject('That input is not assigned on this equipment');
+        const otherLimit = key === 'openLimitInput' ? 'closedLimitInput' : key === 'closedLimitInput' ? 'openLimitInput' : undefined;
+        if (value && otherLimit && eq.config[`bypass_${otherLimit}`]) return reject('Turn off the other limit switch override first');
         if (value) eq.config[`bypass_${key}`] = true; else delete eq.config[`bypass_${key}`];
         this.persistConfig();
         return ok();
@@ -1494,16 +1502,13 @@ export class Mill {
   private updateGate(eq: EquipmentRuntime) {
     const openOutput = eq.config.openOutput as string | undefined;
     const closeOutput = eq.config.closeOutput as string | undefined;
-    const openLimit = this.byp(eq, 'openLimitInput') ? undefined : eq.config.openLimitInput as string | undefined;
-    const closedLimit = this.byp(eq, 'closedLimitInput') ? undefined : eq.config.closedLimitInput as string | undefined;
+    const openLimit = eq.config.openLimitInput as string | undefined;
+    const closedLimit = eq.config.closedLimitInput as string | undefined;
     const timeout = delayMs(eq.config.positionTimeout, 5);
     // Motor gate (dual outputs to a reversing starter): the output is only needed while moving, so it drops once the limit
     // switch confirms the position; the starter's aux must be on while an output is on.
     const motor = eq.config.motorGate === true && !!closeOutput;
     const auxSig = motor && !this.byp(eq, 'motorAuxInput') ? eq.config.motorAuxInput as string | undefined : undefined;
-
-    const openFb = openLimit ? !!this.ioInputs[openLimit] : undefined;
-    const closedFb = closedLimit ? !!this.ioInputs[closedLimit] : undefined;
 
     // P1 / P2 are the gate's two outlets (what each one feeds comes from the flow path). Coil 1 / limit 1 is P1 (openOutput /
     // openLimitInput), coil 2 / limit 2 is P2. Auto goes to the outlet its owner (batch / refill) needs. Released, a
@@ -1515,6 +1520,10 @@ export class Mill {
     // E-stop: only a motorized gate is shut off (its output drops, and it carries on once the e-stop is released); valves keep their state.
     if (motor && !this.estopOk()) want = undefined;
     if (eq.status === 'fault' && eq.faultReason === 'Motor starter feedback timeout') want = undefined; // nothing is driven until reset
+
+    // An overridden limit switch reads as made (the gate is at that port, whatever mode it is in); only one may be set at a time.
+    const openFb = this.byp(eq, 'openLimitInput') ? true : openLimit ? !!this.ioInputs[openLimit] : undefined;
+    const closedFb = this.byp(eq, 'closedLimitInput') ? true : closedLimit ? !!this.ioInputs[closedLimit] : undefined;
 
     let driving = false;
     if (want === 'open') {
