@@ -92,6 +92,7 @@ export class Mill {
     if (Array.from(this.equipment.values()).some(e => e.equipmentType === 'hammermill' && e.enabled)) return 'A hammermill is enabled - disable it first';
     return null;
   }
+  private handRun = new Set<string>(); // motors whose current run was started in Hand (no start/stop delays)
   private rotationState = new Map<string, { runningMs: number; rpm?: number }>();
   private lastDaemonStartUs: number | null = null; // detects an io_daemon restart (see updateBusHealth)
   ioOverrides: Record<string, SignalValue> = {};
@@ -1219,21 +1220,27 @@ export class Mill {
       // Start delays nest too: this timer only survives the interlock pass (motorInterlock zeroes it) while every
       // motor it feeds is running, so it starts counting once the downstream start delay has elapsed.
       eq.stopTimerMs = 0;
-      eq.startTimerMs += SCAN_MS;
-      if (eq.startTimerMs >= delayMs(eq.config.startDelay)) eq.runCmd = true;
+      if (eq.mode === 'Hand') { eq.runCmd = true; this.handRun.add(eq.id); } // Hand ignores the start delay
+      else {
+        this.handRun.delete(eq.id);
+        eq.startTimerMs += SCAN_MS;
+        if (eq.startTimerMs >= delayMs(eq.config.startDelay)) eq.runCmd = true;
+      }
     } else {
       eq.startTimerMs = 0;
-      if (eq.runCmd && !this.upstreamStopping(eq)) {
+      if (eq.runCmd && this.handRun.has(eq.id)) { eq.runCmd = false; eq.stopTimerMs = 0; } // a Hand run stops at once (to Off, or to Auto with no request): no stop delay
+      else if (eq.runCmd && !this.upstreamStopping(eq)) {
         eq.stopTimerMs += SCAN_MS;
         if (eq.stopTimerMs >= delayMs(eq.config.stopDelay)) { eq.runCmd = false; eq.stopTimerMs = 0; }
       } else eq.stopTimerMs = 0; // not running, or waiting for upstream motors to finish stopping
     }
+    if (!eq.runCmd) this.handRun.delete(eq.id);
   }
 
   // Nested run permissive: a motor may only run while every motor it feeds is running. If one stops or faults,
   // everything feeding it drops out at once (no stop delay) and restarts, after its start delay, when it is running again.
   private motorInterlock(eq: EquipmentRuntime) {
-    if (!this.downstreamRunning(eq)) {
+    if (eq.mode !== 'Hand' && !this.downstreamRunning(eq)) { // Hand ignores the permissive
       eq.runCmd = false;
       eq.startTimerMs = 0;
       eq.stopTimerMs = 0;

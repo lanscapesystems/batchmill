@@ -147,6 +147,16 @@ assert.equal(m.ioOutputs.VFD_RUN, true); assert.equal(v1.status, 'running', 'no 
 cmd('SetEquipmentMode', 'V2', { mode: 'Hand' }); for (let i = 0; i < 15; i++) follow(); assert.equal(v2.status, 'running');
 cmd('SetEquipmentMode', 'V1', { mode: 'Off' }); for (let i = 0; i < 5; i++) follow(); assert.equal(m.ioOutputs.VFD_RUN, true, 'shared VFD stays on for V2');
 cmd('SetEquipmentMode', 'V2', { mode: 'Off' }); for (let i = 0; i < 3; i++) follow(); assert.equal(m.ioOutputs.VFD_RUN, false, 'VFD drops with the last run command');
+// Hand ignores start/stop delays; Auto honours them
+const dm: any = mk('D-1', 'auger', { runOutput: 'D_OUT', startDelay: 5, stopDelay: 5 }); dm.mode = 'Off'; m.equipment.set('D-1', dm);
+cmd('SetEquipmentMode', 'D-1', { mode: 'Hand' }); m.scan(); assert.equal(dm.runCmd, true, 'Hand starts at once despite the start delay');
+cmd('SetEquipmentMode', 'D-1', { mode: 'Off' }); m.scan(); assert.equal(dm.runCmd, false, 'Hand stops at once despite the stop delay');
+// Hand ignores the downstream run permissive; Auto-style (non-Hand) still obeys it
+const dn: any = mk('D-2', 'auger', { runOutput: 'D2_OUT' }); dn.mode = 'Off'; m.equipment.set('D-2', dn);
+m.connections.push({ from: 'D-1', to: 'D-2' } as any);
+cmd('SetEquipmentMode', 'D-1', { mode: 'Hand' }); m.scan(); assert.equal(dm.runCmd, true, 'Hand runs although the motor it feeds is stopped');
+m.connections.pop(); m.equipment.delete('D-2');
+m.equipment.delete('D-1');
 // PLC-style display state
 const ds = (e: any) => m.displayState(e);
 const sm: any = mk('S-1', 'auger', { runOutput: 'S_OUT', runConfirmAux: 'S_AUX' }); sm.mode = 'Off'; m.equipment.set('S-1', sm);
@@ -194,14 +204,13 @@ assert.equal(openFault(), true, 'mapped open channel: fault');
 m.signals.find((s: any) => s.id === 'U_AI').equipmentId = undefined; m.readRealInputs({ inputs: { U_AI: 32767 } });
 assert.equal(openFault(), false, 'unmapping clears it');
 
-// Hand -> Auto with nothing requesting: the motor stops (after its stop delay); with an owner's request it keeps running
+// Hand -> Auto with nothing requesting: the motor stops at once; with an owner's request it keeps running
 const hb: any = mk('HB', 'auger', { runOutput: 'HB_OUT', runConfirmAux: 'HB_AUX', stopDelay: 0.3 }); hb.mode = 'Off'; m.equipment.set('HB', hb);
 const hfollow = () => { m.ioInputs.HB_AUX = m.ioOutputs.HB_OUT === true; m.scan(); };
 cmd('SetEquipmentMode', 'HB', { mode: 'Hand' }); for (let i = 0; i < 10; i++) hfollow();
 assert.equal(hb.status, 'running'); assert.equal(hb.request, true);
 cmd('SetEquipmentMode', 'HB', { mode: 'Auto' }); for (let i = 0; i < 2; i++) hfollow();
-assert.equal(hb.request, false, 'Hand request does not carry into Auto'); assert.equal(hb.runCmd, true, 'still inside its stop delay');
-for (let i = 0; i < 6; i++) hfollow(); assert.equal(hb.runCmd, false, 'stops once the stop delay ends'); assert.equal(m.ioOutputs.HB_OUT, false);
+assert.equal(hb.request, false, 'Hand request does not carry into Auto'); assert.equal(hb.runCmd, false, 'a Hand run stops at once, no stop delay'); assert.equal(m.ioOutputs.HB_OUT, false);
 hb.owner = 'BATCH-X'; hb.request = true; for (let i = 0; i < 6; i++) hfollow(); assert.equal(hb.runCmd, true, 'an owner request still runs it in Auto');
 hb.owner = undefined; hb.request = false; cmd('SetEquipmentMode', 'HB', { mode: 'Off' });
 
@@ -284,7 +293,7 @@ cmd('SetEquipmentMode', 'GP', { mode: 'P1' }); m.ioInputs.GP_OL = true; scan(3);
 // each I/O point reports what it is configured as
 m.signals.push({ id: 'HM_OUT', direction: 'DO', label: 'Digital Output' }, { id: 'TAGX', direction: 'DI', label: 'Digital Input' }); m.globalConfig.estopInput = 'TAGX';
 const tag = (id: string) => m.getSnapshot().io.signals.find((s: any) => s.id === id).assignment;
-assert.equal(tag('HM_OUT'), 'HM-1 Run'); assert.equal(tag('TAGX'), 'E-Stop');
+assert.equal(tag('HM_OUT'), 'HM-1 MS Coil'); assert.equal(tag('TAGX'), 'E-Stop');
 assert.equal(cmd('SetGlobalConfig', undefined, { key: 'stateColor_fault', value: 'red' }).accepted, false, 'colour must be #rrggbb');
 assert.equal(cmd('SetGlobalConfig', undefined, { key: 'stateColor_fault', value: '#B71C1C' }).accepted, true);
 // e-stop: a motor gate's output drops (and resumes on release); coil valves keep their state
