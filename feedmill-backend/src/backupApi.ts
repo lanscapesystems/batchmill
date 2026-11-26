@@ -83,7 +83,7 @@ export function registerBackupRoutes(app: Express, mill: Mill) {
   app.get('/api/v1/backup/download', async (req, res) => {
     const kind = kindOf(req.query.kind);
     if (!kind) { res.status(400).json({ error: 'kind must be db or config' }); return; }
-    const tmp = path.join(DATA_DIR, `.dl-${Date.now()}.tmp`);
+    const tmp = path.join(DATA_DIR, `dl-${Date.now()}.tmp`);
     try {
       await makeBackup(kind, tmp);
       res.download(tmp, `feedmill-${kind}-${stamp()}.${EXT[kind]}`, () => fs.rmSync(tmp, { force: true }));
@@ -147,7 +147,7 @@ export function registerBackupRoutes(app: Express, mill: Mill) {
   app.post('/api/v1/backup/restore-upload', express.raw({ type: '*/*', limit: MAX_BYTES }), (req, res) => {
     const kind = kindOf(req.query.kind);
     if (!kind || !Buffer.isBuffer(req.body) || req.body.length === 0) { res.status(400).json({ error: 'Bad restore request' }); return; }
-    const tmp = path.join(DATA_DIR, `.restore-${Date.now()}.tmp`);
+    const tmp = path.join(DATA_DIR, `restore-${Date.now()}.tmp`);
     fs.writeFileSync(tmp, req.body);
     // on success the process exits before this matters; on failure the temp file is removed
     res.on('finish', () => setTimeout(() => fs.rmSync(tmp, { force: true }), 1000));
