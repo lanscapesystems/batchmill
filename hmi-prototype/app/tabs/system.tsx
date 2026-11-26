@@ -42,6 +42,8 @@ function blockFill(eq: EquipmentItem, backendEq?: BackendEquipment, globalConfig
   if (status === 'warning') return '#e65100';
   if (mode === 'Off' || status === 'disabled') return '#4a148c';
   if (status === 'running') return '#2e7d32';
+  // A gate sitting at P2 reports not_running (P1 reports running): either port is a good, confirmed position.
+  if (eq.equipmentType === 'gate' && (backendEq?.gatePosition === 'open' || backendEq?.gatePosition === 'closed')) return '#2e7d32';
   return '#424242';
 }
 

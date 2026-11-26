@@ -1595,6 +1595,9 @@ export class Mill {
       eq.positionTimerMs = 0;
     }
 
+    // A gate's state is its position. It only counts as running while a motor gate is actually driving an output.
+    if (eq.status !== 'fault' && eq.status !== 'disabled') eq.status = motor && driving ? 'running' : 'not_running';
+
     if (auxSig && driving && !this.ioInputs[auxSig]) {
       eq.faultTimerMs += SCAN_MS;
       if (eq.faultTimerMs >= delayMs(eq.config.starterFaultDelay ?? this.globalConfig.motorStarterFaultDelay, 0.5) && eq.status !== 'fault') {

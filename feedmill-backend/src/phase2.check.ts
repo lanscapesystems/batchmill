@@ -277,7 +277,7 @@ gm.mode = 'Off'; m.equipment.set('GM', gm); m.ioInputs.GM_OL = false; m.ioInputs
 cmd('SetEquipmentMode', 'GM', { mode: 'P1' }); scan(3);
 assert.equal(m.ioOutputs.GM_O, true, 'driving open'); assert.notEqual(gm.status, 'fault');
 m.ioInputs.GM_CL = false; m.ioInputs.GM_OL = true; scan(2);
-assert.equal(m.ioOutputs.GM_O, false, 'output drops once the open limit confirms'); assert.equal(gm.gatePosition, 'open'); assert.equal(gm.status, 'running');
+assert.equal(m.ioOutputs.GM_O, false, 'output drops once the open limit confirms'); assert.equal(gm.gatePosition, 'open'); assert.equal(gm.status, 'not_running');
 m.ioInputs.GM_AUX = false; scan(10); assert.notEqual(gm.status, 'fault', 'no aux expected once the output is off');
 cmd('SetEquipmentMode', 'GM', { mode: 'P2' }); m.ioInputs.GM_OL = false; scan(3);
 assert.equal(m.ioOutputs.GM_C, true, 'driving closed'); assert.notEqual(gm.status, 'fault', 'still inside the fault delay'); scan(6);
