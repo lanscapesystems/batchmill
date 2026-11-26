@@ -392,38 +392,19 @@ function SpeedField({ beq, backend, locked }: { beq: BackendEquipment; backend: 
 // instead to list every rack signal regardless of equipment mapping (used by
 // the Commissioning panel, where nothing may be mapped to equipment yet).
 export function IOSignalList({ equipmentId, backend, showAll, embedded }: { equipmentId?: string; backend: Backend; showAll?: boolean; embedded?: boolean }) {
-  const [confirmSignal, setConfirmSignal] = useState<string | null>(null);
-  const [confirmValue, setConfirmValue] = useState<boolean>(false);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
 
   // Forcing I/O is refused by the backend too: never during a batch, never with a hammermill enabled.
   const blocked = backend.activeBatch && !['COMPLETED', 'FAULTED', 'IDLE'].includes(backend.activeBatch.state) ? 'A batch is in progress'
     : backend.equipment.some(e => e.equipmentType === 'hammermill' && e.enabled) ? 'A hammermill is enabled' : null;
   const signals = showAll ? backend.ioSignals : backend.ioSignals.filter(s => s.equipmentId === equipmentId);
-  const outputs = signals.filter(s => s.direction === 'DO' || s.direction === 'AO');
-  const inputs = signals.filter(s => s.direction === 'DI' || s.direction === 'AI');
 
-  function handleOverrideToggle(sigId: string, currentlyOverridden: boolean, currentVal: boolean | number) {
-    if (currentlyOverridden) {
-      setConfirmSignal(sigId);
-      setConfirmValue(false);
-    } else {
-      setConfirmSignal(sigId);
-      setConfirmValue(!currentVal);
-    }
-  }
-
-  function confirmOverride() {
-    if (!confirmSignal) return;
-    const isOverridden = confirmSignal in backend.ioOverrides;
-    if (isOverridden) {
-      backend.sendCommand('ClearOverride', confirmSignal);
-    } else {
-      backend.sendCommand('SetOverride', confirmSignal, { value: confirmValue });
-    }
-    setConfirmSignal(null);
-  }
+  const force = (id: string, value: boolean | number) => backend.sendCommand('SetOverride', id, { value });
+  const release = (id: string) => backend.sendCommand('ClearOverride', id);
+  const numInput = { background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: '3px', color: 'var(--fg-bright)', padding: '2px 6px', fontFamily: 'inherit', fontSize: '11px', width: '64px' } as const;
 
   const sigRow = (sig: BackendSignal) => {
+    const analog = sig.direction === 'AI' || sig.direction === 'AO';
     const isOutput = sig.direction === 'DO' || sig.direction === 'AO';
     const val = isOutput ? backend.ioOutputs[sig.id] : backend.ioInputs[sig.id];
     const on = !!val;
@@ -431,30 +412,34 @@ export function IOSignalList({ equipmentId, backend, showAll, embedded }: { equi
     // Forcing an output needs commissioning mode — the backend rejects it
     // otherwise. Hide the control rather than show one that always fails.
     const canOverride = !isOutput || backend.commissioningMode || isOverridden;
+    const disabled = !!blocked && !isOverridden && (!!showAll || isOutput);
+    const draft = drafts[sig.id] ?? (typeof backend.ioOverrides[sig.id] === 'number' ? String(backend.ioOverrides[sig.id]) : '0');
+    const n = Number(draft);
+    const validNum = draft.trim() !== '' && Number.isFinite(n);
+    const commit = () => { if (isOverridden && validNum) force(sig.id, n); };
 
     return (
       <div key={sig.id} className="flex items-center gap-2 py-0.5" style={{ fontSize: '11px' }}>
-        <span className="inline-block w-2 h-2 rounded-full flex-shrink-0" style={{ background: on ? 'var(--green)' : 'var(--fg-dim)', opacity: on ? 1 : 0.3 }} />
+        {!analog && <span className="inline-block w-2 h-2 rounded-full flex-shrink-0" style={{ background: on ? 'var(--green)' : 'var(--fg-dim)', opacity: on ? 1 : 0.3 }} />}
         <span style={{ color: 'var(--fg-dim)', width: '42px', flexShrink: 0 }}>{sig.id}</span>
-        <span style={{ color: on ? 'var(--fg-bright)' : 'var(--fg-dim)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <span style={{ color: on || analog ? 'var(--fg-bright)' : 'var(--fg-dim)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {showAll ? (sig.assignment
             ? <span title="Configured as" style={{ color: 'var(--accent)', border: '1px solid var(--border)', borderRadius: '3px', padding: '0 6px' }}>{sig.assignment}</span>
             : <span style={{ color: 'var(--fg-dim)' }}>unassigned</span>) : (sig.assignment ?? sig.port ?? sig.label)}
         </span>
-        <span style={{ color: on ? 'var(--green)' : 'var(--fg-dim)', width: '24px', textAlign: 'right', flexShrink: 0 }}>
-          {typeof val === 'number' ? val : (on ? 'ON' : 'OFF')}
-        </span>
+        {analog && <span style={{ color: 'var(--fg-bright)', minWidth: '48px', textAlign: 'right', flexShrink: 0 }}>{typeof val === 'number' ? val : '—'}</span>}
         {canOverride && (
-          <label style={{ flexShrink: 0, cursor: 'pointer', display: 'flex', alignItems: 'center' }}
-            title={isOverridden ? 'Override active — click to release' : blocked && (showAll || isOutput) ? `Forcing is disabled: ${blocked}` : isOutput ? 'Force this output (commissioning mode)' : 'Override this input'}>
-            <input
-              type="checkbox"
-              checked={isOverridden}
-              disabled={!!blocked && !isOverridden && (!!showAll || isOutput)}
-              onChange={() => handleOverrideToggle(sig.id, isOverridden, on)}
-              style={{ accentColor: 'var(--orange)', width: '12px', height: '12px', cursor: 'pointer' }}
-            />
+          <label style={{ flexShrink: 0, cursor: disabled ? 'not-allowed' : 'pointer', display: 'flex', alignItems: 'center' }}
+            title={isOverridden ? 'Forced — click to release' : disabled ? `Forcing is disabled: ${blocked}` : analog ? 'Force to the entered value' : 'Force on'}>
+            <input type="checkbox" checked={isOverridden} disabled={disabled || (analog && !isOverridden && !validNum)}
+              onChange={() => isOverridden ? release(sig.id) : force(sig.id, analog ? n : true)}
+              style={{ accentColor: 'var(--orange)', width: '12px', height: '12px', cursor: 'pointer' }} />
           </label>
+        )}
+        {analog && canOverride && (
+          <input type="number" aria-label={`Force value for ${sig.id}`} value={draft} style={numInput}
+            onChange={e => setDrafts({ ...drafts, [sig.id]: e.target.value })}
+            onBlur={commit} onKeyDown={e => { if (e.key === 'Enter') commit(); }} />
         )}
       </div>
     );
@@ -462,49 +447,20 @@ export function IOSignalList({ equipmentId, backend, showAll, embedded }: { equi
 
   if (signals.length === 0) return null;
 
+  const sections: [string, string][] = [['DI', 'I'], ['DO', 'O'], ['AI', 'AI'], ['AO', 'AO']];
   return (
-    <>
-      <div style={embedded ? undefined : { borderTop: '1px solid var(--border)', paddingTop: '8px' }}>
- {blocked && (showAll || backend.commissioningMode) && <div className="mb-2" style={{ color: 'var(--orange)', fontSize: '11px' }}>Forcing {showAll ? '' : 'outputs '}is disabled: {blocked.toLowerCase()}. Existing forces can still be released.</div>}
-        <div className="mb-1" style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>{embedded ? 'FORCE OUTPUTS' : 'OUTPUTS'}</div>
-        {outputs.length > 0 ? outputs.map(sigRow) : <div style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>None</div>}
-        <div className="mt-2 mb-1" style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>{embedded ? 'FORCE INPUTS' : 'INPUTS'}</div>
-        {inputs.length > 0 ? inputs.map(sigRow) : <div style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>None</div>}
-      </div>
-
-      {/* Confirmation dialog */}
-      {confirmSignal && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}
-          onClick={() => setConfirmSignal(null)}>
-          <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: '6px', padding: '16px 20px', minWidth: '260px' }}
-            onClick={e => e.stopPropagation()}>
-            <div style={{ color: 'var(--fg-bright)', fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>
-              {confirmSignal in backend.ioOverrides ? 'Release Override' : 'Set Override'}
-            </div>
-            <div style={{ color: 'var(--fg)', fontSize: '12px', marginBottom: '14px' }}>
-              {(() => {
-                const sig = backend.ioSignals.find(s => s.id === confirmSignal);
-                const isOutput = sig?.direction === 'DO' || sig?.direction === 'AO';
-                const normal = isOutput ? 'control logic' : 'the real reading';
-                return confirmSignal in backend.ioOverrides
-                  ? `Release manual override on ${confirmSignal}? Signal will return to ${normal}.`
-                  : `${isOutput ? 'Force' : 'Override'} ${confirmSignal} to ${confirmValue ? 'ON' : 'OFF'}? This bypasses ${normal}${isOutput ? ' — the real output will energize.' : '.'}`;
-              })()}
-            </div>
-            <div className="flex gap-2 justify-end">
-              <button onClick={() => setConfirmSignal(null)}
-                style={{ padding: '5px 14px', borderRadius: '3px', border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--fg)', fontSize: '12px', cursor: 'pointer' }}>
-                Cancel
-              </button>
-              <button onClick={confirmOverride}
-                style={{ padding: '5px 14px', borderRadius: '3px', border: 'none', background: confirmSignal in backend.ioOverrides ? 'var(--green)' : 'var(--orange)', color: '#000', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}>
-                {confirmSignal in backend.ioOverrides ? 'Release' : 'Confirm Override'}
-              </button>
-            </div>
+    <div style={embedded ? undefined : { borderTop: '1px solid var(--border)', paddingTop: '8px' }}>
+      {blocked && (showAll || backend.commissioningMode) && <div className="mb-2" style={{ color: 'var(--orange)', fontSize: '11px' }}>Forcing is disabled: {blocked.toLowerCase()}. Existing forces can still be released.</div>}
+      {sections.map(([dir, title]) => {
+        const rows = signals.filter(s => s.direction === dir);
+        return rows.length === 0 ? null : (
+          <div key={dir} className="mb-2">
+            <div className="mb-1" style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>{title}</div>
+            {rows.map(sigRow)}
           </div>
-        </div>
-      )}
-    </>
+        );
+      })}
+    </div>
   );
 }
 
@@ -514,9 +470,9 @@ const stepBtn = { ...ghostBtn, width: '26px', height: '26px', fontSize: '14px', 
 
 // The input kinds a device can bypass (backend BYPASSABLE) and how the sidebar names them.
 const BYPASS_LABELS: Record<string, string> = {
-  runConfirmAux: 'Starter aux feedback', vfdAuxInput: 'VFD aux feedback', motorAuxInput: 'Motor starter aux feedback', analogLoadInput: 'Load sensor',
+  runConfirmAux: 'MS Aux', vfdAuxInput: 'VFD Aux', motorAuxInput: 'MS Aux', analogLoadInput: 'Load sensor',
   rotationPulseInput: 'Rotation sensor', openLimitInput: 'P1 limit switch', closedLimitInput: 'P2 limit switch',
-  highLevelInput: 'High level switch', lowLevelInput: 'Low level switch', fullSensor: 'Full sensor', lowSensor: 'Low sensor',
+  highLevelInput: 'High Switch', lowLevelInput: 'Low Switch',
 };
 const bypassKeys = (beq: BackendEquipment) =>
   Object.keys(BYPASS_LABELS).filter(k => !!beq.config[k] && (k !== 'vfdAuxInput' || !!beq.config.masterVfd) && (k !== 'motorAuxInput' || !!beq.config.motorGate));
@@ -525,12 +481,10 @@ const activeBypasses = (beq: BackendEquipment) => bypassKeys(beq).filter(k => be
 // Bottom of the sidebar: every bypass this device offers. A bypassed input is ignored as if it were not wired.
 function OverridesPanel({ beq, backend }: { beq: BackendEquipment; backend: Backend }) {
   const keys = bypassKeys(beq);
-  const hasSignals = backend.ioSignals.some(s => s.equipmentId === beq.id);
-  if (keys.length === 0 && !hasSignals) return null;
+  if (keys.length === 0) return null;
   return (
     <div className="flex flex-col gap-2" style={{ borderTop: '1px solid var(--border)', paddingTop: '8px' }}>
       <div style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>OVERRIDES</div>
-      {keys.length > 0 && <div style={{ color: 'var(--fg-dim)', fontSize: '11px', fontWeight: 500 }}>BYPASS INPUTS</div>}
       {keys.map(k => {
         const on = beq.config[`bypass_${k}`] === true;
         return (
@@ -541,8 +495,7 @@ function OverridesPanel({ beq, backend }: { beq: BackendEquipment; backend: Back
           </label>
         );
       })}
-      {keys.length > 0 && <div style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>A bypassed input is ignored as if it were not wired: its faults and trips are off until you clear the box.</div>}
-      {hasSignals && <IOSignalList equipmentId={beq.id} backend={backend} embedded />}
+      <div style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>A bypassed input is ignored as if it were not wired: its faults and trips are off until you clear the box.</div>
     </div>
   );
 }

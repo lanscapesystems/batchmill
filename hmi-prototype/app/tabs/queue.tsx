@@ -98,7 +98,7 @@ export function QueueTab() {
     ? (backend.activeBatch ? backendToQueueEntry(backend.activeBatch) : null)
     : queueData.find(q => RUNNING_STATES.has(q.state)) ?? null;
 
-  // Bin full: the backend's level state for the destination (its fullSensor input is active)
+  // Bin full: the backend's level state for the destination (its highLevelInput is active)
   const batchDestBinFull = !!activeBatchEntry && allBins.find(b => b.id === activeBatchEntry.destination)?.levelSwitchState === 'full';
 
   const hasActiveBatch = !!activeBatchEntry;

@@ -31,7 +31,7 @@ const delayMs = (sec: unknown, fallbackSec = 0) => Math.max(0, Number(sec ?? fal
 const EDITABLE_STATES = new Set(['IDLE', 'READY']);
 // Per-device input bypasses ("Overrides" in the sidebar): the input is ignored as if it were not assigned.
 const BYPASSABLE = ['runConfirmAux', 'vfdAuxInput', 'motorAuxInput', 'analogLoadInput', 'rotationPulseInput', 'openLimitInput', 'closedLimitInput',
-  'highLevelInput', 'lowLevelInput', 'fullSensor', 'lowSensor'];
+  'highLevelInput', 'lowLevelInput'];
 // Faults that latch their equipment in 'fault' until reset (restored on boot if the equipment state was lost).
 const TRIP_CODES = ['E-MT-01', 'E-MT-02', 'E-MT-03', 'E-LD-01', 'E-LD-03', 'E-GT-01', 'E-GT-03', 'W-GT-02'];
 type LoadMon = { avgSize: number; avg: MovingAverage; hiWarn: OnDelay; hiPause: OnDelay; pid: LoadPid; tuner?: RelayTuner; tuneBase?: number; tuneWasAuto?: boolean };
@@ -47,12 +47,18 @@ interface Refill {
 }
 
 const PORT_LABELS: Record<string, string> = {
-  runOutput: 'Run', runConfirmAux: 'Run FB', openOutput: 'P1', closeOutput: 'P2',
+  runOutput: 'MS Coil', runConfirmAux: 'MS Aux', openOutput: 'P1', closeOutput: 'P2',
   openLimitInput: 'P1 FB', closedLimitInput: 'P2 FB',
-  highLevelInput: 'High Level', lowLevelInput: 'Low Level', fullSensor: 'Full', lowSensor: 'Low',
+  highLevelInput: 'High Switch', lowLevelInput: 'Low Switch',
   analogSpeedOutput: 'Speed', analogLoadInput: 'Load', rotationPulseInput: 'Rotation',
-  vfdRunOutput: 'VFD Run', vfdAuxInput: 'VFD Aux', motorAuxInput: 'Motor Aux',
+  vfdRunOutput: 'VFD Fwd', vfdAuxInput: 'VFD Aux', motorAuxInput: 'MS Aux',
 };
+
+// Hammermills have no rotation switch: drop its keys wherever a hammermill's config enters (load, add, update).
+const HM_NO_ROTATION = ['rotationPulseInput', 'pulsesPerRev', 'minRpm', 'rotationStartupDelay', 'bypass_rotationPulseInput'];
+function stripHammermillRotation(eq: EquipmentRuntime) {
+  if (eq.equipmentType === 'hammermill') for (const k of HM_NO_ROTATION) delete eq.config[k];
+}
 
 export class Mill {
   equipment = new Map<string, EquipmentRuntime>();
@@ -195,6 +201,12 @@ export class Mill {
     for (const eq of cfg.equipment) {
       // saved equipment is the whole runtime object: drop pre-request-bit fields and start with no run request
       for (const k of ['commanded', 'stopping', 'stopDelayTimerMs']) delete (eq as unknown as Record<string, unknown>)[k];
+      // finished bins used to name their level switches fullSensor/lowSensor; same device as a bin's, same keys now
+      for (const [o, n] of [['fullSensor', 'highLevelInput'], ['fullSensorCovered', 'highLevelCovered'], ['bypass_fullSensor', 'bypass_highLevelInput'],
+                            ['lowSensor', 'lowLevelInput'], ['lowSensorCovered', 'lowLevelCovered'], ['bypass_lowSensor', 'bypass_lowLevelInput']]) {
+        if (o in eq.config) { if (!(n in eq.config)) eq.config[n] = eq.config[o]; delete eq.config[o]; }
+      }
+      stripHammermillRotation(eq);
       Object.assign(eq, { request: false, runCmd: false, startTimerMs: 0, stopTimerMs: 0, loadControlAuto: false });
       this.equipment.set(eq.id, eq);
     }
@@ -714,6 +726,7 @@ export class Mill {
           mode: 'Auto', status: 'not_running', request: false, runCmd: false, feedback: false,
           config: p.config ?? {}, faultTimerMs: 0, positionTimerMs: 0, startTimerMs: 0, stopTimerMs: 0,
         };
+        stripHammermillRotation(eq);
         if (p.equipmentType === 'hammermill') this.pauseHammermill(eq);
         this.equipment.set(id, eq);
         if (p.equipmentType === 'bin' || p.equipmentType === 'finished_bin') {
@@ -749,7 +762,7 @@ export class Mill {
         if (renaming && this.equipment.has(p.newId!)) return reject('ID already in use');
         if (renaming && eq.owner) return reject('Cannot rename owned equipment');
         if (p.name !== undefined) eq.name = p.name;
-        if (p.config !== undefined) eq.config = { ...eq.config, ...p.config };
+        if (p.config !== undefined) { eq.config = { ...eq.config, ...p.config }; stripHammermillRotation(eq); }
         if (renaming && p.newId) {
           const oldId = eq.id;
           eq.id = p.newId;
@@ -1872,12 +1885,11 @@ export class Mill {
 
   // The high and low switch of a bin: input, "high/low = covered" key, and delay key (seconds) in the equipment config.
   private levelSwitches(eq: EquipmentRuntime) {
-    const fin = eq.equipmentType === 'finished_bin';
     const c = eq.config;
     const pick = (k: string) => (this.byp(eq, k) ? undefined : c[k] as string | undefined);
     return {
-      hi: { input: pick(fin ? 'fullSensor' : 'highLevelInput'), covered: fin ? 'fullSensorCovered' : 'highLevelCovered', delay: 'binFullStopDelay' },
-      lo: { input: pick(fin ? 'lowSensor' : 'lowLevelInput'), covered: fin ? 'lowSensorCovered' : 'lowLevelCovered', delay: 'binLowRestartDelay' },
+      hi: { input: pick('highLevelInput'), covered: 'highLevelCovered', delay: 'binFullStopDelay' },
+      lo: { input: pick('lowLevelInput'), covered: 'lowLevelCovered', delay: 'binLowRestartDelay' },
     };
   }
 

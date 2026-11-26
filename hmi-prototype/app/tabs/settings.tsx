@@ -724,8 +724,8 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
 
   const motorFields = (opts: { rotation?: boolean; load?: boolean; delays?: boolean }) => (
     <>
-      {row('Run Output', ioSel(ioPools.do, 'runOutput'))}
-      {row('Run Confirmation Aux', ioSel(ioPools.di, 'runConfirmAux'))}
+      {row('MS Coil', ioSel(ioPools.do, 'runOutput'))}
+      {row('MS Aux', ioSel(ioPools.di, 'runConfirmAux'))}
       {opts.rotation !== false && <>
         {row('Rotation Pulse Input', ioSel(ioPools.di, 'rotationPulseInput'))}
         {v('rotationPulseInput') && <>
@@ -764,11 +764,11 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
       const augerHasAnalog = !!(connectedAuger?.config.analogSpeedOutput);
       return <>
         {row('Capacity', numIn('capacity', 0, 'lbs'))}
-        {row('High Level Input', ioSel(ioPools.di, 'highLevelInput'))}
-        {v('highLevelInput') && row('High Level Polarity', coveredSel('highLevelCovered'))}
+        {row('High Switch', ioSel(ioPools.di, 'highLevelInput'))}
+        {v('highLevelInput') && row('High Switch Polarity', coveredSel('highLevelCovered'))}
         {v('highLevelInput') && row('Bin Full Stop Delay', numIn('binFullStopDelay', 0, 's', 0.1))}
-        {row('Low Level Input', ioSel(ioPools.di, 'lowLevelInput'))}
-        {v('lowLevelInput') && row('Low Level Polarity', coveredSel('lowLevelCovered'))}
+        {row('Low Switch', ioSel(ioPools.di, 'lowLevelInput'))}
+        {v('lowLevelInput') && row('Low Switch Polarity', coveredSel('lowLevelCovered'))}
         {v('lowLevelInput') && row('Bin Low Restart Delay', numIn('binLowRestartDelay', 0, 's', 0.1))}
         {row('Freefall', numIn('freefall', 0, 'lbs'))}
         {augerHasAnalog && <>
@@ -783,7 +783,7 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
         {motorFields({ rotation: true, load: true, delays: true })}
         {row('Master VFD', check('masterVfd', 'Master VFD'))}
         {v('masterVfd') && <>
-          {row('VFD Run Output', ioSel(ioPools.do, 'vfdRunOutput'))}
+          {row('VFD Fwd', ioSel(ioPools.do, 'vfdRunOutput'))}
           {row('VFD Aux Input', ioSel(ioPools.di, 'vfdAuxInput'))}
           {row('VFD Start Delay', numIn('vfdStartDelay', 0.7, 's', 0.1))}
         </>}
@@ -818,7 +818,7 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
             </select>
           : <span style={{ color: destVal ? 'var(--fg-bright)' : 'var(--fg-dim)', fontSize: '12px' }}>{destVal || 'Not Assigned'}</span>
         )}
-        {motorFields({ rotation: true, load: true, delays: true })}
+        {motorFields({ rotation: false, load: true, delays: true })}
         {v('analogLoadInput') && <>
           {row('Load Control Feeder', ioSel((allEquipment ?? []).filter(e => e.config.analogSpeedOutput).map(e => e.id), 'loadControlFeeder'))}
         </>}
@@ -830,8 +830,8 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
     case 'mixer':
       return <>
         {row('Capacity', numIn('capacity', 4000, 'lbs'))}
-        {row('Run Output', ioSel(ioPools.do, 'runOutput'))}
-        {row('Run Confirmation Aux', ioSel(ioPools.di, 'runConfirmAux'))}
+        {row('MS Coil', ioSel(ioPools.do, 'runOutput'))}
+        {row('MS Aux', ioSel(ioPools.di, 'runConfirmAux'))}
         {row('Analog Load Input', ioSel(ioPools.ai, 'analogLoadInput'))}
         {v('analogLoadInput') && <>
           {row('Min Amps', numIn('minAmps', 0, 'A'))}
@@ -843,8 +843,8 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
 
     case 'micro_drag':
       return <>
-        {row('Run Output', ioSel(ioPools.do, 'runOutput'))}
-        {row('Run Confirmation Aux', ioSel(ioPools.di, 'runConfirmAux'))}
+        {row('MS Coil', ioSel(ioPools.do, 'runOutput'))}
+        {row('MS Aux', ioSel(ioPools.di, 'runConfirmAux'))}
         {row('Start Delay', numIn('startDelay', 0, 's', 0.1))}
         {row('Stop Delay', numIn('stopDelay', 0, 's', 0.1))}
         {row('Timer Based Dosing', check('timerBasedDosing', 'Timer Based Dosing'))}
@@ -864,7 +864,7 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
         {row('P1 Output', ioSel(ioPools.do, 'openOutput'))}
         {v('actuatorType') === 'dual' && row('P2 Output', ioSel(ioPools.do, 'closeOutput'))}
         {v('actuatorType') === 'dual' && row('Motor Gate', check('motorGate', 'Motor Gate (output drops once the limit switch confirms)'))}
-        {v('actuatorType') === 'dual' && v('motorGate') && row('Motor Starter Aux Input', ioSel(ioPools.di, 'motorAuxInput'))}
+        {v('actuatorType') === 'dual' && v('motorGate') && row('MS Aux', ioSel(ioPools.di, 'motorAuxInput'))}
         {row('P1 Limit Input', ioSel(ioPools.di, 'openLimitInput'))}
         {row('P2 Limit Input', ioSel(ioPools.di, 'closedLimitInput'))}
         {row('Position Timeout', numIn('positionTimeout', 5, 's', 0.1))}
@@ -879,12 +879,12 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
         {row('Capacity', numIn('capacity', 10000, 'lbs'))}
         {row('Scale Input', check('scaleInput', 'Scale Input'))}
         {v('scaleInput') && row('Scale', scaleSel('scaleId', scaleConfigs))}
-        {row('Full Sensor', ioSel(ioPools.di, 'fullSensor'))}
-        {v('fullSensor') && row('Full Sensor Polarity', coveredSel('fullSensorCovered'))}
-        {v('fullSensor') && row('Bin Full Stop Delay', numIn('binFullStopDelay', 0, 's', 0.1))}
-        {row('Low Sensor', ioSel(ioPools.di, 'lowSensor'))}
-        {v('lowSensor') && row('Low Sensor Polarity', coveredSel('lowSensorCovered'))}
-        {v('lowSensor') && row('Bin Low Restart Delay', numIn('binLowRestartDelay', 0, 's', 0.1))}
+        {row('High Switch', ioSel(ioPools.di, 'highLevelInput'))}
+        {v('highLevelInput') && row('High Switch Polarity', coveredSel('highLevelCovered'))}
+        {v('highLevelInput') && row('Bin Full Stop Delay', numIn('binFullStopDelay', 0, 's', 0.1))}
+        {row('Low Switch', ioSel(ioPools.di, 'lowLevelInput'))}
+        {v('lowLevelInput') && row('Low Switch Polarity', coveredSel('lowLevelCovered'))}
+        {v('lowLevelInput') && row('Bin Low Restart Delay', numIn('binLowRestartDelay', 0, 's', 0.1))}
       </>;
 
     default:
@@ -900,6 +900,7 @@ function IOSection() {
   const [scaleDraft, setScaleDraft] = useState<BackendScaleConfig>({ id: '', name: '', connectionType: 'serial', protocol: '', comPort: '', baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, rackSlot: 0, zeroOffset: 0, ratedMvV: 2.0, capacity: 5000, resolution: 1, freshnessTimeout: 5000, stabilityWindow: 500 });
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [commissioningOpen, setCommissioningOpen] = useState(false);
+  const [confirmCommissioning, setConfirmCommissioning] = useState<boolean | null>(null);
   const [calOpen, setCalOpen] = useState(false);
   const [calStep, setCalStep] = useState<'zero' | 'span'>('zero');
   const [calMode, setCalMode] = useState<'theoretical' | 'span'>('theoretical');
@@ -1472,7 +1473,7 @@ function IOSection() {
         {commissioningOpen && (
           <div className="px-4 py-3 flex flex-col gap-2" style={{ fontSize: '12px' }}>
             <label className="flex items-center gap-2 cursor-pointer" style={{ color: 'var(--fg-bright)' }}>
-              <input type="checkbox" checked={commissioningMode} onChange={e => toggleCommissioningMode(e.target.checked)}
+              <input type="checkbox" checked={commissioningMode} onChange={e => setConfirmCommissioning(e.target.checked)}
                 style={{ accentColor: 'var(--orange)' }} />
               Enable Commissioning Mode
             </label>
@@ -1485,6 +1486,28 @@ function IOSection() {
           </div>
         )}
       </div>
+
+      {/* Commissioning mode confirmation */}
+      {confirmCommissioning !== null && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}
+          onClick={() => setConfirmCommissioning(null)}>
+          <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: '6px', padding: '16px 20px', minWidth: '280px', maxWidth: '420px' }}
+            onClick={e => e.stopPropagation()}>
+            <div style={{ color: 'var(--fg-bright)', fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>{confirmCommissioning ? 'Enable Commissioning Mode' : 'Disable Commissioning Mode'}</div>
+            <div style={{ color: 'var(--fg)', fontSize: '12px', marginBottom: '14px' }}>
+              {confirmCommissioning
+                ? 'Outputs can be forced directly, bypassing control logic. Real outputs will energize.'
+                : 'Any forced outputs will be released.'}
+            </div>
+            <div className="flex gap-2 justify-end">
+              <button onClick={() => setConfirmCommissioning(null)}
+                style={{ padding: '5px 14px', borderRadius: '3px', border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--fg)', fontSize: '12px', cursor: 'pointer' }}>Cancel</button>
+              <button onClick={() => { toggleCommissioningMode(confirmCommissioning); setConfirmCommissioning(null); }}
+                style={{ padding: '5px 14px', borderRadius: '3px', border: 'none', background: confirmCommissioning ? 'var(--orange)' : 'var(--accent)', color: '#000', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}>{confirmCommissioning ? 'Enable' : 'Disable'}</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Read Rack confirmation */}
       {confirmReadRack && (
