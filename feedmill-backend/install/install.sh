@@ -219,8 +219,8 @@ NODE_MAJOR="$(node -v | sed 's/^v//' | cut -d. -f1)"
 # loop and real I/O. (Server not reachable = nothing running = fine.)
 if [[ "${FORCE:-0}" != 1 ]] && STATE_JSON="$(curl -fsS -m 3 http://127.0.0.1:3001/api/v1/state 2>/dev/null)"; then
   node -e 'const s=JSON.parse(require("fs").readFileSync(0,"utf8"));
-    process.exit(s.activeBatch||(s.equipment||[]).some(e=>e.status==="running")?1:0)' <<<"$STATE_JSON" \
-    || die "a batch is active or equipment is running — stop it first (or FORCE=1)"
+    process.exit((s.activeBatch&&!["PAUSED","COMPLETED","FAULTED","IDLE"].includes(s.activeBatch.state))||(s.equipment||[]).some(e=>e.status==="running")?1:0)' <<<"$STATE_JSON" \
+    || die "a batch is in progress (not paused) or equipment is running — stop it first (or FORCE=1)"
 fi
 
 # ---- 2. IgH EtherCAT Master (generic driver — works on any NIC) -------
