@@ -205,6 +205,7 @@ export interface StateSnapshot {
   // needs to bypass control logic, which normal operation must never allow.
   commissioningMode: boolean;
   horn: { on: boolean; silenced: boolean };
+  queueControl: { held: boolean; waiting?: string }; // held = no new batches are released
 }
 
 export interface QueueSnapshot {

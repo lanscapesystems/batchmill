@@ -115,6 +115,10 @@ export class Mill {
   // 1 Hz load trend per motor, last 10 minutes (served by GET /api/v1/trend/:id, not pushed in the snapshot)
   private trends = new Map<string, { t: number; a: number; s?: number; sp?: number }[]>();
   private trendTicks = 0;
+  // Queue hold: stops NEW batches being released (the active one is never interrupted). Not persisted, so the queue
+  // always comes up on hold after a restart or power loss and nothing starts unattended after an outage.
+  private queueHeld = true;
+  private queueWait: string | undefined;
   // Alarm horn (PLC R137-R143): beeps while any fault is active, a silence (HMI or input) toggles it, a NEW fault re-arms it,
   // and it silences itself after hornAutoSilenceSec.
   private hornSilenced = false;
@@ -335,16 +339,11 @@ export class Mill {
         return ok('Queued as batch ' + id);
       }
 
-      case 'StartBatch': {
-        const batch = this.queue.find(b => b.id === cmd.targetId && (b.state === 'IDLE' || b.state === 'READY'));
-        if (!batch) return reject('Batch not found or not startable');
-        if (this.activeBatch) return reject('Another batch is active');
-        if (!this.estopOk()) return reject('E-stop active'); if (this.outputForcesActive()) return reject('Clear the forced outputs first');
-        batch.state = 'VALIDATING';
-        batch.startedAt = new Date().toISOString();
-        this.activeBatch = batch;
-        persistBatch(batch);
-        return ok();
+      // The queue is live (no Start button): releaseQueue() starts the next batch whenever the queue is running.
+      case 'SetQueueHold': {
+        if (typeof cmd.parameters?.held !== 'boolean') return reject('held must be true or false');
+        this.queueHeld = cmd.parameters.held;
+        return ok(this.queueHeld ? 'Queue on hold' : 'Queue running');
       }
 
       case 'PauseBatch': {
@@ -576,9 +575,7 @@ export class Mill {
         const isOutput = sigDef?.direction === 'DO' || sigDef?.direction === 'AO';
         const blocked = isOutput ? this.forceBlockedReason() : null;
         if (blocked) return reject(`Cannot force an output: ${blocked}`);
-        if (isOutput && !this.commissioningMode) {
-          return reject('Enable commissioning mode to force an output');
-        }
+        if (!this.commissioningMode) return reject('Enable commissioning mode to force I/O');
         this.ioOverrides[sig] = val as SignalValue;
         return ok();
       }
@@ -596,14 +593,7 @@ export class Mill {
         const en = cmd.parameters?.enabled;
         if (typeof en !== 'boolean') return reject('Missing enabled');
         this.commissioningMode = en;
-        if (!en) {
-          // Leaving commissioning mode drops any forced outputs rather than
-          // leaving an actuator stuck at whatever it was forced to.
-          for (const id of Object.keys(this.ioOverrides)) {
-            const sigDef = this.signals.find(s => s.id === id);
-            if (sigDef?.direction === 'DO' || sigDef?.direction === 'AO') delete this.ioOverrides[id];
-          }
-        }
+        if (!en) this.ioOverrides = {}; // leaving commissioning mode drops every force (inputs and outputs)
         return ok();
       }
 
@@ -1007,6 +997,7 @@ export class Mill {
     this.updateRotationSensors(ioState);
     this.updateLoadControl();
     this.applyAugerSpeeds();
+    this.releaseQueue();
     this.advanceBatch();
     this.sampleTrends();
     this.updateHorn();
@@ -1626,6 +1617,20 @@ export class Mill {
     return undefined;
   }
 
+  // Live queue: with the queue running and no active batch, the first waiting batch starts by itself.
+  private releaseQueue() {
+    this.queueWait = undefined;
+    if (this.queueHeld || this.activeBatch) return;
+    const batch = this.queue.find(b => b.state === 'IDLE' || b.state === 'READY');
+    if (!batch) return;
+    if (!this.estopOk()) { this.queueWait = 'E-stop active'; return; }
+    if (this.outputForcesActive()) { this.queueWait = 'Forced outputs are active'; return; }
+    batch.state = 'VALIDATING';
+    batch.startedAt = new Date().toISOString();
+    this.activeBatch = batch;
+    persistBatch(batch);
+  }
+
   // PLC HOA: a sequence only drives equipment that is in Auto; anything else holds the batch with a reason (nothing is claimed).
   private batchHold(b: BatchRuntime): string | null {
     const need: (EquipmentRuntime | undefined)[] = [];
@@ -2195,6 +2200,7 @@ export class Mill {
       networkInterfaces: this.networkInterfaces,
       commissioningMode: this.commissioningMode,
       horn: { on: this.hornOn, silenced: this.hornSilenced },
+      queueControl: { held: this.queueHeld, waiting: this.queueWait },
     };
   }
 

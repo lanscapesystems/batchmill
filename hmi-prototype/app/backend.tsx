@@ -147,6 +147,7 @@ interface BackendState {
   networkInterfaces: string[];
   commissioningMode: boolean;
   horn: { on: boolean; silenced: boolean };
+  queueControl: { held: boolean; waiting?: string };
   sendCommand: (action: string, targetId?: string, parameters?: Record<string, unknown>) => Promise<CommandResult>;
 }
 
@@ -164,6 +165,7 @@ const EMPTY_DATA: SnapshotData = {
   networkInterfaces: [],
   commissioningMode: false,
   horn: { on: false, silenced: false },
+  queueControl: { held: true },
 };
 
 function parseSnapshot(d: Record<string, any>): SnapshotData { // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -187,6 +189,7 @@ function parseSnapshot(d: Record<string, any>): SnapshotData { // eslint-disable
     networkInterfaces: d.networkInterfaces ?? [],
     commissioningMode: d.commissioningMode ?? false,
     horn: d.horn ?? { on: false, silenced: false },
+    queueControl: d.queueControl ?? { held: true },
   };
 }
 

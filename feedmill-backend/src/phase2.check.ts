@@ -125,13 +125,14 @@ for (const f of m.faults) f.active = false; scan(10); assert.equal(m.ioOutputs.H
 m.signals.push({ id: 'OUT_X', direction: 'DO', label: 'x' }); m.commissioningMode = true;
 m.activeBatch = { state: 'DOSING' };
 assert.equal(cmd('SetOverride', 'OUT_X', { value: true }).accepted, false, 'batch in progress');
-assert.equal(cmd('SetOverride', 'SOME_IN', { value: true }).accepted, true, 'input override is not guarded'); cmd('ClearOverride', 'SOME_IN');
+assert.equal(cmd('SetOverride', 'SOME_IN', { value: true }).accepted, true, 'input override allowed in commissioning mode'); cmd('ClearOverride', 'SOME_IN');
 m.activeBatch = null;
 hm.enabled = true; assert.equal(cmd('SetOverride', 'OUT_X', { value: true }).accepted, false, 'hammermill enabled'); hm.enabled = false;
 assert.equal(cmd('SetOverride', 'OUT_X', { value: true }).accepted, true);
 assert.equal(cmd('SetHammermillEnabled', 'HM-1', { enabled: true }).accepted, false, 'forced output active');
 cmd('SetOverride', 'SOME_IN', { value: true }); assert.equal(m.outputForcesActive(), true);
 cmd('ClearOverride', 'OUT_X'); assert.equal(m.outputForcesActive(), false, 'an input override does not count'); cmd('ClearOverride', 'SOME_IN');
+cmd('SetOverride', 'SOME_IN', { value: true }); cmd('SetCommissioningMode', undefined, { enabled: false }); assert.deepEqual(m.ioOverrides, {}, 'disabling commissioning drops every force'); assert.equal(cmd('SetOverride', 'SOME_IN', { value: true }).accepted, false, 'no input force outside commissioning'); cmd('SetCommissioningMode', undefined, { enabled: true });
 m.commissioningMode = false;
 
 // master VFD, sequenced like the PLC's micros VFD: starter first, VFD 0.7 s after the starter is confirmed, drops with the

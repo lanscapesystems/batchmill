@@ -102,6 +102,8 @@ export function QueueTab() {
   const batchDestBinFull = !!activeBatchEntry && allBins.find(b => b.id === activeBatchEntry.destination)?.levelSwitchState === 'full';
 
   const hasActiveBatch = !!activeBatchEntry;
+  const queueHeld = backend?.queueControl.held ?? true;
+  const queueWaiting = backend?.queueControl.waiting;
   const TERMINAL = new Set(['COMPLETED', 'FAULTED']);
   const active = queueData.filter(q => !TERMINAL.has(q.state));
   const history = queueData.filter(q => TERMINAL.has(q.state));
@@ -245,8 +247,23 @@ export function QueueTab() {
 
       {/* Queue */}
       <Panel title="QUEUE" action={
-        <button onClick={() => setNewBatchOpen(true)}
-          style={{ ...btnBase, padding: '4px 10px', background: 'var(--accent)', color: '#000' }}>+ New Batch</button>
+        <div className="flex items-center gap-2">
+          {backend?.connected && (
+            <span style={{ fontSize: '11px', color: queueHeld ? 'var(--orange)' : queueWaiting ? 'var(--orange)' : 'var(--fg-dim)' }}>
+              {queueHeld ? 'Queue on hold' : queueWaiting ? `Waiting: ${queueWaiting}` : 'Queue running'}
+            </span>
+          )}
+          {backend?.connected && (
+            <button onClick={() => backend.sendCommand('SetQueueHold', undefined, { held: !queueHeld })}
+              style={queueHeld
+                ? { ...btnBase, padding: '4px 10px', background: 'var(--accent)', color: '#000' }
+                : { ...btnBase, padding: '4px 10px', background: 'transparent', border: '1px solid var(--border)', color: 'var(--fg-dim)' }}>
+              {queueHeld ? 'Run Queue' : 'Hold Queue'}
+            </button>
+          )}
+          <button onClick={() => setNewBatchOpen(true)}
+            style={{ ...btnBase, padding: '4px 10px', background: 'var(--accent)', color: '#000' }}>+ New Batch</button>
+        </div>
       }>
         <table className="w-full" style={{ borderCollapse: 'collapse' }}>
           <thead>
@@ -264,8 +281,6 @@ export function QueueTab() {
               <BatchRow key={`${q.id}-${i}`} entry={q} expanded={expanded === q.id}
                 onToggle={() => setExpanded(expanded === q.id ? null : q.id)}
                 onEdit={EDITABLE_STATES.has(q.state) ? () => setEditBatchId(q.id) : undefined}
-                onStart={q.state === 'IDLE' && !hasActiveBatch && backend?.connected
-                  ? () => backend.sendCommand('StartBatch', q.id) : undefined}
                 ingredients={ingredients} />
             ))}
             {active.length === 0 && (
@@ -335,8 +350,8 @@ export function QueueTab() {
   );
 }
 
-function BatchRow({ entry: q, expanded, onToggle, onEdit, onStart, ingredients }: {
-  entry: QueueEntry; expanded: boolean; onToggle: () => void; onEdit?: () => void; onStart?: () => void; ingredients: { id: string; name: string }[];
+function BatchRow({ entry: q, expanded, onToggle, onEdit, ingredients }: {
+  entry: QueueEntry; expanded: boolean; onToggle: () => void; onEdit?: () => void; ingredients: { id: string; name: string }[];
 }) {
   return (
     <>
@@ -359,14 +374,8 @@ function BatchRow({ entry: q, expanded, onToggle, onEdit, onStart, ingredients }
       {expanded && (
         <tr style={{ background: 'var(--bg-row)' }}>
           <td colSpan={7} className="px-6 py-2">
-            {(onEdit || onStart) && (
+            {onEdit && (
               <div className="flex justify-end gap-2 mb-2">
-                {onStart && (
-                  <button onClick={(e) => { e.stopPropagation(); onStart(); }}
-                    style={{ ...btnBase, padding: '2px 10px', fontSize: '11px', background: 'var(--accent)', color: '#000' }}>
-                    Start
-                  </button>
-                )}
                 {onEdit && (
                   <button onClick={(e) => { e.stopPropagation(); onEdit(); }}
                     style={{ background: 'transparent', border: '1px solid var(--border)', borderRadius: '3px', color: 'var(--fg-dim)', cursor: 'pointer', padding: '2px 8px', fontSize: '11px' }}>

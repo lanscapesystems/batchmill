@@ -430,9 +430,8 @@ export function IOSignalList({ equipmentId, backend, showAll, embedded }: { equi
     const val = isOutput ? backend.ioOutputs[sig.id] : backend.ioInputs[sig.id];
     const on = !!val;
     const isOverridden = sig.id in backend.ioOverrides;
-    // Forcing an output needs commissioning mode — the backend rejects it
-    // otherwise. Hide the control rather than show one that always fails.
-    const canOverride = !isOutput || backend.commissioningMode || isOverridden;
+    // Every force needs commissioning mode (and is dropped when it is turned off) — hide the control rather than show one that always fails.
+    const canOverride = backend.commissioningMode;
     const disabled = !!blocked && !isOverridden && (!!showAll || isOutput);
     const draft = drafts[sig.id] ?? (typeof backend.ioOverrides[sig.id] === 'number' ? String(backend.ioOverrides[sig.id]) : '0');
     const n = Number(draft);
