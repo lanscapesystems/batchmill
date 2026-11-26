@@ -122,6 +122,8 @@ function getRackPdoEntries(position: number): PdoEntry[] {
 const NX_CARD_IDENTS: Record<string, number> = {
   'NX-OD5256': 0x00135256,
   'NX-ID5442': 0x00115442,
+  'NX-RS1201': 0x00251201,
+  'NX-AD3203': 0x00213203,
 };
 
 // shortcut: `ethercat upload`'s exact output format for a uint32 SDO
@@ -297,8 +299,8 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
   if (master.linkUp === false) {
     warnings.push(`EtherCAT link down on ${om.ethercatInterface || 'the configured NIC'}`);
   }
-  if (master.phase && !/op\b/i.test(master.phase)) {
-    warnings.push(`EtherCAT master phase is "${master.phase}", not Operational`);
+  if (master.phase && !/^op/i.test(master.phase)) {
+    warnings.push(`EtherCAT master phase is "${master.phase}", not Operation`);
   }
 
   const slaves = listSlaves();

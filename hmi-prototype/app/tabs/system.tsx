@@ -234,14 +234,17 @@ export function SystemTab() {
         return (
         <div style={{ width: '300px', position: 'absolute', top: 0, right: 0, bottom: 0, background: 'var(--bg-panel)', borderLeft: '1px solid var(--border)', display: 'flex', flexDirection: 'column', overflow: 'auto', zIndex: 10 }}>
           <div className="px-3 py-2.5 flex items-center justify-between" style={{ borderBottom: '1px solid var(--border)' }}>
-            <span style={{ color: 'var(--fg-bright)', fontSize: '13px', fontWeight: 700 }}>{selectedItem.id}</span>
+            <span className="flex items-center gap-2" style={{ minWidth: 0 }}>
+              <span style={{ color: 'var(--fg-bright)', fontSize: '13px', fontWeight: 700, flexShrink: 0 }}>{selectedItem.id}</span>
+              <span style={{ width: '1px', alignSelf: 'stretch', background: 'var(--border)', flexShrink: 0 }} />
+              <span style={{ color: 'var(--fg-dim)', fontSize: '13px', fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{beq?.name ?? selectedItem.name}</span>
+            </span>
             <button onClick={() => setSelectedEq(null)} style={{ color: 'var(--fg-dim)', background: 'transparent', border: 'none', cursor: 'pointer', fontSize: '16px', lineHeight: '1' }}>✕</button>
           </div>
 
           <div className="px-3 py-3 flex flex-col gap-3" style={{ fontSize: '12px' }}>
             {/* Name & Type */}
             <div>
-              <div style={{ color: 'var(--fg-bright)', fontWeight: 500 }}>{beq?.name ?? selectedItem.name}</div>
               {selectedItem.equipmentType === 'gate'
                 // what P1 / P2 do is set by the flow path: each outlet and the equipment it feeds
                 ? [1, 2].map(p => {
@@ -259,12 +262,21 @@ export function SystemTab() {
             </div>
 
             {/* Status */}
-            <div className="flex items-center gap-2">
-              <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: blockFill(selectedItem, beq, backend?.globalConfig) }} />
-              <span style={{ color: 'var(--fg-bright)', fontSize: '12px', fontWeight: 500 }}>
-                {beq?.state && STATE_STYLE[beq.state] ? STATE_STYLE[beq.state].label : liveStatus === 'not_running' ? 'STOPPED' : liveStatus.toUpperCase()}
-              </span>
-            </div>
+            {selectedItem.equipmentType === 'bin' || selectedItem.equipmentType === 'finished_bin'
+              // bins have no run state: show each configured level switch (full = red, empty = orange)
+              ? <div className="flex items-center gap-4">
+                  {([['FULL', beq?.highCovered, 'var(--red)'], ['EMPTY', beq?.lowCovered === undefined ? undefined : !beq.lowCovered, 'var(--orange)']] as const).map(([label, on, color]) => on === undefined ? null : (
+                    <span key={label} className="flex items-center gap-2" style={{ color: on ? color : 'var(--fg-dim)', fontSize: '12px', fontWeight: 500 }}>
+                      <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: on ? color : 'var(--fg-dim)', opacity: on ? 1 : 0.3 }} />{label}
+                    </span>
+                  ))}
+                </div>
+              : <div className="flex items-center gap-2">
+                  <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: blockFill(selectedItem, beq, backend?.globalConfig) }} />
+                  <span style={{ color: 'var(--fg-bright)', fontSize: '12px', fontWeight: 500 }}>
+                    {beq?.state && STATE_STYLE[beq.state] ? STATE_STYLE[beq.state].label : liveStatus === 'not_running' ? 'STOPPED' : liveStatus.toUpperCase()}
+                  </span>
+                </div>}
 
             {beq?.faultReason && (
               <div style={{ color: 'var(--red)', fontSize: '11px' }}>{beq.faultReason}</div>

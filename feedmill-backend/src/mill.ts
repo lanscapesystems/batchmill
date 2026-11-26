@@ -2091,6 +2091,8 @@ export class Mill {
       config: eq.config, position: eq.position, gatePosition: eq.gatePosition,
       speed: eq.speed, refillState: this.refills.get(eq.id)?.state,
       state: this.isMotor(eq) ? this.displayState(eq) : undefined,
+      ...(eq.equipmentType === 'bin' || eq.equipmentType === 'finished_bin'
+        ? { highCovered: this.sensorCovered(eq, this.levelSwitches(eq).hi), lowCovered: this.sensorCovered(eq, this.levelSwitches(eq).lo) } : {}),
       enabled: eq.enabled, loadAmps: eq.loadAmps, loadDisconnected: eq.loadDisconnected, loadControlAuto: eq.loadControlAuto,
       loadAtRunning: eq.loadAtRunning, loadAtMsg: eq.loadAtMsg,
       // only motors have run hours; default 0 so the HMI shows the counter (and Reset) before the first run

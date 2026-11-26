@@ -180,6 +180,8 @@ export interface StateSnapshot {
     speed?: number;
     refillState?: string;
     gatePosition?: string;
+    highCovered?: boolean; // bins: high switch covered (full); undefined = not configured or bypassed
+    lowCovered?: boolean;  // bins: low switch covered (above low point); uncovered = empty
   }[];
   queue: QueueSnapshot[];
   activeBatch: BatchSnapshot | null;

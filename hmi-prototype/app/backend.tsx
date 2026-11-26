@@ -27,6 +27,8 @@ export interface BackendEquipment {
   loadControlAuto?: boolean;
   loadAtRunning?: boolean;
   loadAtMsg?: string;
+  highCovered?: boolean;
+  lowCovered?: boolean;
   enabled?: boolean;
   runSecondsTotal?: number;
   runSeconds?: number;
