@@ -11,10 +11,11 @@ import { listCandidateNics } from './network.js';
 import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresence, clearCouplerErrors, runRs1201Calibration, type ScaleCalStep } from './ethercat.js';
 import { MovingAverage, OnDelay, LoadPid, RelayTuner, scaleLinear } from './loadControl.js';
 import { Debounce } from './monitors.js';
+import { scaleLines, freefallAdjust, toleranceFor, feedsOnlyHammermill, flowPath, round1 } from './batchLogic.js';
 import { readIoState, writeIoCommand, rawToPct, fullScaleFor, NX_ANALOG_DISCONNECT_RAW } from './ioDaemon.js';
 import { loadConfig, saveConfig, type MillConfig } from './config.js';
 import {
-  openDb, closeDb, persistBatch, clearActiveBatch, loadActiveBatch,
+  openDb, closeDb, persistBatch, clearActiveBatch, loadActiveBatch, loadBatchesJson,
   archiveBatch, postInventoryEvent, persistFault, loadFaults,
 } from './db.js';
 
@@ -28,7 +29,9 @@ const SETTLE_MS = 2000;
 const DISCHARGE_TIMEOUT_MS = 60000;
 // All delay settings are stored in seconds (0.1 s steps, like a 100 ms PLC timer); the scan runs in ms.
 const delayMs = (sec: unknown, fallbackSec = 0) => Math.max(0, Number(sec ?? fallbackSec) || 0) * 1000;
-const EDITABLE_STATES = new Set(['IDLE', 'READY']);
+const EDITABLE_STATES = new Set(['IDLE']); // a queued batch; anything released is no longer editable
+const MIXER_NOT_EMPTY = 'Mixer not empty - discharge timed out (Extend or Abort)';
+const NO_PROGRESS_WINDOW_MS = 10_000; // once past the bin's no-flow delay, weight must rise by the minimum every window
 // Per-device input bypasses ("Overrides" in the sidebar): the input is ignored as if it were not assigned.
 const BYPASSABLE = ['runConfirmAux', 'vfdAuxInput', 'motorAuxInput', 'analogLoadInput', 'rotationPulseInput', 'openLimitInput', 'closedLimitInput',
   'highLevelInput', 'lowLevelInput'];
@@ -117,6 +120,8 @@ export class Mill {
   private trendTicks = 0;
   // Queue hold: stops NEW batches being released (the active one is never interrupted). Not persisted, so the queue
   // always comes up on hold after a restart or power loss and nothing starts unattended after an outage.
+  // Batch timers (settle, discharge, cleanout) count scans, not wall-clock time, so they are exact and testable; they restart on Resume.
+  private clockMs = 0;
   private queueHeld = true;
   private queueWait: string | undefined;
   // Alarm horn (PLC R137-R143): beeps while any fault is active, a silence (HMI or input) toggles it, a NEW fault re-arms it,
@@ -154,16 +159,23 @@ export class Mill {
     // gates no longer have Hand (they have P1 / P2): a saved Hand selection becomes Off
     for (const eq of this.equipment.values()) if (eq.equipmentType === 'gate' && eq.mode === 'Hand') eq.mode = 'Off';
     this.restoreTripLatches();
-    const recovered = loadActiveBatch();
-    if (recovered && !['COMPLETED', 'FAULTED', 'IDLE'].includes(recovered.state)) {
-      if (recovered.state !== 'PAUSED') {
-        recovered.previousState = recovered.state;
-        recovered.state = 'PAUSED';
-        recovered.faultReason = 'Recovered after power loss';
-        this.raiseFault('BATCH', 'WARNING', `Batch ${recovered.id} recovered after power loss — review and resume or abort`, 'W-BA-REC');
+    const saved = loadBatchesJson().sort((a, b) => (a.order ?? Number(a.id)) - (b.order ?? Number(b.id)));
+    if (!saved.some(b => b.state !== 'IDLE')) {
+      const legacy = loadActiveBatch(); // a batch saved by a version that kept it in its own table
+      if (legacy) saved.unshift(legacy);
+    }
+    for (const b of saved) {
+      if (['COMPLETED', 'FAULTED', 'ABORTED'].includes(b.state)) continue;
+      if (b.state !== 'IDLE') {
+        if (!['PAUSED', 'ABORTED_HOLD'].includes(b.state)) {
+          b.previousState = b.state;
+          b.state = 'PAUSED';
+          b.faultReason = 'Recovered after power loss';
+          this.raiseFault('BATCH', 'WARNING', `Batch ${b.id} recovered after power loss — review and resume or abort`, 'W-BA-REC');
+        }
+        this.activeBatch = b;
       }
-      this.activeBatch = recovered;
-      this.queue.unshift(recovered);
+      this.queue.push(b);
     }
     // avoid ID collisions after restart
     for (const b of this.queue) {
@@ -299,44 +311,23 @@ export class Mill {
       }
 
       case 'QueueBatch': {
-        const p = cmd.parameters as { recipeId: string; destination: string; targetMass?: number } | undefined;
+        const p = cmd.parameters as { recipeId: string; destination: string; targetMass?: number; scheduledAt?: string; acknowledged?: boolean } | undefined;
         if (!p?.recipeId || !p.destination) return reject('Missing recipe or destination');
         const recipe = this.recipes.find(r => r.id === p.recipeId);
         if (!recipe) return reject('Unknown recipe');
-        const id = String(this.batchSeq++);
-        const allLines = [...recipe.lines, ...recipe.microLines];
-        const steps: DosingStep[] = allLines.map(line => {
-          const ing = this.ingredients.find(i => i.id === line.ingredientId);
-          const bin = this.findBinForIngredient(line.ingredientId);
-          const augerId = this.findAugerForBin(bin?.id ?? '');
-          return {
-            ingredientId: line.ingredientId,
-            ingredientName: ing?.name ?? line.ingredientId,
-            sourceBinId: bin?.id ?? '',
-            augerId: augerId ?? '',
-            target: line.target,
-            actual: 0,
-            unit: line.unit,
-            state: 'pending' as const,
-            baselineWeight: 0,
-            settleStartTime: 0,
-            cutoffStartTime: 0,
-          };
-        });
-        const batch: BatchRuntime = {
-          id, recipeId: recipe.id, recipeName: recipe.name,
-          targetMass: p.targetMass ?? allLines.reduce((s, l) => s + l.target, 0),
-          destination: p.destination,
-          state: 'IDLE',
-          startedAt: '',
-          dosingIndex: 0,
-          dosingSteps: steps,
-          mixTimeRemainingMs: recipe.mixTime * 1000,
-          mixTimeTotalMs: recipe.mixTime * 1000,
-          dischargeStartTime: 0,
-        };
+        if (!this.bins.some(b => b.id === p.destination && b.type === 'finished')) return reject('Destination must be a finished bin');
+        if (p.targetMass !== undefined && !(p.targetMass > 0)) return reject('Batch size must be above zero');
+        if (p.scheduledAt && Number.isNaN(Date.parse(p.scheduledAt))) return reject('Bad scheduled time');
+        const batch = this.buildBatch(String(this.batchSeq), recipe, p.destination, p.targetMass, p.scheduledAt);
+        // inventory / mixer-capacity warnings are raised here (not at start) so the live queue never stalls on a question
+        const warnings = this.batchWarnings(batch);
+        if (warnings.length && !p.acknowledged) return { ...reject('Warnings'), data: { warnings } };
+        this.batchSeq++;
+        batch.warnings = warnings;
+        batch.order = Number(batch.id);
         this.queue.push(batch);
-        return ok('Queued as batch ' + id);
+        persistBatch(batch);
+        return ok('Queued as batch ' + batch.id);
       }
 
       // The queue is live (no Start button): releaseQueue() starts the next batch whenever the queue is running.
@@ -357,6 +348,18 @@ export class Mill {
         const b = this.activeBatch;
         if (b.state !== 'PAUSED') return reject('Batch not paused');
         if (!this.estopOk()) return reject('E-stop active'); if (this.outputForcesActive()) return reject('Clear the forced outputs first');
+        // the scale must still agree with the saved progress of the step in progress: ask the operator if it does not
+        const mismatch = this.resumeMismatch(b);
+        if (mismatch === 'invalid') return reject('Mixer scale invalid');
+        const step = b.dosingSteps[b.dosingIndex];
+        if (mismatch) {
+          if (cmd.parameters?.rebaseline !== true) return { ...reject('Scale mismatch'), data: mismatch };
+          step.baselineWeight = mismatch.current - step.actual; // carry on from what the scale reads now
+          step.clean = false;
+        }
+        if (step && step.state === 'feeding') { step.augerRunMs = 0; step.progressMs = 0; step.progressRef = step.actual; } // no-flow delay starts again
+        if (step?.state === 'settling') step.settleStartTime = this.clockMs; // timers are scan counts: restart after a pause or a restart
+        b.dischargeStartTime = this.clockMs; b.emptySinceMs = undefined;
         b.faultReason = undefined;
         b.state = b.previousState ?? 'DOSING';
         persistBatch(b);
@@ -364,57 +367,128 @@ export class Mill {
       }
 
       case 'AbortBatch': {
-        if (!this.activeBatch) return reject('No active batch');
         const b = this.activeBatch;
-        this.releaseEquipment(b.id);
-        b.state = 'FAULTED';
-        b.faultReason = 'Operator abort';
-        b.completedAt = new Date().toISOString();
-        archiveBatch(b);
-        clearActiveBatch(b.id);
-        this.activeBatch = null;
-        return ok();
-      }
-
-      case 'EditBatch': {
-        const batch = this.queue.find(b => b.id === cmd.targetId);
-        if (!batch) return reject('Batch not found');
-        if (!EDITABLE_STATES.has(batch.state)) return reject('Batch not editable in state ' + batch.state);
-        const p = cmd.parameters as { recipeId?: string; destination?: string } | undefined;
-        if (p?.recipeId) {
-          const recipe = this.recipes.find(r => r.id === p.recipeId);
-          if (!recipe) return reject('Unknown recipe');
-          batch.recipeId = recipe.id;
-          batch.recipeName = recipe.name;
-          batch.mixTimeRemainingMs = recipe.mixTime * 1000;
-          batch.mixTimeTotalMs = recipe.mixTime * 1000;
-          const allLines = [...recipe.lines, ...recipe.microLines];
-          batch.targetMass = allLines.reduce((s, l) => s + l.target, 0);
-          batch.dosingSteps = allLines.map(line => {
-            const ing = this.ingredients.find(i => i.id === line.ingredientId);
-            const bin = this.findBinForIngredient(line.ingredientId);
-            const augerId = this.findAugerForBin(bin?.id ?? '');
-            return {
-              ingredientId: line.ingredientId, ingredientName: ing?.name ?? line.ingredientId,
-              sourceBinId: bin?.id ?? '', augerId: augerId ?? '',
-              target: line.target, actual: 0, unit: line.unit, state: 'pending' as const,
-              baselineWeight: 0, settleStartTime: 0, cutoffStartTime: 0,
-            };
-          });
+        if (!b) return reject('No active batch');
+        if (b.state !== 'PAUSED') return reject('Pause the batch before aborting');
+        const mode = cmd.parameters?.mode;
+        if (mode !== 'mixUnload' && mode !== 'unload' && mode !== 'cancel') return reject('Choose Mix + Unload, Unload or Cancel');
+        if (mode === 'cancel' && cmd.parameters?.acknowledged !== true) return reject('Cancel must be acknowledged');
+        const dosed = b.dosingSteps.some(st => st.actual > 0);
+        if (mode === 'cancel' || !dosed) { // nothing is discharged: the batch closes and what is in the mixer stays there
+          this.postConsumption(b);
+          this.closeBatch(b, 'ABORTED');
+          return ok();
         }
-        if (p?.destination) batch.destination = p.destination;
+        if (!this.estopOk()) return reject('E-stop active'); if (this.outputForcesActive()) return reject('Clear the forced outputs first');
+        this.postConsumption(b);
+        b.unloading = true;
+        b.faultReason = undefined;
+        b.previousState = undefined;
+        b.state = mode === 'mixUnload' ? 'MIXING' : 'ROUTE_PRECHECK';
+        persistBatch(b);
         return ok();
       }
 
+      // After an abort/failure with material in the mixer: discharge it (to the original or another finished bin) ...
       case 'UnloadBatch': {
-        if (!this.activeBatch) return reject('No active batch');
         const b = this.activeBatch;
-        this.releaseEquipment(b.id);
-        b.state = 'COMPLETED';
-        b.completedAt = new Date().toISOString();
-        archiveBatch(b);
-        clearActiveBatch(b.id);
-        this.activeBatch = null;
+        if (!b || b.state !== 'ABORTED_HOLD') return reject('No aborted batch to unload');
+        const dest = (cmd.parameters?.destination as string | undefined) ?? b.destination;
+        if (!this.bins.some(x => x.id === dest && x.type === 'finished')) return reject('Destination must be a finished bin');
+        if (!this.estopOk()) return reject('E-stop active'); if (this.outputForcesActive()) return reject('Clear the forced outputs first');
+        b.destination = dest;
+        b.unloading = true;
+        b.faultReason = undefined;
+        b.state = 'ROUTE_PRECHECK';
+        persistBatch(b);
+        return ok();
+      }
+
+      // ... or, if the operator emptied the mixer another way, close it without crediting anything.
+      case 'DiscardBatch': {
+        const b = this.activeBatch;
+        if (!b || b.state !== 'ABORTED_HOLD') return reject('No aborted batch to discard');
+        const scale = this.getMixerScale();
+        if (!scale || !scale.valid || scale.weight >= this.emptyLbs()) return reject('The mixer scale must read empty first');
+        this.closeBatch(b, 'ABORTED');
+        return ok();
+      }
+
+      case 'ExtendDischarge': {
+        const b = this.activeBatch;
+        if (!b || b.state !== 'DISCHARGING') return reject('Not discharging');
+        b.dischargeStartTime = this.clockMs;
+        if (b.faultReason === MIXER_NOT_EMPTY) b.faultReason = undefined;
+        return ok();
+      }
+
+      case 'ResolveTolerance': {
+        const b = this.activeBatch;
+        if (!b?.tolHold) return reject('No step is waiting for the operator');
+        const choice = cmd.parameters?.choice;
+        if (choice !== 'ignore' && choice !== 'update') return reject('Choose ignore or update');
+        const step = b.dosingSteps[b.tolHold.stepIndex];
+        const binEq = this.equipment.get(step.sourceBinId);
+        if (choice === 'update' && binEq) this.applyFreefall(b, step, binEq, false); // Update ignores the max-adjust cap
+        b.tolHold = undefined;
+        b.faultReason = undefined;
+        step.state = 'complete';
+        b.dosingIndex++;
+        persistBatch(b);
+        return ok();
+      }
+
+      // A queued (not yet released) batch can be changed: recipe, destination, size, scheduled time.
+      case 'EditBatch': {
+        const idx = this.queue.findIndex(b => b.id === cmd.targetId);
+        if (idx < 0) return reject('Batch not found');
+        const old = this.queue[idx];
+        if (!EDITABLE_STATES.has(old.state)) return reject('Batch already started');
+        const p = (cmd.parameters ?? {}) as { recipeId?: string; destination?: string; targetMass?: number; scheduledAt?: string | null; acknowledged?: boolean };
+        const recipe = this.recipes.find(r => r.id === (p.recipeId ?? old.recipeId));
+        if (!recipe) return reject('Unknown recipe');
+        const destination = p.destination ?? old.destination;
+        if (!this.bins.some(b => b.id === destination && b.type === 'finished')) return reject('Destination must be a finished bin');
+        if (p.targetMass !== undefined && !(p.targetMass > 0)) return reject('Batch size must be above zero');
+        const scheduledAt = p.scheduledAt === undefined ? old.scheduledAt : (p.scheduledAt ?? undefined);
+        if (scheduledAt && Number.isNaN(Date.parse(scheduledAt))) return reject('Bad scheduled time');
+        // changing the recipe without a size keeps the recipe's own weights; changing only the destination keeps the batch as it was
+        const resize = p.recipeId !== undefined || p.targetMass !== undefined;
+        const batch = resize ? this.buildBatch(old.id, recipe, destination, p.targetMass, scheduledAt) : { ...old, destination, scheduledAt };
+        batch.order = old.order;
+        const saved = this.queue[idx];
+        this.queue[idx] = batch; // in place, so the warnings count only the batches ahead of it
+        const warnings = this.batchWarnings(batch);
+        if (warnings.length && !p.acknowledged) { this.queue[idx] = saved; return { ...reject('Warnings'), data: { warnings } }; }
+        batch.warnings = warnings;
+        persistBatch(batch);
+        return ok();
+      }
+
+      case 'DeleteBatch': {
+        const idx = this.queue.findIndex(b => b.id === cmd.targetId);
+        if (idx < 0) return reject('Batch not found');
+        if (!EDITABLE_STATES.has(this.queue[idx].state)) return reject('Batch already started');
+        clearActiveBatch(this.queue[idx].id);
+        this.queue.splice(idx, 1);
+        return ok();
+      }
+
+      // Move a queued batch past its nearest queued neighbour (batches already started or finished keep their place).
+      case 'MoveBatch': {
+        const dir = cmd.parameters?.direction;
+        if (dir !== 'up' && dir !== 'down') return reject('direction must be up or down');
+        const idx = this.queue.findIndex(b => b.id === cmd.targetId);
+        if (idx < 0) return reject('Batch not found');
+        if (!EDITABLE_STATES.has(this.queue[idx].state)) return reject('Batch already started');
+        const step = dir === 'up' ? -1 : 1;
+        let j = idx + step;
+        while (j >= 0 && j < this.queue.length && !EDITABLE_STATES.has(this.queue[j].state)) j += step;
+        if (j < 0 || j >= this.queue.length) return reject('Already at the ' + (dir === 'up' ? 'front' : 'back'));
+        const a = this.queue[idx], c = this.queue[j];
+        [a.order, c.order] = [c.order ?? Number(c.id), a.order ?? Number(a.id)];
+        this.queue[idx] = c; this.queue[j] = a;
+        persistBatch(a); persistBatch(c);
         return ok();
       }
 
@@ -764,6 +838,8 @@ export class Mill {
         if (!eq) return reject('Unknown equipment');
         const p = cmd.parameters as { name?: string; config?: Record<string, string | number | boolean>; newId?: string } | undefined;
         if (!p) return reject('Missing parameters');
+        if (p.config?.notTracked === true && !(eq.equipmentType === 'bin' && feedsOnlyHammermill(eq.id, this.connections, id => this.equipment.get(id)?.equipmentType)))
+          return reject('A bin can be Not tracked only if it discharges only to a hammermill');
         const renaming = !!p.newId && p.newId !== eq.id;
         if (renaming && this.equipment.has(p.newId!)) return reject('ID already in use');
         if (renaming && eq.owner) return reject('Cannot rename owned equipment');
@@ -804,6 +880,7 @@ export class Mill {
         const dup = this.connections.some(c => c.from === p.from && c.fromPort === p.fromPort && c.to === p.to && c.toPort === p.toPort);
         if (dup) return reject('Connection already exists');
         this.connections.push({ from: p.from, fromPort: p.fromPort, to: p.to, toPort: p.toPort });
+        this.revalidateHiddenBins();
         return ok();
       }
 
@@ -813,6 +890,7 @@ export class Mill {
         const idx = this.connections.findIndex(c => c.from === p.from && c.fromPort === p.fromPort && c.to === p.to && c.toPort === p.toPort);
         if (idx < 0) return reject('Connection not found');
         this.connections.splice(idx, 1);
+        this.revalidateHiddenBins();
         return ok();
       }
 
@@ -986,6 +1064,7 @@ export class Mill {
   // ── main control cycle ──
 
   private scan() {
+    this.clockMs += SCAN_MS;
     this.applyOverrides();
     const ioState = readIoState(); // read once; shared by readRealInputs and updateRotationSensors
     this.updateBusHealth(ioState);
@@ -1090,7 +1169,7 @@ export class Mill {
     // have stopped), then the downstream permissive downstream-first, then feedback/fault/status/outputs.
     if (!this.estopOk()) {
       this.raiseFault('ESTOP', 'CRITICAL', 'Emergency stop pressed', 'E-ES-01');
-      this.pauseActiveBatch(); // motors are already dead (motorRunLogic), so PAUSING completes on the next batch tick
+      if (this.pauseActiveBatch()) this.activeBatch!.faultReason = 'E-stop active - reset it, then Resume'; // motors are already dead (motorRunLogic), so PAUSING completes on the next batch tick
       // Hammermills are disabled (paused) like at startup: the operator must re-enable them, and any refill is dropped.
       this.abortRefills();
       for (const eq of this.equipment.values()) {
@@ -1617,26 +1696,18 @@ export class Mill {
     return undefined;
   }
 
-  // Live queue: with the queue running and no active batch, the first waiting batch starts by itself.
-  private releaseQueue() {
-    this.queueWait = undefined;
-    if (this.queueHeld || this.activeBatch) return;
-    const batch = this.queue.find(b => b.state === 'IDLE' || b.state === 'READY');
-    if (!batch) return;
-    if (!this.estopOk()) { this.queueWait = 'E-stop active'; return; }
-    if (this.outputForcesActive()) { this.queueWait = 'Forced outputs are active'; return; }
-    batch.state = 'VALIDATING';
-    batch.startedAt = new Date().toISOString();
-    this.activeBatch = batch;
-    persistBatch(batch);
-  }
-
   // PLC HOA: a sequence only drives equipment that is in Auto; anything else holds the batch with a reason (nothing is claimed).
   private batchHold(b: BatchRuntime): string | null {
     const need: (EquipmentRuntime | undefined)[] = [];
     if (['READY', 'DOSING', 'MIXING'].includes(b.state)) need.push(this.findEquipmentByType('mixer'));
     if (b.state === 'DOSING') { const st = b.dosingSteps[b.dosingIndex]; if (st?.augerId) need.push(this.equipment.get(st.augerId)); }
-    if (['ROUTE_PRECHECK', 'DISCHARGING'].includes(b.state)) need.push(this.findGateForDischarge());
+    if (['ROUTE_PRECHECK', 'DISCHARGING'].includes(b.state)) {
+      const mx = this.findEquipmentByType('mixer');
+      for (const id of (mx ? flowPath(mx.id, b.destination, this.connections) ?? [] : [])) {
+        const g = this.equipment.get(id);
+        if (g?.equipmentType === 'gate') need.push(g);
+      }
+    }
     const bad = need.find(e => e && e.owner !== b.id && e.mode !== 'Auto'); // equipment the batch already owns cannot leave Auto
     return bad ? `Waiting: ${bad.id} is not in Auto` : null;
   }
@@ -1650,6 +1721,7 @@ export class Mill {
       // equipment this batch owns tripped: stop and wait (Resume after the operator resets it) instead of feeding blind
       const tripped = Array.from(this.equipment.values()).find(e => e.owner === b.id && e.status === 'fault');
       if (tripped) { this.pauseActiveBatch(); b.faultReason = `${tripped.id} faulted - reset it, then Resume`; return; }
+      if (!this.estopOk()) { this.pauseActiveBatch(); b.faultReason = 'E-stop active - reset it, then Resume'; return; }
       const hold = this.batchHold(b);
       if (hold) { b.faultReason = hold; return; }
       if (b.faultReason?.endsWith('is not in Auto')) b.faultReason = undefined;
@@ -1657,12 +1729,10 @@ export class Mill {
 
     switch (b.state) {
       case 'VALIDATING': {
-        const mixer = this.findEquipmentByType('mixer');
-        if (!mixer) { this.batchFault(b, 'No mixer configured'); return; }
-        const scale = this.getMixerScale();
-        if (!scale && this.hasMappedScales()) {
-          return;
-        }
+        // the same checks that released it, re-run: nothing starts moving until they all hold
+        const blocker = this.releaseBlocker(b);
+        if (blocker) { b.faultReason = `Waiting: ${blocker}`; break; }
+        b.faultReason = undefined;
         b.state = 'READY';
         break;
       }
@@ -1670,22 +1740,20 @@ export class Mill {
       case 'READY': {
         b.state = 'DOSING';
         b.dosingIndex = 0;
-        const mixer = this.findEquipmentByType('mixer');
-        if (mixer) { mixer.owner = b.id; mixer.request = true; }
+        this.requestMixer(b);
         break;
       }
 
       case 'DOSING': {
-        const mixer = this.findEquipmentByType('mixer');
-        if (mixer) { mixer.owner = b.id; mixer.request = true; }
+        this.requestMixer(b);
         this.advanceDosing(b);
         break;
       }
 
       case 'MIXING': {
-        const mixer = this.findEquipmentByType('mixer');
-        if (mixer) { mixer.owner = b.id; mixer.request = true; }
-        b.mixTimeRemainingMs -= SCAN_MS;
+        const mixer = this.requestMixer(b);
+        // the timer only counts while the mixer is actually running
+        if (mixer?.runCmd) b.mixTimeRemainingMs -= SCAN_MS;
         if (b.mixTimeRemainingMs <= 0) {
           b.mixTimeRemainingMs = 0;
           b.state = 'ROUTE_PRECHECK';
@@ -1694,24 +1762,24 @@ export class Mill {
       }
 
       case 'ROUTE_PRECHECK': {
+        this.requestMixer(b);
         const destLevel = this.levelState(b.destination);
         if (destLevel === 'full' || destLevel === 'fault') {
           b.faultReason = destLevel === 'full' ? `Waiting: destination ${b.destination} is full` : `Waiting: ${b.destination} level sensors disagree`;
           break;
         }
         b.faultReason = undefined;
-        const gate = this.findGateForDischarge();
-        if (gate) {
-          gate.owner = b.id;
-          gate.request = true;
-          gate.gatePort = this.gatePortToward(gate, b.destination) ?? 1;
-        }
+        this.requestDischargeGates(b);
+        const scale = this.getMixerScale();
+        b.dischargeStartWeight = scale?.valid ? scale.weight : undefined;
+        b.emptySinceMs = undefined;
         b.state = 'DISCHARGING';
-        b.dischargeStartTime = Date.now();
+        b.dischargeStartTime = this.clockMs;
         break;
       }
 
       case 'DISCHARGING': {
+        const mixer = this.requestMixer(b);
         // 'full' is already debounced by the destination's Bin Full Stop Delay
         if (this.levelState(b.destination) === 'full') {
           b.previousState = b.state;
@@ -1720,67 +1788,142 @@ export class Mill {
           this.initiateEquipmentStop(b.id);
           break;
         }
-        const gate = this.findGateForDischarge();
-        if (gate) { gate.owner = b.id; gate.request = true; gate.gatePort = this.gatePortToward(gate, b.destination) ?? 1; }
-        if (gate && !this.pathReady(gate.id)) { b.dischargeStartTime = Date.now(); break; } // wait for the gate to reach the destination's outlet
+        const gates = this.requestDischargeGates(b);
+        if (!gates.every(g => this.pathReady(g.id))) { b.dischargeStartTime = this.clockMs; break; } // wait for the gate(s) to reach the destination's outlet
         const scale = this.getMixerScale();
-        if (scale && scale.weight < 10 && scale.stable) {
-          b.state = 'CLEAROUT';
-        } else if (Date.now() - b.dischargeStartTime > DISCHARGE_TIMEOUT_MS) {
-          b.state = 'CLEAROUT';
+        if (!scale || !scale.valid) { b.faultReason = 'Waiting: mixer scale invalid'; break; }
+        if (b.faultReason === 'Waiting: mixer scale invalid') b.faultReason = undefined;
+        if (scale.stable && scale.weight < this.emptyLbs()) {
+          // declared empty: keep running for the mixer's cleanout time, then finish
+          b.emptySinceMs ??= this.clockMs;
+          if (this.clockMs - b.emptySinceMs >= delayMs(mixer?.config.cleanoutSec, 0)) { b.faultReason = undefined; b.state = 'CLEAROUT'; }
+        } else {
+          b.emptySinceMs = undefined;
+          // never completes on a timeout: alarm and keep waiting (Extend Discharge re-arms the timer, Abort gives up)
+          const limit = delayMs(mixer?.config.dischargeTimeoutSec, DISCHARGE_TIMEOUT_MS / 1000);
+          if (this.clockMs - b.dischargeStartTime > limit && b.faultReason !== MIXER_NOT_EMPTY) {
+            b.faultReason = MIXER_NOT_EMPTY;
+            this.raiseFault('BATCH', 'WARNING', `Batch ${b.id}: mixer not empty - discharge timed out`, 'W-BA-02');
+          }
         }
         break;
       }
 
       case 'CLEAROUT': {
-        const gate = this.findGateForDischarge();
-        if (gate) { gate.request = false; gate.owner = undefined; }
-        this.releaseEquipment(b.id);
-        b.state = 'COMPLETED';
-        b.completedAt = new Date().toISOString();
-        this.activeBatch = null;
-        for (const step of b.dosingSteps) {
-          if (step.actual > 0) {
-            const bin = this.bins.find(bn => bn.id === step.sourceBinId);
-            if (bin) bin.balance = Math.max(0, bin.balance - step.actual);
-            postInventoryEvent(
-              `${b.id}-${step.ingredientId}-consume`, 'consumption',
-              step.sourceBinId, step.ingredientId, -step.actual, step.unit, b.id,
-            );
-          }
-        }
+        // what actually left the mixer is credited to the destination: weight at the start of discharge minus what is left
+        const scale = this.getMixerScale();
+        const dosed = b.dosingSteps.reduce((s, st) => s + st.actual, 0);
+        const left = scale?.valid ? scale.weight : 0;
+        const discharged = Math.max(0, (b.dischargeStartWeight ?? dosed) - left);
+        this.postConsumption(b);
         const destBin = this.bins.find(bn => bn.id === b.destination);
         if (destBin) {
-          const total = b.dosingSteps.reduce((s, st) => s + st.actual, 0);
-          destBin.balance += total;
-          postInventoryEvent(
-            `${b.id}-dest-receive`, 'batch_receive',
-            b.destination, null, total, 'lbs', b.id,
-          );
+          destBin.balance += discharged;
+          postInventoryEvent(`${b.id}-dest-receive`, 'batch_receive', b.destination, null, discharged, 'lbs', b.id);
         }
-        this.persistConfig();
-        archiveBatch(b);
-        clearActiveBatch(b.id);
+        this.closeBatch(b, b.unloading ? 'ABORTED' : 'COMPLETED');
         break;
       }
 
       case 'PAUSING': {
-        const allStopped = this.allOwnedEquipmentStopped(b.id);
-        if (allStopped) {
+        if (this.allOwnedEquipmentStopped(b.id)) {
           this.releaseEquipment(b.id);
           b.state = 'PAUSED';
         }
         break;
       }
 
+      case 'ABORTED_HOLD': {
+        // everything stopped through its own stop delay; the batch now waits for Unload or Discard
+        if (this.allOwnedEquipmentStopped(b.id)) this.releaseEquipment(b.id);
+        break;
+      }
+
       case 'PAUSED':
       case 'FAULTED':
+      case 'ABORTED':
       case 'COMPLETED':
       case 'IDLE':
         break;
     }
 
-    if (b.state !== prevState) persistBatch(b);
+    if (b.state !== prevState && this.activeBatch === b) persistBatch(b); // a batch closed above must not be written back
+  }
+
+  private requestMixer(b: BatchRuntime): EquipmentRuntime | undefined {
+    const mixer = this.findEquipmentByType('mixer');
+    if (mixer) { mixer.owner = b.id; mixer.request = true; }
+    return mixer;
+  }
+
+  // Gates on the flow path mixer -> destination, each told which outlet leads on to the next hop.
+  private requestDischargeGates(b: BatchRuntime): EquipmentRuntime[] {
+    const mixer = this.findEquipmentByType('mixer');
+    const path = mixer ? flowPath(mixer.id, b.destination, this.connections) : null;
+    const gates: EquipmentRuntime[] = [];
+    path?.forEach((id, i) => {
+      const g = this.equipment.get(id);
+      if (g?.equipmentType !== 'gate') return;
+      g.owner = b.id;
+      g.request = true;
+      g.gatePort = this.gatePortToward(g, path[i + 1]) ?? 1;
+      gates.push(g);
+    });
+    return gates;
+  }
+
+  private emptyLbs() { return Number(this.globalConfig.mixerEmptyLbs ?? 10); }
+
+  // Everything that must hold before the head of the queue is released. A failing check keeps the batch queued with its reason.
+  private releaseBlocker(b: BatchRuntime): string | null {
+    if (!this.estopOk()) return 'E-stop active';
+    if (this.outputForcesActive()) return 'forced outputs are active';
+    const mixer = this.findEquipmentByType('mixer');
+    if (!mixer) return 'no mixer configured';
+    if (mixer.mode !== 'Auto') return `${mixer.id} is not in Auto`;
+    if (mixer.status === 'fault') return `${mixer.id} is faulted`;
+    if (!mixer.config.scaleId) return 'the mixer has no scale assigned';
+    const scale = this.getMixerScale();
+    if (!scale || !scale.valid) return 'mixer scale invalid';
+    if (!scale.stable) return 'mixer scale not stable';
+    if (scale.weight >= this.emptyLbs()) return `mixer not empty (${round1(scale.weight)} lb)`;
+    for (const st of b.dosingSteps) {
+      if (!st.sourceBinId || !this.equipment.has(st.sourceBinId)) return `no source bin for ${st.ingredientName}`;
+      const a = st.augerId ? this.equipment.get(st.augerId) : undefined;
+      if (!a) return `no auger below ${st.sourceBinId}`;
+      if (a.mode !== 'Auto') return `${a.id} is not in Auto`;
+      if (a.status === 'fault') return `${a.id} is faulted`;
+    }
+    if (!this.bins.some(x => x.id === b.destination && x.type === 'finished')) return `destination ${b.destination} not found`;
+    const lvl = this.levelState(b.destination);
+    if (lvl === 'full') return `destination ${b.destination} is full`;
+    if (lvl === 'fault') return `${b.destination} level sensors disagree`;
+    const path = flowPath(mixer.id, b.destination, this.connections);
+    if (!path) return `no flow path from ${mixer.id} to ${b.destination}`;
+    for (const id of path) {
+      const g = this.equipment.get(id);
+      if (g?.equipmentType !== 'gate') continue;
+      if (g.mode !== 'Auto') return `${g.id} is not in Auto`;
+      if (g.status === 'fault') return `${g.id} is faulted`;
+    }
+    return null;
+  }
+
+  // Live queue: with the queue running and no active batch, the next eligible batch starts by itself. A scheduled batch that
+  // is not due yet is skipped (it does not hold up the ones behind it); the head batch waits, with a reason, while a check fails.
+  private releaseQueue() {
+    this.queueWait = undefined;
+    if (this.queueHeld || this.activeBatch) return;
+    const now = Date.now();
+    const batch = this.queue.find(b => b.state === 'IDLE' && (!b.scheduledAt || Date.parse(b.scheduledAt) <= now));
+    if (!batch) return;
+    const blocker = this.releaseBlocker(batch);
+    if (blocker) { this.queueWait = `batch ${batch.id} - ${blocker}`; return; }
+    if (batch.scheduledAt && now - Date.parse(batch.scheduledAt) > 60_000) batch.late = true;
+    batch.state = 'VALIDATING';
+    batch.startedAt = new Date().toISOString();
+    this.activeBatch = batch;
+    persistBatch(batch);
   }
 
   private advanceDosing(b: BatchRuntime) {
@@ -1797,17 +1940,22 @@ export class Mill {
     const hasAnalogSpeed = !!(auger?.config.analogSpeedOutput);
     const freefall = (binEq?.config.freefall as number) ?? 0;
     const slowFeedLbs = (hasAnalogSpeed && (binEq?.config.slowFeedLbs as number)) ? (binEq!.config.slowFeedLbs as number) : 0;
+    // Real weight only: no scale reading means nothing is dosed (there is no simulated mode).
+    const scale = this.getMixerScale();
+    const scaleOk = !!scale && scale.valid;
+    const waitScale = (needStable: boolean): boolean => {
+      if (!scaleOk) { b.faultReason = 'Waiting: mixer scale invalid'; return true; }
+      if (needStable && !scale!.stable) { b.faultReason = 'Waiting: mixer scale not stable'; return true; }
+      if (b.faultReason?.startsWith('Waiting: mixer scale')) b.faultReason = undefined;
+      return false;
+    };
 
     switch (step.state) {
       case 'pending': {
-        const scale = this.getMixerScale();
-        if (scale && scale.stable && scale.valid) {
-          step.baselineWeight = scale.weight;
-          step.state = 'baseline';
-        } else if (!this.hasMappedScales()) {
-          step.baselineWeight = 0;
-          step.state = 'baseline';
-        }
+        if (waitScale(true)) break;
+        step.baselineWeight = scale!.weight;
+        step.augerRunMs = 0; step.progressMs = 0; step.progressRef = 0; step.clean = true;
+        step.state = 'baseline';
         break;
       }
 
@@ -1818,14 +1966,42 @@ export class Mill {
       }
 
       case 'feeding': {
+        if (!scaleOk) {
+          // lost the weight while feeding: stop the feeder and pause; Resume once the scale is back
+          step.clean = false;
+          if (auger) auger.request = false;
+          this.pauseActiveBatch();
+          b.faultReason = 'Mixer scale invalid - restore it, then Resume';
+          return;
+        }
         if (auger) { auger.owner = b.id; auger.request = true; }
-        this.updateStepActual(step);
+        step.actual = Math.max(0, scale!.weight - step.baselineWeight);
         const remaining = step.target - step.actual;
         if (hasAnalogSpeed) {
           const slowSpeed = (binEq?.config.slowFeedSpeed as number) ?? 50;
           const inSlowZone = slowFeedLbs > 0 && (remaining <= slowFeedLbs || slowFeedLbs >= step.target);
           const normal = auger?.speed ?? 100;
           this.setAugerSpeed(auger, inSlowZone ? Math.min(slowSpeed, normal) : normal);
+        }
+        // No-flow watchdog: once the auger has run for the bin's delay, the weight must keep rising
+        if (auger?.runCmd) {
+          step.augerRunMs = (step.augerRunMs ?? 0) + SCAN_MS;
+          const delay = delayMs(binEq?.config.noProgressDelaySec, 60);
+          if (step.augerRunMs >= delay) {
+            if (step.augerRunMs - SCAN_MS < delay) { step.progressRef = step.actual; step.progressMs = 0; }
+            else {
+              step.progressMs = (step.progressMs ?? 0) + SCAN_MS;
+              if (step.progressMs >= NO_PROGRESS_WINDOW_MS) {
+                const minLbs = Number(binEq?.config.noProgressMinLbs ?? 2);
+                if (step.actual - (step.progressRef ?? 0) < minLbs) {
+                  step.state = 'faulted';
+                  this.batchFault(b, `No flow from ${step.sourceBinId}`);
+                  return;
+                }
+                step.progressRef = step.actual; step.progressMs = 0;
+              }
+            }
+          }
         }
         // Freefall cutoff
         if (step.actual >= step.target - freefall) {
@@ -1836,25 +2012,43 @@ export class Mill {
       }
 
       case 'cutoff': {
-        this.updateStepActual(step);
+        if (scaleOk) step.actual = Math.max(0, scale!.weight - step.baselineWeight);
+        else step.clean = false;
         if (auger) auger.request = false;
         if (!auger?.runCmd) {
           if (auger) auger.owner = undefined;
-          step.settleStartTime = Date.now();
+          step.settleStartTime = this.clockMs;
           step.state = 'settling';
         }
         break;
       }
 
       case 'settling': {
-        const scale = this.getMixerScale();
-        if (scale) step.actual = Math.max(0, scale.weight - step.baselineWeight);
-        if (Date.now() - step.settleStartTime >= SETTLE_MS) {
-          step.state = 'complete';
-          b.dosingIndex++;
+        if (!scaleOk) { step.clean = false; waitScale(false); break; }
+        if (this.clockMs - step.settleStartTime < delayMs(binEq?.config.settleSec, SETTLE_MS / 1000)) break;
+        if (waitScale(true)) break;
+        step.actual = Math.max(0, scale!.weight - step.baselineWeight);
+        step.deviation = Math.round((step.actual - step.target) * 100) / 100;
+        const tol = toleranceFor(binEq?.config.toleranceLbs, step.target);
+        if (Math.abs(step.deviation) > tol) {
+          // out of tolerance: hold for the operator (Ignore / Update freefall / Abort), like the PLC popup
+          const ff = freefall;
+          const { newFreefall } = freefallAdjust(step.actual, step.target, ff, Number(binEq?.config.ffStrengthPct ?? 50));
+          b.tolHold = { stepIndex: b.dosingIndex, ingredientName: step.ingredientName, desired: step.target, actual: step.actual,
+            difference: step.deviation, currentFreefall: ff, newFreefall };
+          b.faultReason = `${step.ingredientName} is ${round1(Math.abs(step.deviation))} lb ${step.deviation > 0 ? 'over' : 'under'} target - choose Ignore or Update freefall`;
+          step.state = 'hold';
+          persistBatch(b);
+          break;
         }
+        if (binEq?.config.ffAuto === true && step.clean !== false) this.applyFreefall(b, step, binEq, true);
+        step.state = 'complete';
+        b.dosingIndex++;
         break;
       }
+
+      case 'hold':
+        break; // waiting for ResolveTolerance
 
       case 'complete':
         b.dosingIndex++;
@@ -1870,20 +2064,73 @@ export class Mill {
       this.batchPersistCounter = 0;
     } else if (step.state === 'feeding') {
       this.batchPersistCounter++;
-      if (this.batchPersistCounter >= 50) {
+      if (this.batchPersistCounter >= 10) { // once a second while feeding: a power cut loses at most that
         persistBatch(b);
         this.batchPersistCounter = 0;
       }
     }
   }
 
-  private updateStepActual(step: DosingStep) {
-    const scale = this.getMixerScale();
-    if (scale) {
-      step.actual = Math.max(0, scale.weight - step.baselineWeight);
-    } else if (!this.hasMappedScales()) {
-      step.actual += step.target * SCAN_MS / 5000;
+  // PLC freefall calibration: move the bin's freefall by (error x strength %). Auto mode is capped by the bin's max adjust per
+  // batch; the operator's "Update" is not. Each change is logged on the bin (last 10) so a bad trend can be seen.
+  private applyFreefall(b: BatchRuntime, step: DosingStep, binEq: EquipmentRuntime, capped: boolean) {
+    const old = Number(binEq.config.freefall ?? 0);
+    const cap = capped ? Number(binEq.config.ffMaxAdjLbs ?? 2) : undefined;
+    const { adjust, newFreefall } = freefallAdjust(step.actual, step.target, old, Number(binEq.config.ffStrengthPct ?? 50), cap);
+    if (adjust <= 0 || newFreefall === old) return;
+    binEq.config.freefall = newFreefall;
+    step.ffOld = old; step.ffNew = newFreefall;
+    let log: unknown[] = [];
+    try { log = JSON.parse(String(binEq.config.ffLog ?? '[]')) as unknown[]; } catch { log = []; }
+    log.push({ at: new Date().toISOString(), batch: b.id, old, new: newFreefall, error: step.deviation });
+    binEq.config.ffLog = JSON.stringify(log.slice(-10));
+    this.persistConfig();
+  }
+
+  // Dosed material comes off the source bins once, however the batch ends.
+  private postConsumption(b: BatchRuntime) {
+    if (b.consumptionPosted) return;
+    b.consumptionPosted = true;
+    for (const step of b.dosingSteps) {
+      if (step.actual <= 0) continue;
+      const bin = this.bins.find(bn => bn.id === step.sourceBinId);
+      if (bin) bin.balance = Math.max(0, bin.balance - step.actual);
+      postInventoryEvent(`${b.id}-${step.ingredientId}-consume`, 'consumption', step.sourceBinId, step.ingredientId, -step.actual, step.unit, b.id);
     }
+    this.persistConfig();
+  }
+
+  // Ends the active batch for good: releases everything, archives it, clears it from the database and frees the queue.
+  private closeBatch(b: BatchRuntime, final: 'COMPLETED' | 'FAULTED' | 'ABORTED') {
+    this.releaseEquipment(b.id);
+    b.state = final;
+    b.tolHold = undefined;
+    b.completedAt = new Date().toISOString();
+    this.activeBatch = null;
+    archiveBatch(b);
+    clearActiveBatch(b.id);
+  }
+
+  // Abort or failure: stop the batch's equipment and deduct what was dosed. With material in the mixer the batch waits in
+  // ABORTED_HOLD for Unload (or Discard once the scale reads empty); with none it closes at once.
+  private abortActive(b: BatchRuntime, reason: string, finalIfEmpty: 'ABORTED' | 'FAULTED') {
+    this.initiateEquipmentStop(b.id);
+    b.tolHold = undefined;
+    b.faultReason = reason;
+    this.postConsumption(b);
+    if (b.dosingSteps.some(st => st.actual > 0)) { b.previousState = undefined; b.state = 'ABORTED_HOLD'; persistBatch(b); }
+    else this.closeBatch(b, finalIfEmpty);
+  }
+
+  // What the saved progress of the step in progress says the scale should read, vs. what it reads now (checked on Resume).
+  private resumeMismatch(b: BatchRuntime): 'invalid' | { saved: number; current: number; ingredientName: string } | null {
+    const step = b.dosingSteps[b.dosingIndex];
+    if ((b.previousState ?? 'DOSING') !== 'DOSING' || !step || !['feeding', 'cutoff', 'settling', 'hold'].includes(step.state)) return null;
+    const scale = this.getMixerScale();
+    if (!scale || !scale.valid) return 'invalid';
+    const saved = step.baselineWeight + step.actual;
+    if (Math.abs(scale.weight - saved) <= Number(this.globalConfig.resumeMismatchLbs ?? 10)) return null;
+    return { saved: round1(saved), current: round1(scale.weight), ingredientName: step.ingredientName };
   }
 
   private setAugerSpeed(auger: EquipmentRuntime | undefined, pct: number) {
@@ -1903,7 +2150,9 @@ export class Mill {
   // Pause the running batch: PAUSING releases its equipment once everything has stopped, then it sits PAUSED for Resume.
   private pauseActiveBatch(): boolean {
     const b = this.activeBatch;
-    if (!b || ['COMPLETED', 'FAULTED', 'PAUSED', 'PAUSING', 'IDLE'].includes(b.state)) return false;
+    if (!b || ['COMPLETED', 'FAULTED', 'ABORTED', 'ABORTED_HOLD', 'PAUSED', 'PAUSING', 'IDLE'].includes(b.state)) return false;
+    const st = b.dosingSteps[b.dosingIndex];
+    if (b.state === 'DOSING' && st) st.clean = false; // a paused feed is not a clean run: no freefall calibration from it
     b.previousState = b.state;
     b.state = 'PAUSING';
     this.initiateEquipmentStop(b.id);
@@ -2166,6 +2415,7 @@ export class Mill {
       else if (b.state === 'MIXING') progress = 50 + 40 * (1 - b.mixTimeRemainingMs / Math.max(1, b.mixTimeTotalMs));
       else if (b.state === 'DOSING') progress = totalTarget > 0 ? Math.round(50 * totalActual / totalTarget) : 0;
       else if (['DISCHARGING', 'CLEAROUT'].includes(b.state)) progress = 92;
+      else if (b.state === 'ROUTE_PRECHECK') progress = 90;
       return {
         id: b.id, recipeId: b.recipeId, recipeName: b.recipeName,
         targetMass: b.targetMass, destination: b.destination, state: b.state,
@@ -2174,10 +2424,11 @@ export class Mill {
         dosingSteps: b.dosingSteps.map(s => ({
           ingredientId: s.ingredientId, ingredientName: s.ingredientName,
           sourceBinId: s.sourceBinId, target: s.target,
-          actual: Math.round(s.actual * 10) / 10, unit: s.unit, state: s.state,
+          actual: Math.round(s.actual * 10) / 10, unit: s.unit, state: s.state, deviation: s.deviation,
         })),
         mixTimeRemainingMs: b.mixTimeRemainingMs, mixTimeTotalMs: b.mixTimeTotalMs,
         faultReason: b.faultReason,
+        scheduledAt: b.scheduledAt, late: b.late, warnings: b.warnings, tolHold: b.tolHold,
       };
     };
 
@@ -2188,7 +2439,7 @@ export class Mill {
       queue: this.queue.map(batchToQueue),
       activeBatch: this.activeBatch ? batchToQueue(this.activeBatch) : null,
       faults: this.faults,
-      bins: this.bins.map(b => ({ ...b, levelSwitchState: this.levelState(b.id) })),
+      bins: this.bins.map(b => ({ ...b, hidden: this.isHidden(b.id) || undefined, levelSwitchState: this.levelState(b.id) })),
       recipes: this.recipes,
       ingredients: this.ingredients,
       connections: this.connections,
@@ -2348,11 +2599,8 @@ export class Mill {
   }
 
   private batchFault(b: BatchRuntime, reason: string) {
-    b.state = 'FAULTED';
-    b.faultReason = reason;
-    this.releaseEquipment(b.id);
     this.raiseFault('BATCH', 'CRITICAL', `Batch ${b.id}: ${reason}`, 'E-BA-01');
-    persistBatch(b);
+    this.abortActive(b, reason, 'FAULTED');
   }
 
   private releaseEquipment(ownerId: string) {
@@ -2368,9 +2616,85 @@ export class Mill {
     return undefined;
   }
 
+  private buildBatch(id: string, recipe: Recipe, destination: string, targetMass?: number, scheduledAt?: string): BatchRuntime {
+    // a requested size scales every line (micros included); no size = the recipe as written
+    const lines = scaleLines([...recipe.lines, ...recipe.microLines], targetMass);
+    const steps: DosingStep[] = lines.map(line => {
+      const ing = this.ingredients.find(i => i.id === line.ingredientId);
+      const bin = this.findBinForIngredient(line.ingredientId);
+      const augerId = this.findAugerForBin(bin?.id ?? '');
+      return {
+        ingredientId: line.ingredientId,
+        ingredientName: ing?.name ?? line.ingredientId,
+        sourceBinId: bin?.id ?? '',
+        augerId: augerId ?? '',
+        target: line.target,
+        actual: 0,
+        unit: line.unit,
+        state: 'pending' as const,
+        baselineWeight: 0,
+        settleStartTime: 0,
+        cutoffStartTime: 0,
+      };
+    });
+    return {
+      id, recipeId: recipe.id, recipeName: recipe.name,
+      targetMass: Math.round(steps.reduce((s, st) => s + st.target, 0) * 100) / 100,
+      destination,
+      state: 'IDLE',
+      startedAt: '',
+      dosingIndex: 0,
+      dosingSteps: steps,
+      mixTimeRemainingMs: recipe.mixTime * 1000,
+      mixTimeTotalMs: recipe.mixTime * 1000,
+      dischargeStartTime: 0,
+      scheduledAt,
+    };
+  }
+
+  // Advisory only (the operator confirms): what the batch would need from each bin after every batch ahead of it in the queue,
+  // and whether it fits the mixer. Raised when a batch is added or edited, never at start.
+  private batchWarnings(b: BatchRuntime): string[] {
+    const w: string[] = [];
+    const ahead = new Map<string, number>();
+    for (const o of this.queue) {
+      if (o.id === b.id) break; // on an edit the batch sits in the queue: count only what is in front of it
+      if (['COMPLETED', 'FAULTED', 'ABORTED'].includes(o.state)) continue;
+      for (const st of o.dosingSteps) ahead.set(st.sourceBinId, (ahead.get(st.sourceBinId) ?? 0) + st.target);
+    }
+    const need = new Map<string, number>();
+    for (const st of b.dosingSteps) {
+      if (!st.sourceBinId) { w.push(`No source bin for ${st.ingredientName}`); continue; }
+      if (!st.augerId) w.push(`No auger below ${st.sourceBinId}`);
+      need.set(st.sourceBinId, (need.get(st.sourceBinId) ?? 0) + st.target);
+    }
+    for (const [binId, n] of need) {
+      const bin = this.bins.find(x => x.id === binId);
+      if (!bin) continue;
+      const available = bin.balance - (ahead.get(binId) ?? 0);
+      if (n > available) w.push(`${bin.name}: needs ${round1(n)} lbs, ${round1(Math.max(0, available))} available${ahead.get(binId) ? ' after the batches ahead' : ''}`);
+    }
+    const mixer = this.findEquipmentByType('mixer');
+    const capacity = Number(mixer?.config.capacity ?? 4000);
+    if (mixer && capacity > 0 && b.targetMass > capacity) w.push(`Batch is ${round1(b.targetMass)} lbs; mixer capacity is ${capacity} lbs`);
+    return w;
+  }
+
+  private isHidden(binId: string) { return this.equipment.get(binId)?.config.notTracked === true; }
+
+  // A bin marked Not tracked must still discharge only to a hammermill; if a connection change breaks that, the flag is cleared.
+  private revalidateHiddenBins() {
+    for (const eq of this.equipment.values()) {
+      if (eq.config.notTracked !== true) continue;
+      if (feedsOnlyHammermill(eq.id, this.connections, id => this.equipment.get(id)?.equipmentType)) continue;
+      delete eq.config.notTracked;
+      this.raiseFault(eq.id, 'WARNING', `${eq.name} no longer feeds only a hammermill - it is tracked again`, 'W-BN-01');
+    }
+  }
+
   private findBinForIngredient(ingredientId: string): Bin | undefined {
     return this.bins
-      .filter(b => b.ingredientId === ingredientId && b.type !== 'finished')
+      .filter(b => b.ingredientId === ingredientId && b.type !== 'finished' && !this.isHidden(b.id))
       .sort((a, b) => {
         const na = parseInt(a.id.replace(/\D/g, '')) || 0;
         const nb = parseInt(b.id.replace(/\D/g, '')) || 0;
@@ -2385,23 +2709,10 @@ export class Mill {
     return undefined;
   }
 
-  private findGateForDischarge(): EquipmentRuntime | undefined {
-    for (const eq of this.equipment.values()) {
-      if (eq.equipmentType === 'gate') return eq;
-    }
-    return undefined;
-  }
-
+  // Only the scale assigned to the mixer counts: with none assigned (or none reading) the batch has no weight to work with.
   private getMixerScale(): ScaleReading | undefined {
-    const mixer = this.findEquipmentByType('mixer');
-    const id = mixer?.config.scaleId as string | undefined;
-    if (id) return this.scales[id];
-    return this.scales[Object.keys(this.scales)[0] ?? ''];
-  }
-
-  private hasMappedScales(): boolean {
-    const mixer = this.findEquipmentByType('mixer');
-    return !!(mixer?.config.scaleId);
+    const id = this.findEquipmentByType('mixer')?.config.scaleId as string | undefined;
+    return id ? this.scales[id] : undefined;
   }
 
   // ── default config matching hmi-prototype ──

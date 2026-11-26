@@ -234,6 +234,8 @@ gl.owner = undefined; gl.request = false;
 
 // the batch drives only equipment in Auto, and pauses when equipment it owns trips
 m.equipment.delete('MX-1');
+const mxt: any = mk('MXT', 'mixer', { scaleId: 'SCT' }); mxt.mode = 'Auto'; m.equipment.set('MXT', mxt); // a batch needs a mixer with a real scale reading
+m.scales.SCT = { weight: 0, stable: true, valid: true, timestamp: Date.now() };
 const ag: any = mk('AG', 'auger', { runOutput: 'AG_OUT', runConfirmAux: 'AG_AUX' }); ag.mode = 'Off'; m.equipment.set('AG', ag); m.ioInputs.AG_AUX = true;
 m.activeBatch = { id: 'BT', recipeId: 'R', recipeName: 'R', targetMass: 100, destination: 'BIN', state: 'DOSING', startedAt: new Date().toISOString(), dosingIndex: 0,
   dosingSteps: [{ ingredientId: 'I', ingredientName: 'I', sourceBinId: 'SB', augerId: 'AG', target: 50, actual: 0, unit: 'lbs', state: 'pending', baselineWeight: 0, settleStartTime: 0, cutoffStartTime: 0 }],
@@ -244,7 +246,7 @@ assert.equal(ag.owner, 'BT'); assert.equal(m.activeBatch.faultReason, undefined,
 m.ioInputs.AG_AUX = false; scan(10);
 assert.ok(['PAUSING', 'PAUSED'].includes(m.activeBatch.state), `batch pauses when its auger trips (${m.activeBatch.state})`);
 assert.match(m.activeBatch.faultReason, /AG faulted/);
-m.releaseEquipment('BT'); m.activeBatch = null;
+m.releaseEquipment('BT'); m.activeBatch = null; m.equipment.delete('MXT'); delete m.scales.SCT;
 
 // gates: P1 (open) / P2 (closed) / Auto / Off instead of Hand; bins have no HOA
 const gp: any = mk('GP', 'gate', { openOutput: 'GP_O', closeOutput: 'GP_C', openLimitInput: 'GP_OL', closedLimitInput: 'GP_CL', positionTimeout: 5 }); gp.mode = 'Off'; m.equipment.set('GP', gp);

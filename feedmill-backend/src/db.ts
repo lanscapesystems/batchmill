@@ -76,32 +76,35 @@ CREATE TABLE IF NOT EXISTS fault_log (
 );
 `;
 
-// ── active batch persistence ──
+// ── batch persistence: the whole batch as JSON, queued and active alike (queued batches survive a restart) ──
 
-const upsertBatch = () => db.prepare(`
-  INSERT OR REPLACE INTO active_batch
-    (id, recipe_id, recipe_name, target_mass, destination, state,
-     started_at, dosing_index, dosing_steps,
-     mix_time_remaining_ms, mix_time_total_ms, discharge_start_time,
-     fault_reason, previous_state, updated_at)
-  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-`);
+export function persistBatchJson(b: BatchRuntime): void {
+  db.prepare('CREATE TABLE IF NOT EXISTS batch_json (id TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at TEXT NOT NULL)').run();
+  db.prepare('INSERT OR REPLACE INTO batch_json (id, json, updated_at) VALUES (?,?,?)').run(b.id, JSON.stringify(b), new Date().toISOString());
+}
+
+export function removeBatchJson(id: string): void {
+  db.prepare('CREATE TABLE IF NOT EXISTS batch_json (id TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at TEXT NOT NULL)').run();
+  db.prepare('DELETE FROM batch_json WHERE id = ?').run(id);
+}
+
+export function loadBatchesJson(): BatchRuntime[] {
+  db.prepare('CREATE TABLE IF NOT EXISTS batch_json (id TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at TEXT NOT NULL)').run();
+  return (db.prepare('SELECT json FROM batch_json ORDER BY rowid').all() as { json: string }[]).map(r => JSON.parse(r.json) as BatchRuntime);
+}
+
+// ── active batch persistence (legacy table, still read once for a batch saved by an older version) ──
 
 const deleteBatch = () => db.prepare('DELETE FROM active_batch WHERE id = ?');
 const selectBatch = () => db.prepare('SELECT * FROM active_batch LIMIT 1');
 
 export function persistBatch(b: BatchRuntime): void {
-  upsertBatch().run(
-    b.id, b.recipeId, b.recipeName, b.targetMass, b.destination, b.state,
-    b.startedAt, b.dosingIndex, JSON.stringify(b.dosingSteps),
-    b.mixTimeRemainingMs, b.mixTimeTotalMs, b.dischargeStartTime,
-    b.faultReason ?? null, b.previousState ?? null,
-    new Date().toISOString(),
-  );
+  persistBatchJson(b);
 }
 
 export function clearActiveBatch(id: string): void {
   deleteBatch().run(id);
+  removeBatchJson(id);
 }
 
 export function loadActiveBatch(): BatchRuntime | null {

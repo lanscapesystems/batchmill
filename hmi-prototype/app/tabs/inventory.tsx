@@ -30,7 +30,7 @@ export function InventoryTab() {
   const backend = useBackend();
   const [topTab, setTopTab] = useState<TopTab>('BINS');
   const bins: Bin[] = backend?.connected
-    ? backend.bins.map(b => ({ ...b, tracked: b.tracked ?? true }))
+    ? backend.bins.filter(b => !b.hidden).map(b => ({ ...b, tracked: b.tracked ?? true })) // hammermill-feed bins marked Not tracked stay out of inventory
     : [];
   const ingredients: Ingredient[] = backend?.connected ? backend.ingredients : [];
 

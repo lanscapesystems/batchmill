@@ -1,6 +1,6 @@
 // Frontend view types for backend state
 
-export type BatchState = 'IDLE' | 'VALIDATING' | 'READY' | 'DOSING' | 'MIXING' | 'ROUTE_PRECHECK' | 'DISCHARGING' | 'CLEAROUT' | 'COMPLETED' | 'PAUSING' | 'PAUSED' | 'FAULTED';
+export type BatchState = 'IDLE' | 'VALIDATING' | 'READY' | 'DOSING' | 'MIXING' | 'ROUTE_PRECHECK' | 'DISCHARGING' | 'CLEAROUT' | 'COMPLETED' | 'PAUSING' | 'PAUSED' | 'FAULTED' | 'ABORTED_HOLD' | 'ABORTED';
 
 export interface Ingredient {
   id: string;
@@ -32,6 +32,7 @@ export interface Bin {
   unit: string;
   type: 'ingredient' | 'finished' | 'micro_hopper';
   tracked?: boolean;
+  hidden?: boolean; // hammermill-feed bin marked Not tracked: not shown in inventory or recipes
   levelSwitchState?: 'empty' | 'full' | 'normal' | 'fault';
 }
 
@@ -61,6 +62,16 @@ export interface QueueEntry {
   startedAt?: string;
   completedAt?: string;
   actuals?: { ingredientId: string; target: number; actual: number; unit: string; sourceBinId: string; alternateBinIds?: string[] }[];
+  scheduledAt?: string;
+  late?: boolean;
+  warnings?: string[];
+  faultReason?: string;
+  tolHold?: ToleranceHold;
+}
+
+// An out-of-tolerance step waiting for the operator (Ignore / Update freefall / Abort).
+export interface ToleranceHold {
+  stepIndex: number; ingredientName: string; desired: number; actual: number; difference: number; currentFreefall: number; newFreefall: number;
 }
 
 export interface Fault {

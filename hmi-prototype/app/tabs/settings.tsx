@@ -764,7 +764,22 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
       const connectedAugerId = connections?.find(c => c.from === equipmentId)?.to;
       const connectedAuger = connectedAugerId ? allEquipment?.find(e => e.id === connectedAugerId) : undefined;
       const augerHasAnalog = !!(connectedAuger?.config.analogSpeedOutput);
+      // A bin that discharges only to a hammermill (augers in between are fine) is not a batching bin and can be hidden from tracking.
+      const hammermillOnly = (() => {
+        if (!connections || !allEquipment || !equipmentId || !connections.some(c => c.from === equipmentId)) return false;
+        const seen = new Set<string>();
+        const queue = [equipmentId];
+        while (queue.length) { const n = queue.shift()!; for (const c of connections) if (c.from === n && !seen.has(c.to)) { seen.add(c.to); queue.push(c.to); } }
+        let hm = false;
+        for (const id of seen) {
+          const t = allEquipment.find(e => e.id === id)?.equipmentType;
+          if (t === 'hammermill') hm = true;
+          if (t === 'bin' || t === 'finished_bin' || t === 'mixer') return false;
+        }
+        return hm;
+      })();
       return <>
+        {(hammermillOnly || !!v('notTracked')) && row('Not Tracked', check('notTracked', 'Not tracked (hammermill feed: hidden from inventory and recipes)'))}
         {row('Capacity', numIn('capacity', 0, 'lbs'))}
         {row('High Switch', ioSel(ioPools.di, 'highLevelInput'))}
         {v('highLevelInput') && row('High Switch Polarity', coveredSel('highLevelCovered'))}
@@ -773,6 +788,15 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
         {v('lowLevelInput') && row('Low Switch Polarity', coveredSel('lowLevelCovered'))}
         {v('lowLevelInput') && row('Bin Low Restart Delay', numIn('binLowRestartDelay', 0, 's', 0.1))}
         {row('Freefall', numIn('freefall', 0, 'lbs'))}
+        {row('Tolerance (blank = 2 % of target)', numIn('toleranceLbs', 0, 'lbs', 0.1))}
+        {row('Settle Time', numIn('settleSec', 2, 's', 0.1))}
+        {row('No-Flow Delay', numIn('noProgressDelaySec', 60, 's', 1))}
+        {row('No-Flow Minimum Rise (per 10 s)', numIn('noProgressMinLbs', 2, 'lbs', 0.1))}
+        {row('Auto Freefall', check('ffAuto', 'Adjust freefall after each in-tolerance step'))}
+        {!!v('ffAuto') && <>
+          {row('Adjust Strength', numIn('ffStrengthPct', 50, '%'))}
+          {row('Max Adjust per Batch', numIn('ffMaxAdjLbs', 2, 'lbs', 0.1))}
+        </>}
         {augerHasAnalog && <>
           {row('Slow Feed Speed', numIn('slowFeedSpeed', 50, '%'))}
           {row('Slow Feed', numIn('slowFeedLbs', 0, 'lbs'))}
@@ -832,6 +856,8 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
     case 'mixer':
       return <>
         {row('Capacity', numIn('capacity', 4000, 'lbs'))}
+        {row('Cleanout Time', numIn('cleanoutSec', 0, 's', 0.1))}
+        {row('Discharge Timeout', numIn('dischargeTimeoutSec', 60, 's', 1))}
         {row('MS Coil', ioSel(ioPools.do, 'runOutput'))}
         {row('MS Aux', ioSel(ioPools.di, 'runConfirmAux'))}
         {row('Analog Load Input', ioSel(ioPools.ai, 'analogLoadInput'))}
@@ -1629,6 +1655,18 @@ function GlobalSection() {
                   {(backend?.ioSignals ?? []).filter(s => s.direction === dir).map(s => <option key={s.id} value={s.id}>{s.id}</option>)}
                 </select>
               : <span style={{ color: globalConfig[key] ? 'var(--fg-bright)' : 'var(--fg-dim)' }}>{(globalConfig[key] as string) || 'Not Assigned'}</span>}
+          </div>
+        ))}
+        {([['mixerEmptyLbs', 'Mixer Empty Below', 10, 'lbs'], ['resumeMismatchLbs', 'Resume: Ask if Scale Differs by', 10, 'lbs']] as const).map(([key, label, def, unit]) => (
+          <div key={key} className="flex items-center gap-2">
+            <span style={{ color: 'var(--fg-dim)', width: '200px', flexShrink: 0 }}>{label}</span>
+            {editing
+              ? <div className="flex items-center gap-1">
+                  <input type="number" step={1} min={0} value={draft[key] ?? def}
+                    onChange={e => setDraft({ ...draft, [key]: Number(e.target.value) })} style={inputStyle} />
+                  <span style={{ color: 'var(--fg-dim)', fontSize: '12px' }}>{unit}</span>
+                </div>
+              : <span style={{ color: 'var(--fg-bright)' }}>{globalConfig[key] ?? def} {unit}</span>}
           </div>
         ))}
         {([['hornAutoSilenceSec', 'Horn Auto-Silence (0 = never)', 60], ['hornOnSec', 'Horn On Time', 1], ['hornOffSec', 'Horn Off Time (0 = steady)', 1]] as const).map(([key, label, def]) => (

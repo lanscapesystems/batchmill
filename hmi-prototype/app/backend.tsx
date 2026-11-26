@@ -1,7 +1,7 @@
 'use client';
 
 import { createContext, useContext, useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
-import type { Fault, Ingredient, Bin, Recipe } from './sim-data';
+import type { Fault, Ingredient, Bin, Recipe, ToleranceHold } from './sim-data';
 import type { EquipmentStatus, EquipmentMode } from './store';
 
 export interface BackendEquipment {
@@ -53,10 +53,15 @@ export interface BackendBatch {
     actual: number;
     unit: string;
     state: string;
+    deviation?: number;
   }[];
   mixTimeRemainingMs?: number;
   mixTimeTotalMs?: number;
   faultReason?: string;
+  scheduledAt?: string;
+  late?: boolean;
+  warnings?: string[];
+  tolHold?: ToleranceHold;
 }
 
 export interface BackendSignal {
@@ -307,7 +312,7 @@ export function BackendProvider({ children }: { children: ReactNode }) {
         resolve({ accepted: false, reason: 'Not connected' });
       }
     });
-    if (!result.accepted) {
+    if (!result.accepted && result.data === undefined) { // a rejection that carries data is a question for the operator (warnings, scale mismatch), not an error
       setCommandError(result.reason || `${action} was rejected`);
       clearTimeout(errorTimer.current);
       errorTimer.current = setTimeout(() => setCommandError(null), 6000);

@@ -51,7 +51,8 @@ export interface EquipmentRuntime {
 }
 
 export type BatchState = 'IDLE' | 'VALIDATING' | 'READY' | 'DOSING' | 'MIXING' |
-  'ROUTE_PRECHECK' | 'DISCHARGING' | 'CLEAROUT' | 'COMPLETED' | 'PAUSING' | 'PAUSED' | 'FAULTED';
+  'ROUTE_PRECHECK' | 'DISCHARGING' | 'CLEAROUT' | 'COMPLETED' | 'PAUSING' | 'PAUSED' | 'FAULTED' |
+  'ABORTED_HOLD' | 'ABORTED'; // aborted/failed with material in the mixer: waits for Unload (or Discard once empty)
 
 export interface DosingStep {
   ingredientId: string;
@@ -61,10 +62,28 @@ export interface DosingStep {
   target: number;
   actual: number;
   unit: string;
-  state: 'pending' | 'baseline' | 'feeding' | 'cutoff' | 'settling' | 'complete' | 'faulted';
+  state: 'pending' | 'baseline' | 'feeding' | 'cutoff' | 'settling' | 'hold' | 'complete' | 'faulted';
   baselineWeight: number;
   settleStartTime: number;
   cutoffStartTime: number;
+  augerRunMs?: number;   // time the auger has run this feed (no-progress delay counts from here)
+  progressMs?: number;   // time in the current no-progress window
+  progressRef?: number;  // step actual at the start of the window
+  clean?: boolean;       // false once paused / scale lost / re-baselined: the stop point is not a clean run, so no freefall calibration
+  deviation?: number;    // actual - target once settled
+  ffOld?: number;        // freefall before / after the calibration of this step (set when one was applied)
+  ffNew?: number;
+}
+
+// Out-of-tolerance step waiting for the operator (Ignore / Update freefall / Abort).
+export interface ToleranceHold {
+  stepIndex: number;
+  ingredientName: string;
+  desired: number;
+  actual: number;
+  difference: number;
+  currentFreefall: number;
+  newFreefall: number;
 }
 
 export interface BatchRuntime {
@@ -83,6 +102,15 @@ export interface BatchRuntime {
   dischargeStartTime: number;
   faultReason?: string;
   previousState?: BatchState;
+  order?: number;                // queue position (kept across restarts; Move changes it)
+  scheduledAt?: string;          // ISO time: not released before this
+  late?: boolean;                // released more than a minute after its scheduled time
+  warnings?: string[];           // queue-time warnings (inventory / mixer capacity) the operator accepted
+  tolHold?: ToleranceHold;
+  dischargeStartWeight?: number; // mixer weight when discharge began (credited weight = this minus what is left)
+  emptySinceMs?: number;         // when the scale first declared the mixer empty (cleanout time counts from here)
+  consumptionPosted?: boolean;   // dosed material already deducted from the bins
+  unloading?: boolean;           // an aborted batch is discharging its mixer contents
 }
 
 export interface Recipe {
@@ -112,6 +140,7 @@ export interface Bin {
   unit: string;
   type: 'ingredient' | 'finished' | 'micro_hopper';
   tracked?: boolean;
+  hidden?: boolean; // snapshot only: a hammermill-feed bin marked Not tracked (hidden from inventory and recipes)
 }
 
 export interface Fault {
@@ -226,10 +255,15 @@ export interface QueueSnapshot {
     actual: number;
     unit: string;
     state: string;
+    deviation?: number;
   }[];
   mixTimeRemainingMs?: number;
   mixTimeTotalMs?: number;
   faultReason?: string;
+  scheduledAt?: string;
+  late?: boolean;
+  warnings?: string[];
+  tolHold?: ToleranceHold;
 }
 
 export interface BatchSnapshot extends QueueSnapshot {}

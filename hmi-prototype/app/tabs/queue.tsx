@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { type QueueEntry, type Recipe, type Bin } from '../sim-data';
+import { type QueueEntry, type Recipe, type Bin, type ToleranceHold } from '../sim-data';
 import { useBackend, type BackendBatch } from '../backend';
 import { useMillStore, type FlowConnection } from '../store';
 
@@ -18,10 +18,13 @@ const stateColor: Record<string, string> = {
   PAUSING: 'var(--orange)',
   PAUSED: 'var(--orange)',
   FAULTED: 'var(--red)',
+  ABORTED_HOLD: 'var(--orange)',
+  ABORTED: 'var(--red)',
 };
 
-const RUNNING_STATES = new Set(['VALIDATING', 'DOSING', 'MIXING', 'ROUTE_PRECHECK', 'DISCHARGING', 'CLEAROUT', 'PAUSING', 'PAUSED', 'FAULTED']);
-const EDITABLE_STATES = new Set(['IDLE', 'READY']);
+const RUNNING_STATES = new Set(['VALIDATING', 'DOSING', 'MIXING', 'ROUTE_PRECHECK', 'DISCHARGING', 'CLEAROUT', 'PAUSING', 'PAUSED', 'FAULTED', 'ABORTED_HOLD']);
+const EDITABLE_STATES = new Set(['IDLE']); // queued, not yet released
+const stateLabel = (s: string) => (s === 'IDLE' ? 'QUEUED' : s.replace(/_/g, ' '));
 
 const btnBase = { padding: '6px 14px', borderRadius: '3px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 600 } as const;
 
@@ -32,6 +35,7 @@ function backendToQueueEntry(b: BackendBatch): QueueEntry {
     state: b.state as QueueEntry['state'],
     progress: b.progress,
     startedAt: b.startedAt, completedAt: b.completedAt,
+    scheduledAt: b.scheduledAt, late: b.late, warnings: b.warnings, faultReason: b.faultReason, tolHold: b.tolHold,
     actuals: b.dosingSteps?.map(s => ({
       ingredientId: s.ingredientId, target: s.target, actual: s.actual,
       unit: s.unit, sourceBinId: s.sourceBinId,
@@ -80,8 +84,11 @@ export function QueueTab() {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [newBatchOpen, setNewBatchOpen] = useState(false);
   const [editBatchId, setEditBatchId] = useState<string | null>(null);
-  const [abortConfirmOpen, setAbortConfirmOpen] = useState(false);
-  const [awaitingUnload, setAwaitingUnload] = useState(false);
+  const [abortMenu, setAbortMenu] = useState(false); // Abort pressed on a paused batch: the choices replace Resume/Abort
+  const [cancelAckOpen, setCancelAckOpen] = useState(false);
+  // questions the backend asks before going on: queue-time warnings, a scale that disagrees on resume
+  const [warnAsk, setWarnAsk] = useState<{ warnings: string[]; action: string; targetId?: string; data: Record<string, unknown> } | null>(null);
+  const [mismatchAsk, setMismatchAsk] = useState<{ saved: number; current: number; ingredientName: string } | null>(null);
 
   const backend = useBackend();
   const { equipment, connections } = useMillStore();
@@ -104,7 +111,7 @@ export function QueueTab() {
   const hasActiveBatch = !!activeBatchEntry;
   const queueHeld = backend?.queueControl.held ?? true;
   const queueWaiting = backend?.queueControl.waiting;
-  const TERMINAL = new Set(['COMPLETED', 'FAULTED']);
+  const TERMINAL = new Set(['COMPLETED', 'FAULTED', 'ABORTED']);
   const active = queueData.filter(q => !TERMINAL.has(q.state));
   const history = queueData.filter(q => TERMINAL.has(q.state));
 
@@ -117,9 +124,6 @@ export function QueueTab() {
 
   const backendEqMap = new Map((backend?.connected ? backend.equipment : []).map(e => [e.id, e]));
 
-  useEffect(() => {
-    if (!hasActiveBatch) setAwaitingUnload(false);
-  }, [hasActiveBatch]);
 
   function handleHmDestChange(hmId: string, dest: string) {
     const group = hmGroupMap.get(hmId) ?? [hmId];
@@ -137,11 +141,30 @@ export function QueueTab() {
 
   const isPaused = activeBatchEntry?.state === 'PAUSED' || activeBatchEntry?.state === 'PAUSING';
 
-  async function handleAbortConfirm() {
-    if (backend?.connected) await backend.sendCommand('AbortBatch');
-    setAbortConfirmOpen(false);
-    setAwaitingUnload(true);
+  async function handleCancelConfirm() {
+    if (backend?.connected) await backend.sendCommand('AbortBatch', undefined, { mode: 'cancel', acknowledged: true });
+    setCancelAckOpen(false); setAbortMenu(false);
   }
+
+  // Add / edit a batch: the backend answers with warnings (inventory, mixer capacity) and the operator confirms to go on
+  async function submitBatch(action: string, targetId: string | undefined, data: Record<string, unknown>) {
+    if (!backend?.connected) return;
+    const r = await backend.sendCommand(action, targetId, data);
+    if (!r.accepted && r.reason === 'Warnings') { setWarnAsk({ warnings: (r.data as { warnings: string[] }).warnings, action, targetId, data }); return; }
+    setNewBatchOpen(false); setEditBatchId(null);
+  }
+
+  async function handleResume(rebaseline = false) {
+    if (!backend?.connected) return;
+    setAbortMenu(false);
+    const r = await backend.sendCommand('ResumeBatch', undefined, rebaseline ? { rebaseline: true } : undefined);
+    if (!r.accepted && r.reason === 'Scale mismatch') setMismatchAsk(r.data as { saved: number; current: number; ingredientName: string });
+    else setMismatchAsk(null);
+  }
+
+  const aborted = activeBatchEntry?.state === 'ABORTED_HOLD';
+  // the tolerance popup steps aside once the batch is paused, so the Abort choices are reachable
+  const tolHold: ToleranceHold | undefined = isPaused ? undefined : activeBatchEntry?.tolHold;
 
   return (
     <div className="flex flex-col gap-3">
@@ -160,9 +183,12 @@ export function QueueTab() {
                   </div>
                 </div>
                 <span style={{ color: stateColor[activeBatchEntry.state] ?? 'var(--fg)', fontWeight: 600 }}>
-                  {activeBatchEntry.state}
+                  {stateLabel(activeBatchEntry.state)}
                 </span>
               </div>
+              {activeBatchEntry.faultReason && (
+                <div style={{ color: 'var(--orange)', fontSize: '11px' }}>{activeBatchEntry.faultReason}</div>
+              )}
               <div>
                 <div className="flex justify-between" style={{ fontSize: '11px', color: 'var(--fg-dim)', marginBottom: '4px' }}>
                   <span>Progress</span>
@@ -174,19 +200,40 @@ export function QueueTab() {
               </div>
               {backend?.connected && (
                 <div className="flex gap-2">
-                  {awaitingUnload ? (
-                    <button onClick={() => { backend.sendCommand('UnloadBatch'); setAwaitingUnload(false); }}
-                      style={{ ...btnBase, background: 'var(--green)', color: '#000' }}>Unload</button>
+                  {aborted ? (
+                    <>
+                      <button onClick={() => backend.sendCommand('UnloadBatch')}
+                        style={{ ...btnBase, background: 'var(--green)', color: '#000' }}>Unload</button>
+                      <button onClick={() => backend.sendCommand('DiscardBatch')}
+                        style={{ ...btnBase, background: 'transparent', border: '1px solid var(--border)', color: 'var(--fg-dim)' }}>Discard (mixer empty)</button>
+                    </>
+                  ) : abortMenu && activeBatchEntry.state === 'PAUSED' ? (
+                    <>
+                      <button onClick={() => { setAbortMenu(false); backend.sendCommand('AbortBatch', undefined, { mode: 'mixUnload' }); }}
+                        style={{ ...btnBase, background: 'var(--green)', color: '#000' }}>Mix + Unload</button>
+                      <button onClick={() => { setAbortMenu(false); backend.sendCommand('AbortBatch', undefined, { mode: 'unload' }); }}
+                        style={{ ...btnBase, background: 'var(--orange)', color: '#000' }}>Unload</button>
+                      <button onClick={() => setCancelAckOpen(true)}
+                        style={{ ...btnBase, background: 'var(--red)', color: '#fff' }}>Cancel Batch</button>
+                      <button onClick={() => setAbortMenu(false)}
+                        style={{ ...btnBase, background: 'transparent', border: '1px solid var(--border)', color: 'var(--fg-dim)' }}>Back</button>
+                    </>
                   ) : isPaused ? (
-                    <button onClick={() => backend.sendCommand('ResumeBatch')}
-                      style={{ ...btnBase, background: 'var(--green)', color: '#000' }}>Resume</button>
+                    <>
+                      <button onClick={() => handleResume()}
+                        style={{ ...btnBase, background: 'var(--green)', color: '#000' }}>Resume</button>
+                      {activeBatchEntry.state === 'PAUSED' && (
+                        <button onClick={() => setAbortMenu(true)}
+                          style={{ ...btnBase, background: 'var(--red)', color: '#fff' }}>Abort</button>
+                      )}
+                    </>
                   ) : (
                     <button onClick={() => backend.sendCommand('PauseBatch')}
                       style={{ ...btnBase, background: 'var(--orange)', color: '#000' }}>Pause</button>
                   )}
-                  {!awaitingUnload && (
-                    <button onClick={() => setAbortConfirmOpen(true)}
-                      style={{ ...btnBase, background: 'var(--red)', color: '#fff' }}>Abort</button>
+                  {activeBatchEntry.state === 'DISCHARGING' && /not empty/.test(activeBatchEntry.faultReason ?? '') && (
+                    <button onClick={() => backend.sendCommand('ExtendDischarge')}
+                      style={{ ...btnBase, background: 'var(--accent)', color: '#000' }}>Extend Discharge</button>
                   )}
                 </div>
               )}
@@ -281,6 +328,8 @@ export function QueueTab() {
               <BatchRow key={`${q.id}-${i}`} entry={q} expanded={expanded === q.id}
                 onToggle={() => setExpanded(expanded === q.id ? null : q.id)}
                 onEdit={EDITABLE_STATES.has(q.state) ? () => setEditBatchId(q.id) : undefined}
+                onDelete={EDITABLE_STATES.has(q.state) && backend?.connected ? () => backend.sendCommand('DeleteBatch', q.id) : undefined}
+                onMove={EDITABLE_STATES.has(q.state) && backend?.connected ? (dir) => backend.sendCommand('MoveBatch', q.id, { direction: dir }) : undefined}
                 ingredients={ingredients} />
             ))}
             {active.length === 0 && (
@@ -312,18 +361,19 @@ export function QueueTab() {
         </table>
       </Panel>
 
-      {/* Abort Confirm */}
-      {abortConfirmOpen && (
-        <ModalOverlay onClose={() => setAbortConfirmOpen(false)}>
-          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px', color: 'var(--fg-bright)' }}>Abort Batch?</div>
-          <div style={{ fontSize: '12px', color: 'var(--fg)', marginBottom: '14px' }}>
-            This will stop the current batch. Press Unload to run the unload sequence.
+      {/* Cancel batch: acknowledged here; nothing is discharged */}
+      {cancelAckOpen && (
+        <ModalOverlay onClose={() => setCancelAckOpen(false)}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px', color: 'var(--fg-bright)' }}>Cancel batch?</div>
+          <div style={{ fontSize: '12px', color: 'var(--orange)', marginBottom: '14px' }}>
+            The batch ends now and the material already dosed stays in the mixer. It is deducted from the bins, but nothing is credited to a finished bin.
+            The mixer must be emptied by hand before the next batch can start.
           </div>
           <div className="flex gap-2 justify-end">
-            <button onClick={() => setAbortConfirmOpen(false)}
-              style={{ ...btnBase, background: 'var(--bg)', color: 'var(--fg)', border: '1px solid var(--border)' }}>Cancel</button>
-            <button onClick={handleAbortConfirm}
-              style={{ ...btnBase, background: 'var(--red)', color: '#fff' }}>Abort</button>
+            <button onClick={() => setCancelAckOpen(false)}
+              style={{ ...btnBase, background: 'var(--bg)', color: 'var(--fg)', border: '1px solid var(--border)' }}>Go Back</button>
+            <button onClick={handleCancelConfirm}
+              style={{ ...btnBase, background: 'var(--red)', color: '#fff' }}>Cancel Batch</button>
           </div>
         </ModalOverlay>
       )}
@@ -334,24 +384,72 @@ export function QueueTab() {
           recipes={recipes}
           finishedBins={finishedBins}
           initial={editBatchId ? queueData.find(q => q.id === editBatchId) : undefined}
-          onSubmit={(data) => {
-            if (editBatchId && backend?.connected) {
-              backend.sendCommand('EditBatch', editBatchId, data);
-            } else if (backend?.connected) {
-              backend.sendCommand('QueueBatch', undefined, data);
-            }
-            setNewBatchOpen(false);
-            setEditBatchId(null);
-          }}
+          onSubmit={(data) => { submitBatch(editBatchId ? 'EditBatch' : 'QueueBatch', editBatchId ?? undefined, data); }}
           onClose={() => { setNewBatchOpen(false); setEditBatchId(null); }}
         />
+      )}
+
+      {/* Queue-time warnings: inventory and mixer capacity, confirmed here so the queue never stalls on them at start */}
+      {warnAsk && (
+        <ModalOverlay onClose={() => setWarnAsk(null)}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px', color: 'var(--fg-bright)' }}>Check before queueing</div>
+          <ul style={{ fontSize: '12px', color: 'var(--orange)', margin: '0 0 14px 16px', listStyle: 'disc' }}>
+            {warnAsk.warnings.map((w, i) => <li key={i}>{w}</li>)}
+          </ul>
+          <div className="flex gap-2 justify-end">
+            <button onClick={() => setWarnAsk(null)}
+              style={{ ...btnBase, background: 'var(--bg)', color: 'var(--fg)', border: '1px solid var(--border)' }}>Cancel</button>
+            <button onClick={async () => { const a = warnAsk; setWarnAsk(null); await backend?.sendCommand(a.action, a.targetId, { ...a.data, acknowledged: true }); setNewBatchOpen(false); setEditBatchId(null); }}
+              style={{ ...btnBase, background: 'var(--accent)', color: '#000' }}>{warnAsk.action === 'EditBatch' ? 'Save anyway' : 'Add anyway'}</button>
+          </div>
+        </ModalOverlay>
+      )}
+
+      {/* Out of tolerance: the batch is holding for the operator */}
+      {tolHold && (
+        <ModalOverlay onClose={() => undefined}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px', color: 'var(--fg-bright)' }}>{tolHold.ingredientName} is out of tolerance</div>
+          <table style={{ fontSize: '12px', marginBottom: '14px' }}>
+            <tbody>
+              {([['Desired', `${tolHold.desired} lbs`], ['Actual', `${tolHold.actual.toFixed(1)} lbs`], ['Difference', `${tolHold.difference > 0 ? '+' : ''}${tolHold.difference.toFixed(1)} lbs`],
+                ['Current freefall', `${tolHold.currentFreefall} lbs`], ['Freefall if updated', `${tolHold.newFreefall} lbs`]] as const).map(([k, val]) => (
+                <tr key={k}><td style={{ color: 'var(--fg-dim)', paddingRight: '16px' }}>{k}</td><td style={{ color: 'var(--fg-bright)' }}>{val}</td></tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="flex gap-2 justify-end">
+            <button onClick={() => backend?.sendCommand('PauseBatch')}
+              style={{ ...btnBase, background: 'var(--orange)', color: '#000' }}>Pause</button>
+            <button onClick={() => backend?.sendCommand('ResolveTolerance', undefined, { choice: 'ignore' })}
+              style={{ ...btnBase, background: 'var(--bg)', color: 'var(--fg)', border: '1px solid var(--border)' }}>Ignore</button>
+            <button onClick={() => backend?.sendCommand('ResolveTolerance', undefined, { choice: 'update' })}
+              style={{ ...btnBase, background: 'var(--accent)', color: '#000' }}>Update Freefall</button>
+          </div>
+        </ModalOverlay>
+      )}
+
+      {/* Resume: the scale no longer matches the saved progress */}
+      {mismatchAsk && (
+        <ModalOverlay onClose={() => setMismatchAsk(null)}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px', color: 'var(--fg-bright)' }}>The scale does not match the saved progress</div>
+          <div style={{ fontSize: '12px', color: 'var(--fg)', marginBottom: '14px' }}>
+            While dosing {mismatchAsk.ingredientName} the mixer should read {mismatchAsk.saved} lbs, but it reads {mismatchAsk.current} lbs.
+            Re-baseline carries on from the current reading (no freefall calibration from this step), or close this and Abort the paused batch.
+          </div>
+          <div className="flex gap-2 justify-end">
+            <button onClick={() => setMismatchAsk(null)}
+              style={{ ...btnBase, background: 'var(--bg)', color: 'var(--fg)', border: '1px solid var(--border)' }}>Close</button>
+            <button onClick={() => handleResume(true)}
+              style={{ ...btnBase, background: 'var(--accent)', color: '#000' }}>Re-baseline and Resume</button>
+          </div>
+        </ModalOverlay>
       )}
     </div>
   );
 }
 
-function BatchRow({ entry: q, expanded, onToggle, onEdit, ingredients }: {
-  entry: QueueEntry; expanded: boolean; onToggle: () => void; onEdit?: () => void; ingredients: { id: string; name: string }[];
+function BatchRow({ entry: q, expanded, onToggle, onEdit, onDelete, onMove, ingredients }: {
+  entry: QueueEntry; expanded: boolean; onToggle: () => void; onEdit?: () => void; onDelete?: () => void; onMove?: (dir: 'up' | 'down') => void; ingredients: { id: string; name: string }[];
 }) {
   return (
     <>
@@ -364,7 +462,9 @@ function BatchRow({ entry: q, expanded, onToggle, onEdit, ingredients }: {
         <td className="py-2 px-3">
           <span className="inline-flex items-center gap-1.5">
             <span className="w-1.5 h-1.5 rounded-full inline-block" style={{ background: stateColor[q.state] ?? 'var(--gray)' }} />
-            <span style={{ color: stateColor[q.state] ?? 'var(--fg)' }}>{q.state}</span>
+            <span style={{ color: stateColor[q.state] ?? 'var(--fg)' }}>{stateLabel(q.state)}</span>
+            {q.state === 'IDLE' && q.scheduledAt && <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>starts {new Date(q.scheduledAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>}
+            {q.late && <span style={{ color: 'var(--orange)', fontSize: '11px' }}>late</span>}
           </span>
         </td>
         {q.state !== 'COMPLETED' && (
@@ -374,14 +474,19 @@ function BatchRow({ entry: q, expanded, onToggle, onEdit, ingredients }: {
       {expanded && (
         <tr style={{ background: 'var(--bg-row)' }}>
           <td colSpan={7} className="px-6 py-2">
+            {q.warnings && q.warnings.length > 0 && (
+              <ul style={{ color: 'var(--orange)', fontSize: '11px', margin: '0 0 6px 16px', listStyle: 'disc' }}>
+                {q.warnings.map((w, i) => <li key={i}>{w}</li>)}
+              </ul>
+            )}
             {onEdit && (
               <div className="flex justify-end gap-2 mb-2">
-                {onEdit && (
-                  <button onClick={(e) => { e.stopPropagation(); onEdit(); }}
+                {([['Up', () => onMove?.('up')], ['Down', () => onMove?.('down')], ['Edit', onEdit], ['Delete', onDelete]] as const).map(([label, fn]) => fn && (
+                  <button key={label} onClick={(e) => { e.stopPropagation(); fn(); }}
                     style={{ background: 'transparent', border: '1px solid var(--border)', borderRadius: '3px', color: 'var(--fg-dim)', cursor: 'pointer', padding: '2px 8px', fontSize: '11px' }}>
-                    Edit
+                    {label}
                   </button>
-                )}
+                ))}
               </div>
             )}
             {q.actuals ? (
@@ -431,11 +536,15 @@ function BatchRow({ entry: q, expanded, onToggle, onEdit, ingredients }: {
 
 function BatchFormModal({ recipes, finishedBins, initial, onSubmit, onClose }: {
   recipes: Recipe[]; finishedBins: Bin[]; initial?: QueueEntry;
-  onSubmit: (data: { recipeId: string; destination: string }) => void;
+  onSubmit: (data: Record<string, unknown>) => void;
   onClose: () => void;
 }) {
   const [recipeId, setRecipeId] = useState(initial?.recipeId || recipes[0]?.id || '');
   const [dest, setDest] = useState(initial?.destination || finishedBins[0]?.id || '');
+  const [size, setSize] = useState(initial ? String(initial.targetMass) : '');
+  // datetime-local wants local "YYYY-MM-DDTHH:mm"; empty = start as soon as the queue gets to it
+  const toLocal = (iso?: string) => { if (!iso) return ''; const d = new Date(iso); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
+  const [when, setWhen] = useState(toLocal(initial?.scheduledAt));
 
   const inputStyle = { background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: '3px', color: 'var(--fg-bright)', padding: '6px 10px', fontSize: '12px', width: '100%' } as const;
 
@@ -457,11 +566,26 @@ function BatchFormModal({ recipes, finishedBins, initial, onSubmit, onClose }: {
             {finishedBins.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
           </select>
         </div>
+        <div className="flex flex-col gap-1">
+          <span style={{ color: 'var(--fg-dim)' }}>Batch size (lbs, blank = recipe size)</span>
+          <input type="number" min={0} value={size} onChange={e => setSize(e.target.value)} style={inputStyle} />
+        </div>
+        <div className="flex flex-col gap-1">
+          <span style={{ color: 'var(--fg-dim)' }}>Start at (blank = as soon as the queue reaches it)</span>
+          <input type="datetime-local" value={when} onChange={e => setWhen(e.target.value)} style={inputStyle} />
+        </div>
       </div>
       <div className="flex gap-2 justify-end mt-4">
         <button onClick={onClose}
           style={{ ...btnBase, background: 'var(--bg)', color: 'var(--fg)', border: '1px solid var(--border)' }}>Cancel</button>
-        <button onClick={() => onSubmit({ recipeId, destination: dest })}
+        <button onClick={() => {
+          const scheduledAt = when ? new Date(when).toISOString() : (initial ? null : undefined); // null clears a schedule on edit
+          const mass = size.trim() === '' ? undefined : Number(size);
+          if (!initial) return onSubmit({ recipeId, destination: dest, targetMass: mass, scheduledAt });
+          // an edit sends only what changed: a recipe or size change re-scales the batch, nothing else does
+          onSubmit({ ...(recipeId !== initial.recipeId ? { recipeId } : {}), destination: dest,
+            ...(mass !== undefined && mass !== initial.targetMass ? { targetMass: mass } : {}), scheduledAt });
+        }}
           style={{ ...btnBase, background: 'var(--accent)', color: '#000' }}>
           {initial ? 'Save' : 'Queue Batch'}
         </button>

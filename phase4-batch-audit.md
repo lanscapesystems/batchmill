@@ -30,3 +30,38 @@ Static read of `feedmill-backend/src/mill.ts` (QueueBatch … UnloadBatch, advan
 
 ## Suggested order
 Fix 1–5 first (they change what material is made and recorded), with a backend test for each. Then 6–8 together, then 9–11.
+
+---
+
+# Re-audit after the Phase 4 build
+
+Checked against the code and `feedmill-backend/src/batch.check.ts` (one test per finding, all passing with the other suites). Browser-checked on a scratch backend: Run/Hold, the queue-time warnings popup, the waiting reason, the new batch form, the bin/mixer settings fields. Nothing run on hardware.
+
+| # | Finding | Status |
+|---|---|---|
+| 1 | Invented weight with no scale | **Fixed.** `updateStepActual` and every no-scale branch are gone; no valid, stable, empty mixer scale = the batch waits in the queue with the reason. |
+| 2 | Invalid / unstable scale ignored mid-batch | **Fixed.** Scale lost while feeding stops the auger and pauses the batch; settling waits for a valid stable reading; Resume needs the scale back. New no-flow watchdog (delay per bin, default 60 s, then a minimum rise per 10 s). |
+| 3 | E-stop / tripped auger not handled in DOSING | **Fixed.** E-stop pauses the batch with a reason (it did pause before, with none); owned-equipment trips already paused. |
+| 4 | Steps not validated | **Fixed** (release gate: bin, auger, Auto, not faulted, destination, flow path, gates). Not checked: a *bin* trip (bins have none). |
+| 5 | Discharge ends on a timeout | **Fixed.** Empty = valid, stable, below the threshold; then the mixer's Cleanout Time; a timeout only alarms and keeps waiting (Extend Discharge). |
+| 6 | Wrong discharge gate | **Fixed.** Gates come from the flow path mixer to destination, each with the outlet toward the next hop. Mixer is re-requested after a pause (it was not before). |
+| 7 | Batch size ignored | **Fixed.** Size scales every line. |
+| 8 | Abort / Unload broken | **Fixed.** Abort with material gives ABORTED_HOLD; Unload (to the original or another finished bin) or Discard once empty. |
+| 9 | Inventory drift on abort / fault | **Fixed.** Dosed material is deducted once however the batch ends. |
+| 10 | Queued batches lost on restart | **Fixed.** Whole batches saved as JSON (queue order too); queue comes back on Hold. |
+| 11 | Recovery precision | **Fixed.** Saved every second while feeding; Resume compares the scale with saved progress and asks. |
+| 12 | No tolerance check | **Fixed.** Hold for the operator with Ignore / Update freefall / Abort; auto freefall calibration as in the PLC. |
+
+Found and fixed while building:
+- A finished batch was written back to the database right after it was cleared (the end-of-scan save ran on it), so it could be recovered as active later.
+- A batch that faulted was never released from `activeBatch`, so it blocked the queue until it was aborted.
+- Batch timers used the wall clock; they now count scans (exact and testable) and restart on Resume.
+- The mixer was not re-requested when a paused batch resumed in discharge.
+
+## Still open
+1. **Micro dosing is not audited.** `micro_drag` has timer-based dosing and a weight stop setpoint that the batch engine ignores; micro lines are dosed like majors through the first connection under the bin. Needs its own pass against the PLC micros logic.
+2. **Single mixer, unit handling** (audit items 13, 14): unchanged. Units are assumed to be lbs.
+3. **No explicit overfeed fault.** An overshoot lands in the tolerance hold instead (the auger is already stopping by then). Covered by tolerance, not by a separate limit.
+4. **Not exercised in the browser:** the tolerance popup, the scale-mismatch popup and the Unload / Discard buttons (they need a live scale feed); they are type-checked and the backend side is tested.
+5. **Not done on hardware:** everything above runs against a simulated scale.
+6. Defaults I chose where you did not say: auto freefall strength 50 %, max adjust 2 lb per batch, resume mismatch 10 lb, mixer empty 10 lb, discharge timeout 60 s, settle 2 s.
