@@ -86,10 +86,12 @@ done
 VERSION="$(node -p "require('$SRC/package.json').version" 2>/dev/null)" || fail "cannot read release version"
 
 # Snapshot db + config before anything is switched. No snapshot, no update.
+# One folder per snapshot: mill.db (data), config.json (data), io.conf (derived
+# from config.json, but versioned with the daemon, so it is restored with it).
 status running "snapshotting database"
 TS="$(date +%Y%m%d%H%M%S)"
-install -d -o "$APP_USER" -g "$APP_USER" -m 0750 "$BACKUPS"
-SNAP="$BACKUPS/pre-$TS.db"
+SNAP="$BACKUPS/pre-update/$TS"
+install -d -o "$APP_USER" -g "$APP_USER" -m 0750 "$BACKUPS" "$BACKUPS/pre-update" "$SNAP"
 if [[ -f "$DATA_DIR/mill.db" ]]; then
   # SQLite online backup (consistent under WAL), run as the db's own user from
   # the live release so the same native better-sqlite3 build is used
@@ -97,13 +99,11 @@ if [[ -f "$DATA_DIR/mill.db" ]]; then
     const D=require("better-sqlite3");
     new D(process.argv[1],{fileMustExist:true}).backup(process.argv[2])
       .then(()=>process.exit(0),e=>{console.error(e);process.exit(1)})' \
-    "$DATA_DIR/mill.db" "$SNAP") || fail "database snapshot failed — update aborted, nothing changed"
+    "$DATA_DIR/mill.db" "$SNAP/mill.db") || fail "database snapshot failed — update aborted, nothing changed"
 fi
-[[ ! -f "$DATA_DIR/config.json" ]] || install -m 0640 -o "$APP_USER" -g "$APP_USER" "$DATA_DIR/config.json" "$BACKUPS/pre-$TS.config.json"
-[[ ! -f /etc/feedmill/io.conf ]] || install -m 0640 -o "$APP_USER" -g "$APP_USER" /etc/feedmill/io.conf "$BACKUPS/pre-$TS.io.conf"
-ls -1t "$BACKUPS"/pre-*.db 2>/dev/null | tail -n +6 | while read -r old; do
-  rm -f "$old" "${old%.db}.config.json" "${old%.db}.io.conf"
-done
+[[ ! -f "$DATA_DIR/config.json" ]] || install -m 0640 -o "$APP_USER" -g "$APP_USER" "$DATA_DIR/config.json" "$SNAP/config.json"
+[[ ! -f /etc/feedmill/io.conf ]] || install -m 0640 -o "$APP_USER" -g "$APP_USER" /etc/feedmill/io.conf "$SNAP/io.conf"
+ls -1dt "$BACKUPS"/pre-update/*/ 2>/dev/null | tail -n +6 | xargs -r rm -rf # keep the last 5
 
 status running "building $VERSION and switching (several minutes)"
 (cd "$SRC" && FEEDMILL_UPDATE=1 bash install/install.sh "$IFACE") 2>&1 | tee "$WORK/install.log"
@@ -115,17 +115,17 @@ if [[ $RC -eq 0 ]]; then
   status success "updated to $VERSION"
 elif [[ $RC -eq 3 ]]; then
   # new code was live, failed its health check, and install.sh put the old
-  # release back — but the new backend may already have migrated mill.db
-  if [[ -f "$SNAP" ]]; then
-    systemctl stop feedmill-backend.service
+  # release back — but the new backend may already have migrated mill.db or
+  # rewritten config.json / io.conf, so put all three back from the snapshot
+  systemctl stop feedmill-backend.service
+  if [[ -f "$SNAP/mill.db" ]]; then
     rm -f "$DATA_DIR/mill.db" "$DATA_DIR/mill.db-wal" "$DATA_DIR/mill.db-shm"
-    install -m 0640 -o "$APP_USER" -g "$APP_USER" "$SNAP" "$DATA_DIR/mill.db"
-    # the new backend may also have rewritten config.json / io.conf
-    [[ ! -f "$BACKUPS/pre-$TS.config.json" ]] || install -m 0640 -o "$APP_USER" -g "$APP_USER" "$BACKUPS/pre-$TS.config.json" "$DATA_DIR/config.json"
-    [[ ! -f "$BACKUPS/pre-$TS.io.conf" ]] || install -m 0640 -o "$APP_USER" -g "$APP_USER" "$BACKUPS/pre-$TS.io.conf" /etc/feedmill/io.conf
-    systemctl start feedmill-backend.service
+    install -m 0640 -o "$APP_USER" -g "$APP_USER" "$SNAP/mill.db" "$DATA_DIR/mill.db"
   fi
-  status rolled_back "$VERSION failed its health check; previous release and database restored"
+  [[ ! -f "$SNAP/config.json" ]] || install -m 0640 -o "$APP_USER" -g "$APP_USER" "$SNAP/config.json" "$DATA_DIR/config.json"
+  [[ ! -f "$SNAP/io.conf" ]] || install -m 0640 -o "$APP_USER" -g "$APP_USER" "$SNAP/io.conf" /etc/feedmill/io.conf
+  systemctl start feedmill-backend.service
+  status rolled_back "$VERSION failed its health check; previous release, database and config restored"
   RC=1
 else
   status failed "$VERSION did not build (current release untouched): $WHY"
