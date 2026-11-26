@@ -7,8 +7,7 @@ import {
   NX_CARD_CATALOG, NX_BUS_POWER_BUDGET_W, NX_MAX_UNITS, ECC_MODEL_MIN_CYCLE_US,
   EQUIPMENT_DEFS,
 } from './types.js';
-import { listCandidateNics } from './network.js';
-import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresence, clearCouplerErrors, runRs1201Calibration, type ScaleCalStep } from './ethercat.js';
+import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresence, clearCouplerErrors, readCouplerErrorCount, readCouplerErrorDetail, runRs1201Calibration, type ScaleCalStep } from './ethercat.js';
 import { MovingAverage, OnDelay, LoadPid, RelayTuner, scaleLinear } from './loadControl.js';
 import { Debounce } from './monitors.js';
 import { scaleLines, freefallAdjust, toleranceFor, feedsOnlyHammermill, flowPath, round1 } from './batchLogic.js';
@@ -19,10 +18,17 @@ import {
   archiveBatch, postInventoryEvent, persistFault, loadFaults,
 } from './db.js';
 
-const SCAN_MS = 100;
+// Logic scan period (how often the loop is woken). Timers do NOT count scans: each scan measures the real time since the
+// previous one (this.dtMs) and every timer and the PI loops integrate that, so a late scan costs resolution, not accuracy.
+// FIXED_DT_MS (env SCAN_MS) replaces the measurement with a constant - for the behaviour checks, which call scan() in a tight loop.
+const SCAN_MS = 20;
+const FIXED_DT_MS = Number(process.env.SCAN_MS) || 0;
+// A scan that comes after a stall (the synchronous ethercat CLI calls, a long GC) integrates at most this much: the inputs were
+// not being read during the stall, so timers must not leap on stale data and the PI loops must not take one huge step.
+const MAX_DT_MS = 500;
 // How often the rack watchdog polls `ethercat slaves` for a card going missing/
 // mismatched after commissioning. Deliberately NOT inside scan() — it shells out
-// to the ethercat CLI (blocking, up to its 3s timeout), which the 100ms control
+// to the ethercat CLI (blocking, up to its 3s timeout), which the control
 // loop can't afford.
 const RACK_WATCHDOG_MS = 3000;
 const SETTLE_MS = 2000;
@@ -108,18 +114,19 @@ export class Mill {
   scaleConfigs: ScaleConfig[] = [];
   sharedVfds: SharedVfd[] = [];
   scaleConfigVersion = 0; // bumped on ConfigureScale/RemoveScale — server.ts watches this to restart scale readers
-  omronConfig: OmronConfig = { couplerType: 'none', ipAddress: '', nodeAddress: 1, ethercatInterface: '', eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
+  omronConfig: OmronConfig = { couplerType: 'none', ipAddress: '', nodeAddress: 1, eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
   globalConfig: Record<string, string | number> = { motorStarterFaultDelay: 0.5, siteName: 'FEED MILL CONTROLLER' };
-  networkInterfaces: string[] = listCandidateNics(); // computed once at startup; restart the service to pick up newly added NICs
   private faultSeq = 300;
   private batchSeq = 2000;
   private batchPersistCounter = 0;
-  private persistTicks = 0;
+  private dtMs = SCAN_MS; // real time since the previous scan
+  private lastScanAt = performance.now();
+  private persistMs = 0;
   private aiDisconnected = new Set<string>();
   private loadMon = new Map<string, LoadMon>();
   // 1 Hz load trend per motor, last 10 minutes (served by GET /api/v1/trend/:id, not pushed in the snapshot)
   private trends = new Map<string, { t: number; a: number; s?: number; sp?: number }[]>();
-  private trendTicks = 0;
+  private trendMs = 0;
   // Queue hold: stops NEW batches being released (the active one is never interrupted). Not persisted, so the queue
   // always comes up on hold after a restart or power loss and nothing starts unattended after an outage.
   // Batch timers (settle, discharge, cleanout) count scans, not wall-clock time, so they are exact and testable; they restart on Resume.
@@ -208,6 +215,7 @@ export class Mill {
   private rackWatchdogCheck() {
     const om = this.omronConfig;
     if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return;
+    this.couplerErrorCheck();
     // The CLI check is synchronous and stalls the mill scan. A card that drops or faults breaks the working counter, which
     // the daemon reports as unhealthy every cycle, so identity (is it still the same cards?) only needs checking when the
     // bus comes up healthy: first time for this daemon run, and after any unhealthy stretch. While unhealthy, keep polling.
@@ -226,6 +234,23 @@ export class Mill {
       return;
     }
     this.verifyRack();
+  }
+
+  // The coupler's own current errors (CoE 0x3809) are a fault with the newest error-log entry as its text; clearing that fault
+  // clears them at the coupler (ClearFault). A cause that is still there raises it again on the next poll.
+  // shortcut: one extra synchronous CLI read, throttled to every 10 s; upgrade with the async-CLI note in ethercat.ts.
+  private lastCouplerErrorCheck = 0;
+  private couplerErrorCheck(force = false) {
+    if (!force && Date.now() - this.lastCouplerErrorCheck < 10_000) return;
+    this.lastCouplerErrorCheck = Date.now();
+    const n = readCouplerErrorCount();
+    if (n === null) return; // unreadable: leave the fault as it is
+    if (n === 0) { this.clearFault('E-EC-01'); return; }
+    const message = `EtherCAT coupler reports ${n} error(s): ${readCouplerErrorDetail() ?? 'details unreadable'}`;
+    const old = this.faults.find(f => f.code === 'E-EC-01' && f.active);
+    if (old && old.message === message) return;
+    if (old) this.clearFault('E-EC-01'); // a different error than the one shown
+    this.raiseFault('OMRON', 'CRITICAL', message, 'E-EC-01');
   }
 
   private applyConfig(cfg: MillConfig): void {
@@ -615,6 +640,10 @@ export class Mill {
       case 'ClearFault': {
         const f = this.faults.find(f => f.id === cmd.targetId && f.active);
         if (!f) return reject('Fault not found');
+        if (f.code === 'E-EC-01') {
+          const r = clearCouplerErrors();
+          if (!r.ok) return reject(`Could not clear coupler errors: ${r.error ?? 'unknown'}`);
+        }
         f.active = false;
         f.clearedAt = new Date().toISOString();
         persistFault(f);
@@ -680,6 +709,8 @@ export class Mill {
       }
 
       case 'ReadOmronRack': {
+        const guardErr = this.guardConfigEdit(); // the rack read shells out to the CLI and stalls the scan: not while running
+        if (guardErr) return reject(guardErr);
         // probe: read the rack off the bus while the coupler is still being set up (nothing saved, no cards needed)
         if (cmd.parameters?.probe === true) {
           const r = discoverRack();
@@ -696,6 +727,7 @@ export class Mill {
         const r = clearCouplerErrors();
         if (!r.ok) return reject(`Could not clear coupler errors: ${r.error ?? 'unknown'}`);
         this.readOmronRack(); // re-read so the rack status/warnings reflect what's still wrong
+        this.couplerErrorCheck(true);
         this.persistConfig();
         return ok();
       }
@@ -1095,7 +1127,6 @@ export class Mill {
           couplerType: p.couplerType ?? 'none',
           ipAddress: p.ipAddress ?? '',
           nodeAddress: p.nodeAddress ?? 1,
-          ethercatInterface: p.ethercatInterface ?? '',
           eccModel: p.eccModel ?? 'NX-ECC203',
           cycleTimeUs: p.cycleTimeUs ?? 5000,
           ringTopology: p.ringTopology ?? false,
@@ -1107,6 +1138,8 @@ export class Mill {
         this.validateRack();
         this.clearRackFault();
         this.buildSignals();
+        // every save verifies the rack against the bus (a mismatch raises the rack fault, as the old Verify Rack did)
+        if (this.omronConfig.couplerType !== 'none') this.readOmronRack();
         return ok();
       }
 
@@ -1118,7 +1151,10 @@ export class Mill {
   // ── main control cycle ──
 
   private scan() {
-    this.clockMs += SCAN_MS;
+    const now = performance.now();
+    this.dtMs = FIXED_DT_MS || Math.min(MAX_DT_MS, Math.max(0, now - this.lastScanAt));
+    this.lastScanAt = now;
+    this.clockMs += this.dtMs;
     this.applyOverrides();
     const ioState = readIoState(); // read once; shared by readRealInputs and updateRotationSensors
     this.updateBusHealth(ioState);
@@ -1136,7 +1172,7 @@ export class Mill {
     this.updateHorn();
     this.computeOutputs();
     // run-hour counters change every scan; write them out once a minute (a power cut loses at most that)
-    if (++this.persistTicks >= 600) { this.persistTicks = 0; this.persistConfig(); }
+    if ((this.persistMs += this.dtMs) >= 60_000) { this.persistMs = 0; this.persistConfig(); }
     this.revision++;
     this.onChange?.();
   }
@@ -1287,7 +1323,7 @@ export class Mill {
         st = { runningMs: 0 };
         this.rotationState.set(eq.id, st);
       }
-      st.runningMs = eq.status === 'running' ? st.runningMs + SCAN_MS : 0;
+      st.runningMs = eq.status === 'running' ? st.runningMs + this.dtMs : 0;
 
       if (!counters || !(sig in counters) || nowUs === undefined) {
         // Daemon not running (dev box, or not installed yet) — no live data,
@@ -1366,14 +1402,14 @@ export class Mill {
       if (eq.mode === 'Hand') { eq.runCmd = true; this.handRun.add(eq.id); } // Hand ignores the start delay
       else {
         this.handRun.delete(eq.id);
-        eq.startTimerMs += SCAN_MS;
+        eq.startTimerMs += this.dtMs;
         if (eq.startTimerMs >= delayMs(eq.config.startDelay)) eq.runCmd = true;
       }
     } else {
       eq.startTimerMs = 0;
       if (eq.runCmd && this.handRun.has(eq.id)) { eq.runCmd = false; eq.stopTimerMs = 0; } // a Hand run stops at once (to Off, or to Auto with no request): no stop delay
       else if (eq.runCmd && !this.upstreamStopping(eq)) {
-        eq.stopTimerMs += SCAN_MS;
+        eq.stopTimerMs += this.dtMs;
         if (eq.stopTimerMs >= delayMs(eq.config.stopDelay)) { eq.runCmd = false; eq.stopTimerMs = 0; }
       } else eq.stopTimerMs = 0; // not running, or waiting for upstream motors to finish stopping
     }
@@ -1478,8 +1514,8 @@ export class Mill {
       const delay = delayMs(eq.config.loadLimitDelay, 2);
       const lim = (k: string) => Number(eq.config[k] ?? 0);
       const watch = running && !bypass;
-      const hiWarn = m.hiWarn.tick(watch && lim('hiWarnAmps') > 0 && amps >= lim('hiWarnAmps'), SCAN_MS, delay);
-      const hiPause = m.hiPause.tick(watch && lim('hiPauseAmps') > 0 && amps >= lim('hiPauseAmps'), SCAN_MS, delay);
+      const hiWarn = m.hiWarn.tick(watch && lim('hiWarnAmps') > 0 && amps >= lim('hiWarnAmps'), this.dtMs, delay);
+      const hiPause = m.hiPause.tick(watch && lim('hiPauseAmps') > 0 && amps >= lim('hiPauseAmps'), this.dtMs, delay);
 
       eq.warningReason = hiWarn ? 'High load' : undefined;
       if (hiWarn) this.raiseFault(eq.id, 'WARNING', `${eq.name}: high load warning (${eq.loadAmps} A)`, 'W-LD-01');
@@ -1508,7 +1544,7 @@ export class Mill {
       const bothRun = eq.status === 'running' && feeder?.status === 'running';
       if (m.tuner) {
         if (!ready || !bothRun) { this.endTune(eq, m, 'Autotune aborted: mill, feeder or load input not available', feeder); continue; }
-        const r = m.tuner.step(eq.loadAmps!, SCAN_MS / 1000);
+        const r = m.tuner.step(eq.loadAmps!, this.dtMs / 1000);
         feeder!.speed = r.out;
         if (r.done) {
           // PLC's ATCalcGain: 1 = fast ... 10 = slow, default 7. Gain 7 keeps the measured values; slower = gentler Kp and longer Ti.
@@ -1523,14 +1559,14 @@ export class Mill {
       if (!ready || !(eq.loadControlAuto && bothRun)) { m.pid.reset(); continue; }
       const [lo, hi] = this.speedLimits(feeder!);
       feeder!.speed = m.pid.step(
-        Number(eq.config.loadSetpointAmps ?? 0), eq.loadAmps!, feeder!.speed ?? 100, SCAN_MS / 1000,
+        Number(eq.config.loadSetpointAmps ?? 0), eq.loadAmps!, feeder!.speed ?? 100, this.dtMs / 1000,
         { kp: Number(eq.config.loadKp ?? 0), tiSec: Number(eq.config.loadTiSec ?? 0), tdSec: Number(eq.config.loadTdSec ?? 0) }, lo, hi);
     }
   }
 
   private sampleTrends() {
-    if (++this.trendTicks < 10) return;
-    this.trendTicks = 0;
+    if ((this.trendMs += this.dtMs) < 1000) return; // one trend sample per second
+    this.trendMs = 0;
     const now = Date.now();
     for (const eq of this.equipment.values()) {
       if (eq.loadAmps === undefined) continue;
@@ -1557,11 +1593,11 @@ export class Mill {
     let on = false;
     if (this.faults.some(f => f.active) && !this.hornSilenced) {
       const auto = Number(gc.hornAutoSilenceSec ?? 60);
-      this.hornAutoMs += SCAN_MS;
+      this.hornAutoMs += this.dtMs;
       if (auto > 0 && this.hornAutoMs >= auto * 1000) this.hornSilenced = true;
       else {
         const onMs = delayMs(gc.hornOnSec, 1), offMs = delayMs(gc.hornOffSec, 1);
-        this.hornPhaseMs += SCAN_MS;
+        this.hornPhaseMs += this.dtMs;
         if (offMs === 0) this.hornPhaseOn = true;
         else if (this.hornPhaseOn && this.hornPhaseMs >= onMs) { this.hornPhaseOn = false; this.hornPhaseMs = 0; }
         else if (!this.hornPhaseOn && this.hornPhaseMs >= offMs) { this.hornPhaseOn = true; this.hornPhaseMs = 0; }
@@ -1599,12 +1635,12 @@ export class Mill {
     const vfdOk = !vfd?.aux || !!this.ioInputs[vfd.aux];
     // Same sequence as the PLC's micros VFD (M11): the starter closes first and the VFD is started only once the starter
     // has been confirmed for vfdStartDelay (0.7 s); it drops with the run command. Its aux is only expected once it was started.
-    eq.vfdStartMs = vfd && usable && eq.runCmd && eq.feedback ? (eq.vfdStartMs ?? 0) + SCAN_MS : 0;
+    eq.vfdStartMs = vfd && usable && eq.runCmd && eq.feedback ? (eq.vfdStartMs ?? 0) + this.dtMs : 0;
     eq.vfdCmd = !!vfd && eq.vfdStartMs >= delayMs(this.sharedVfdOf(eq)?.startDelay ?? eq.config.vfdStartDelay, 0.7);
 
     if (usable) {
       if ((eq.runCmd && !eq.feedback) || (eq.vfdCmd && !vfdOk)) {
-        eq.faultTimerMs += SCAN_MS;
+        eq.faultTimerMs += this.dtMs;
         // per-motor starterFaultDelay overrides the global one (PLC: OLFaultTdSV is an input of each MSFault call)
         if (eq.faultTimerMs >= delayMs(eq.config.starterFaultDelay ?? this.globalConfig.motorStarterFaultDelay, 0.5)) {
           const starter = !eq.feedback;
@@ -1626,8 +1662,8 @@ export class Mill {
       eq.status = eq.runCmd && eq.feedback && (!vfd || eq.vfdCmd) && vfdOk ? 'running' : 'not_running';
     }
     if (eq.status === 'running') {
-      eq.runSecondsTotal = (eq.runSecondsTotal ?? 0) + SCAN_MS / 1000;
-      eq.runSeconds = (eq.runSeconds ?? 0) + SCAN_MS / 1000;
+      eq.runSecondsTotal = (eq.runSecondsTotal ?? 0) + this.dtMs / 1000;
+      eq.runSeconds = (eq.runSeconds ?? 0) + this.dtMs / 1000;
     }
     this.out(eq.config.runOutput as string | undefined, eq.runCmd);
     this.outOr(vfd?.run, !!eq.vfdCmd && eq.runCmd);
@@ -1671,7 +1707,7 @@ export class Mill {
         eq.positionTimerMs = 0;
       } else if (openLimit) {
         eq.gatePosition = 'moving';
-        eq.positionTimerMs += SCAN_MS;
+        eq.positionTimerMs += this.dtMs;
         if (eq.positionTimerMs >= timeout) {
           eq.status = 'fault';
           eq.faultReason = 'Gate open timeout';
@@ -1694,7 +1730,7 @@ export class Mill {
           eq.positionTimerMs = 0;
         } else {
           eq.gatePosition = 'moving';
-          eq.positionTimerMs += SCAN_MS;
+          eq.positionTimerMs += this.dtMs;
           if (eq.positionTimerMs >= timeout) {
             eq.status = 'fault';
             eq.faultReason = 'Gate close timeout';
@@ -1728,7 +1764,7 @@ export class Mill {
     if (eq.status !== 'fault' && eq.status !== 'disabled') eq.status = motor && driving ? 'running' : 'not_running';
 
     if (auxSig && driving && !this.ioInputs[auxSig]) {
-      eq.faultTimerMs += SCAN_MS;
+      eq.faultTimerMs += this.dtMs;
       if (eq.faultTimerMs >= delayMs(eq.config.starterFaultDelay ?? this.globalConfig.motorStarterFaultDelay, 0.5) && eq.status !== 'fault') {
         eq.status = 'fault';
         eq.faultReason = 'Motor starter feedback timeout';
@@ -1818,7 +1854,7 @@ export class Mill {
       case 'MIXING': {
         const mixer = this.requestMixer(b);
         // the timer only counts while the mixer is actually running
-        if (mixer?.runCmd) b.mixTimeRemainingMs -= SCAN_MS;
+        if (mixer?.runCmd) b.mixTimeRemainingMs -= this.dtMs;
         if (b.mixTimeRemainingMs <= 0) {
           b.mixTimeRemainingMs = 0;
           b.state = 'ROUTE_PRECHECK';
@@ -2032,7 +2068,7 @@ export class Mill {
     if (!conv || !first) { b.microDelivered = true; this.afterMicroUnload(b); return; }
     if (!b.microUnloading) { b.microUnloading = true; b.microUnloadRunMs = 0; persistBatch(b); }
     conv.owner = b.id; conv.request = true;
-    if (conv.runCmd) b.microUnloadRunMs = (b.microUnloadRunMs ?? 0) + SCAN_MS;
+    if (conv.runCmd) b.microUnloadRunMs = (b.microUnloadRunMs ?? 0) + this.dtMs;
     const scale = this.stepScale(first);
     if (!scale || !scale.valid) { b.faultReason = 'Waiting: micros scale invalid'; return; }
     if (b.faultReason === 'Waiting: micros scale invalid') b.faultReason = undefined;
@@ -2119,12 +2155,12 @@ export class Mill {
         }
         // No-flow watchdog: once the auger has run for the bin's delay, the weight must keep rising
         if (auger?.runCmd) {
-          step.augerRunMs = (step.augerRunMs ?? 0) + SCAN_MS;
+          step.augerRunMs = (step.augerRunMs ?? 0) + this.dtMs;
           const delay = delayMs(binEq?.config.noProgressDelaySec, 60);
           if (step.augerRunMs >= delay) {
-            if (step.augerRunMs - SCAN_MS < delay) { step.progressRef = step.actual; step.progressMs = 0; }
+            if (step.augerRunMs - this.dtMs < delay) { step.progressRef = step.actual; step.progressMs = 0; }
             else {
-              step.progressMs = (step.progressMs ?? 0) + SCAN_MS;
+              step.progressMs = (step.progressMs ?? 0) + this.dtMs;
               if (step.progressMs >= NO_PROGRESS_WINDOW_MS) {
                 const minLbs = Number(binEq?.config.noProgressMinLbs ?? 2);
                 if (step.actual - (step.progressRef ?? 0) < minLbs) {
@@ -2321,7 +2357,7 @@ export class Mill {
       let d = this.debouncedCovered.get(key);
       if (!d || d.input !== sw.input) { d = { input: sw.input, db: new Debounce(raw) }; this.debouncedCovered.set(key, d); }
       const delay = delayMs(eq.config[sw.delay]);
-      d.db.step(raw, SCAN_MS, isHi ? delay : 0, isHi ? 0 : delay); // high: slow to cover; low: slow to uncover
+      d.db.step(raw, this.dtMs, isHi ? delay : 0, isHi ? 0 : delay); // high: slow to cover; low: slow to uncover
     }
   }
 
@@ -2578,7 +2614,6 @@ export class Mill {
       sharedVfds: this.sharedVfds,
       omronConfig: { ...this.omronConfig, bus: this.busState, cards: this.omronConfig.cards.map(c => ({ ...c })) },
       globalConfig: { ...this.globalConfig },
-      networkInterfaces: this.networkInterfaces,
       commissioningMode: this.commissioningMode,
       horn: { on: this.hornOn, silenced: this.hornSilenced },
       queueControl: { held: this.queueHeld, waiting: this.queueWait },
@@ -2627,9 +2662,6 @@ export class Mill {
     const om = this.omronConfig;
     om.warnings = [];
     if (om.couplerType === 'NX-ECC') {
-      if (!om.ethercatInterface) {
-        om.warnings.push('EtherCAT master NIC not set — select the dedicated Debian interface');
-      }
       const minCycle = ECC_MODEL_MIN_CYCLE_US[om.eccModel];
       if (om.cycleTimeUs < minCycle) {
         om.warnings.push(`Cycle time ${om.cycleTimeUs}µs is below ${om.eccModel}'s minimum (${minCycle}µs)`);

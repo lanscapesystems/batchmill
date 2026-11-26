@@ -1,6 +1,6 @@
 // Rack allocation check (no hardware needed): RS1201 must be recognised wherever it sits in the rack.
 import assert from 'node:assert/strict';
-import { allocateRackEntries, cardsFromRack, checkAnalogSettings, generateIoConf } from './ethercat.js';
+import { allocateRackEntries, cardsFromRack, checkAnalogSettings, describeDiagnosisMessage, generateIoConf } from './ethercat.js';
 import type { IoRackCard } from './types.js';
 import { NX_CARD_CATALOG } from './types.js';
 
@@ -77,3 +77,8 @@ assert.equal(allocateRackEntries([card(1, 'NX-DA3205')], [], [1, 2, 3, 4].map(i 
 const aoFound = cardsFromRack([1, 2, 3, 4].map(i => outE(uo(2), 16, i)), [null, 0x00115442, 0x00233205], 2).cards[1];
 assert.deepEqual([aoFound.model, aoFound.confidence], ['NX-DA3205', 'ident']);
 console.log('ethercat checks passed');
+
+// coupler error log text
+assert.match(describeDiagnosisMessage([0x41, 0x70, 0, 0, 0, 0, 0, 0]), /NX unit communications error \(code 0x00007041/);
+assert.match(describeDiagnosisMessage([0x34, 0x12, 0, 0]), /unknown error \(code 0x00001234/);
+assert.equal(describeDiagnosisMessage([]), 'no details');

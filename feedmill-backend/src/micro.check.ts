@@ -1,5 +1,6 @@
 // Behaviour check for micro dosing: micros dose onto their own conveyor scale while the majors dose into the mixer; the belt
 // runs into the mixer only after both are finished. Run: MILL_DATA_DIR=<tmp dir> npm run check
+import './testScan.js';
 import assert from 'node:assert/strict';
 import { Mill } from './mill.js';
 import { loadBatchesJson, clearActiveBatch } from './db.js';

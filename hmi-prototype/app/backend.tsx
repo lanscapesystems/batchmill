@@ -131,7 +131,6 @@ export interface BackendOmronConfig {
   couplerType: BackendCouplerType;
   ipAddress: string;
   nodeAddress: number;
-  ethercatInterface: string;
   eccModel: BackendEccModel;
   cycleTimeUs: number;
   ringTopology: boolean;
@@ -166,7 +165,6 @@ interface BackendState {
   sharedVfds: BackendSharedVfd[];
   omronConfig: BackendOmronConfig;
   globalConfig: Record<string, string | number>;
-  networkInterfaces: string[];
   commissioningMode: boolean;
   horn: { on: boolean; silenced: boolean };
   queueControl: { held: boolean; waiting?: string };
@@ -175,7 +173,7 @@ interface BackendState {
 
 type SnapshotData = Omit<BackendState, 'connected' | 'ready' | 'commandError' | 'clearCommandError' | 'sendCommand'>;
 
-const EMPTY_OMRON: BackendOmronConfig = { couplerType: 'none', ipAddress: '', nodeAddress: 1, ethercatInterface: '', eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
+const EMPTY_OMRON: BackendOmronConfig = { couplerType: 'none', ipAddress: '', nodeAddress: 1, eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
 
 const EMPTY_DATA: SnapshotData = {
   equipment: [], queue: [], activeBatch: null,
@@ -184,7 +182,6 @@ const EMPTY_DATA: SnapshotData = {
   scales: {}, scaleConfigs: [], sharedVfds: [],
   omronConfig: EMPTY_OMRON,
   globalConfig: {},
-  networkInterfaces: [],
   commissioningMode: false,
   horn: { on: false, silenced: false },
   queueControl: { held: true },
@@ -209,7 +206,6 @@ function parseSnapshot(d: Record<string, any>): SnapshotData { // eslint-disable
     sharedVfds: d.sharedVfds ?? [],
     omronConfig: d.omronConfig ?? EMPTY_OMRON,
     globalConfig: d.globalConfig ?? {},
-    networkInterfaces: d.networkInterfaces ?? [],
     commissioningMode: d.commissioningMode ?? false,
     horn: d.horn ?? { on: false, silenced: false },
     queueControl: d.queueControl ?? { held: true },
@@ -314,7 +310,7 @@ export function BackendProvider({ children }: { children: ReactNode }) {
       const timeout = setTimeout(() => {
         cmdCallbacks.current.delete(requestId);
         resolve({ accepted: false, reason: 'Timeout' });
-      }, 5000);
+      }, action === 'ReadOmronRack' || action === 'ConfigureOmron' ? 60000 : 5000); // these shell out to the ethercat CLI many times
 
       cmdCallbacks.current.set(requestId, (r) => {
         clearTimeout(timeout);

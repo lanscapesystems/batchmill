@@ -1035,7 +1035,7 @@ function IOSection() {
   const [calTestWeight, setCalTestWeight] = useState('');
 
   const scaleConfigs = backend?.scaleConfigs ?? [];
-  const om: BackendOmronConfig = backend?.omronConfig ?? { couplerType: 'none', ipAddress: '', nodeAddress: 1, ethercatInterface: '', eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
+  const om: BackendOmronConfig = backend?.omronConfig ?? { couplerType: 'none', ipAddress: '', nodeAddress: 1, eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
   const commissioningMode = backend?.commissioningMode ?? false;
   const [omDraft, setOmDraft] = useState<BackendOmronConfig>(om);
   const [omEditing, setOmEditing] = useState(false);
@@ -1103,11 +1103,10 @@ function IOSection() {
     setDragIdx(null);
     setDragOverIdx(null);
   }
-  // While configuring, Read from Coupler reads the rack off the bus with nothing saved and fills the draft card list.
-  // Outside the editor it verifies the saved configuration against the bus.
+  // Read from Coupler reads the rack off the bus with nothing saved and fills the draft card list. Saving verifies the
+  // saved configuration against the bus (backend, ConfigureOmron).
   async function doReadRack() {
     setConfirmReadRack(false);
-    if (!omEditing) { backend?.sendCommand('ReadOmronRack'); return; }
     const r = await backend?.sendCommand('ReadOmronRack', undefined, { probe: true });
     const d = r?.data as { eccModel?: string; couplerName?: string; cards: { slot: number; model: string; confidence: string }[]; warnings: string[] } | undefined;
     if (!r?.accepted || !d) { setRackNotes([{ text: r?.reason ?? 'Read failed', warn: true }]); return; }
@@ -1174,7 +1173,7 @@ function IOSection() {
               {om.couplerType !== 'none' && (
                 <>
                   {om.couplerType === 'NX-EIC' && <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>IP: {om.ipAddress || '—'}</div>}
-                  {om.couplerType === 'NX-ECC' && <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>{om.eccModel} &middot; Node Address: {om.nodeAddress} &middot; Debian Interface: {om.ethercatInterface || '—'} &middot; Cycle: {om.cycleTimeUs}&micro;s{om.ringTopology ? ' · Ring' : ''}</div>}
+                  {om.couplerType === 'NX-ECC' && <div style={{ fontSize: '11px', color: 'var(--fg-dim)' }}>{om.eccModel} &middot; Node Address: {om.nodeAddress} &middot; Cycle: {om.cycleTimeUs}&micro;s{om.ringTopology ? ' · Ring' : ''}</div>}
                   {om.cards.length > 0 && (
                     <table style={{ fontSize: '11px', borderCollapse: 'collapse', width: '100%' }}>
                       <thead>
@@ -1216,12 +1215,6 @@ function IOSection() {
                   style={{ background: 'transparent', color: 'var(--fg-bright)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer' }}>
                   Configure
                 </button>
-                {om.couplerType !== 'none' && (
-                  <button onClick={() => setConfirmReadRack(true)} className="px-3 py-1.5 text-xs font-medium" title="Check the saved cards against what the coupler reports"
-                    style={{ background: 'transparent', color: 'var(--accent)', border: '1px solid var(--accent)', borderRadius: '3px', cursor: 'pointer' }}>
-                    Verify Rack
-                  </button>
-                )}
               </div>
             </>
           ) : (
@@ -1260,25 +1253,6 @@ function IOSection() {
                         <input type="number" min={1} max={199} value={omDraft.nodeAddress}
                           onChange={e => setOmDraft({ ...omDraft, nodeAddress: Number(e.target.value) })}
                           style={{ ...inputStyle, width: '80px' }} />
-                      </div>
-                      <div className="flex flex-col gap-1">
-                        <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Debian EtherCAT Interface (dedicated NIC)</span>
-                        {(() => {
-                          const nics = backend?.networkInterfaces ?? [];
-                          const current = omDraft.ethercatInterface;
-                          if (nics.length === 0) {
-                            return <input value={current} onChange={e => setOmDraft({ ...omDraft, ethercatInterface: e.target.value })}
-                              placeholder="enp2s0" style={inputStyle} />;
-                          }
-                          const options = current && !nics.includes(current) ? [...nics, current] : nics;
-                          return (
-                            <select value={current} onChange={e => setOmDraft({ ...omDraft, ethercatInterface: e.target.value })} style={inputStyle}>
-                              <option value="">Select interface</option>
-                              {options.map(n => <option key={n} value={n}>{n}{n === current && !nics.includes(n) ? ' (not detected)' : ''}</option>)}
-                            </select>
-                          );
-                        })()}
-                        <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Must be a NIC reserved for the EtherCAT master — not the general LAN port. Only physical interfaces detected on the Debian host are listed.</span>
                       </div>
                       <div className="flex items-end gap-3">
                         <div className="flex flex-col gap-1">

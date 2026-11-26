@@ -1,4 +1,5 @@
 // Behaviour check for the Phase 1 motor-protection logic. Run: MILL_DATA_DIR=<tmp dir> npm run check
+import './testScan.js';
 import assert from 'node:assert/strict';
 import { Mill } from './mill.js';
 

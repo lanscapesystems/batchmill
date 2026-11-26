@@ -158,6 +158,30 @@ export function readCouplerErrorCount(): number | null {
   return n === null ? null : Math.max(0, n - 1);
 }
 
+// W519 13-7-3 emergency error codes (the ones that mean something to an operator)
+const COUPLER_ERROR_NAMES: Record<number, string> = {
+  0x5530: 'hardware error', 0x7040: 'unit configuration / control parameter error', 0x7041: 'NX unit communications error',
+};
+
+/** Text for one 23-byte CoE 0x10F3 diagnosis message (ETG.1020 layout: DiagCode u32 LE, flags u16, text id u16, timestamp).
+ * shortcut: the layout is the standard one and the code is looked up as either 16-bit half; not checked against a real Omron
+ * log - the raw bytes stay in the text so a wrong guess is still readable. Replace with the exact mapping once seen. */
+export function describeDiagnosisMessage(b: number[]): string {
+  if (b.length < 4) return 'no details';
+  const code = (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
+  const name = COUPLER_ERROR_NAMES[code & 0xffff] ?? COUPLER_ERROR_NAMES[code >>> 16];
+  return `${name ?? 'unknown error'} (code 0x${code.toString(16).padStart(8, '0')}, log ${b.map(x => x.toString(16).padStart(2, '0')).join(' ')})`;
+}
+
+/** Newest entry of the coupler's error log (CoE 0x10F3, W519 A-7-5), as text; null = could not read. */
+export function readCouplerErrorDetail(): string | null {
+  const newest = sdoUpload('uint8', '0x10f3', '2');
+  if (!newest) return null;
+  const { out } = runEthercat(['upload', '-p', '0', '-t', 'octet_string', '0x10f3', String(newest)]);
+  if (out === null) return null;
+  return describeDiagnosisMessage(out.trim().split(/\s+/).filter(x => /^[0-9a-f]{2}$/i.test(x)).map(x => parseInt(x, 16)));
+}
+
 /** Clears the coupler's + NX units' current errors by writing 01 to CoE
  * 0x2002:02 "Sysmac Error Status Clear" (W519 A-5-3). Does not fix the cause —
  * the same error returns if it's still present. */
@@ -303,7 +327,7 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
 
   const warnings: string[] = [];
   if (master.linkUp === false) {
-    warnings.push(`EtherCAT link down on ${om.ethercatInterface || 'the configured NIC'}`);
+    warnings.push('EtherCAT link down - check the cable and the master NIC');
   }
   if (master.phase && !/^op/i.test(master.phase)) {
     warnings.push(`EtherCAT master phase is "${master.phase}", not Operation`);
@@ -321,7 +345,7 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
   }
 
   const errCount = readCouplerErrorCount();
-  if (errCount) warnings.push(`Coupler/NX units report ${errCount} current error(s) — remove the cause, then Clear EtherCAT Errors`);
+  if (errCount) warnings.push(`Coupler/NX units report ${errCount} current error(s): ${readCouplerErrorDetail() ?? 'details unreadable'} - remove the cause, then clear the EtherCAT fault`);
 
   const productId = getSlaveProductId(0);
   const rackEntries = getRackPdoEntries(0);

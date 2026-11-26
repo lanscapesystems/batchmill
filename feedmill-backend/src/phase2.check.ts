@@ -1,4 +1,5 @@
 // Behaviour check for Phase 2 load monitoring and the load PID. Run: MILL_DATA_DIR=<tmp dir> npm run check
+import './testScan.js';
 import assert from 'node:assert/strict';
 import { Mill } from './mill.js';
 import { loadFaults } from './db.js';

@@ -255,7 +255,6 @@ export interface StateSnapshot {
   sharedVfds: SharedVfd[];
   omronConfig: OmronConfig;
   globalConfig: Record<string, string | number>;
-  networkInterfaces: string[];
   // Gates forcing an output via SetOverride — bench-testing real DO/AO points
   // needs to bypass control logic, which normal operation must never allow.
   commissioningMode: boolean;
@@ -439,7 +438,6 @@ export interface OmronConfig {
   couplerType: CouplerType;
   ipAddress: string;
   nodeAddress: number;
-  ethercatInterface: string; // dedicated Debian NIC bound to the EtherCAT master (NX-ECC only)
   eccModel: EccModel; // NX-ECC only: NX-ECC202 or NX-ECC203
   cycleTimeUs: number; // EtherCAT master cyclic period, in microseconds (NX-ECC only)
   ringTopology: boolean; // NX-ECC203 v1.5+ only
