@@ -5,6 +5,7 @@ import { readIoState } from './ioDaemon.js';
 
 const DEFAULT_WEIGHT_REGEX = '[+-]?\\d+\\.?\\d*';
 const RS1201_POLL_MS = 100;
+const SERIAL_RETRY_MS = 3000;
 
 interface Reader {
   key: string; // config fields that define the connection — reader restarts when this changes
@@ -56,37 +57,53 @@ function startSerialReader(mill: Mill, cfg: ScaleConfig): () => void {
   let lastValidAt = 0;
   let port: SerialPort | null = null;
   let buf = '';
+  let closed = false;
+  let retry: NodeJS.Timeout | null = null;
 
   const markStaleLoop = setInterval(() => {
     if (Date.now() - lastValidAt > cfg.freshnessTimeout) mill.setScale(cfg.id, 0, false, false);
   }, Math.max(250, cfg.freshnessTimeout / 2));
 
-  try {
-    const re = new RegExp(cfg.weightRegex || DEFAULT_WEIGHT_REGEX);
-    port = new SerialPort({
-      path: cfg.comPort, baudRate: cfg.baudRate,
-      dataBits: cfg.dataBits as 5 | 6 | 7 | 8, parity: cfg.parity, stopBits: cfg.stopBits as 1 | 1.5 | 2,
-    });
-    port.on('data', (chunk: Buffer) => {
-      buf += chunk.toString('ascii');
-      let nl: number;
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, nl);
-        buf = buf.slice(nl + 1);
-        const m = re.exec(line);
-        if (!m) continue;
-        const weight = Number(m[0]);
-        if (!Number.isFinite(weight)) continue;
-        lastValidAt = Date.now();
-        mill.setScale(cfg.id, weight, stable(weight, lastValidAt), true);
-      }
-    });
-    port.on('error', () => { /* reconcile will retry on the next config check; no crash */ });
-  } catch {
-    // port failed to open (not present, wrong name) — scale just stays stale/invalid, no fault from here
-  }
+  // Port missing / unplugged / errored: stay stale (no fault from here) and re-open every few seconds.
+  const scheduleRetry = () => {
+    if (closed || retry) return;
+    retry = setTimeout(() => { retry = null; open(); }, SERIAL_RETRY_MS);
+  };
 
-  return () => { clearInterval(markStaleLoop); try { port?.close(); } catch {} };
+  const open = () => {
+    try {
+      const re = new RegExp(cfg.weightRegex || DEFAULT_WEIGHT_REGEX);
+      buf = '';
+      const p = new SerialPort({
+        path: cfg.comPort, baudRate: cfg.baudRate,
+        dataBits: cfg.dataBits as 5 | 6 | 7 | 8, parity: cfg.parity, stopBits: cfg.stopBits as 1 | 1.5 | 2,
+      });
+      port = p;
+      p.on('data', (chunk: Buffer) => {
+        buf += chunk.toString('ascii');
+        if (buf.length > 4096) buf = buf.slice(-256); // no line terminator ever arriving must not grow the buffer forever
+        let nl: number;
+        // LF or CR ends a line (some heads send CR only); blank pieces from CRLF are skipped by the regex miss
+        while ((nl = buf.search(/[\r\n]/)) >= 0) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          const m = re.exec(line);
+          if (!m) continue;
+          const weight = Number(m[0]);
+          if (!Number.isFinite(weight)) continue;
+          lastValidAt = Date.now();
+          mill.setScale(cfg.id, weight, stable(weight, lastValidAt), true);
+        }
+      });
+      p.on('error', () => { try { p.close(); } catch {} scheduleRetry(); });
+      p.on('close', scheduleRetry);
+    } catch {
+      scheduleRetry();
+    }
+  };
+  open();
+
+  return () => { closed = true; if (retry) clearTimeout(retry); clearInterval(markStaleLoop); try { port?.close(); } catch {} };
 }
 
 // ── RS1201: weight PDO read via the io_daemon's cyclic state file ──
@@ -105,8 +122,9 @@ function startRs1201Reader(mill: Mill, cfg: ScaleConfig): () => void {
   const timer = setInterval(() => {
     const state = readIoState();
     const raw = state?.inputs[signalId];
-    if (typeof raw !== 'number') {
-      mill.setScale(cfg.id, 0, false, false); // io_daemon not running, or this scale not in its config yet
+    // healthy === false: the daemon freezes inputs at last-good, so a stale weight would otherwise look live
+    if (typeof raw !== 'number' || state?.healthy === false) {
+      mill.setScale(cfg.id, 0, false, false); // io_daemon not running, bus down, or this scale not in its config yet
       return;
     }
     const status = state?.inputs[`SS:${cfg.id}`];
