@@ -360,7 +360,7 @@ export class Mill {
         if (step && step.state === 'feeding') { step.augerRunMs = 0; step.progressMs = 0; step.progressRef = step.actual; } // no-flow delay starts again
         if (step?.state === 'settling') step.settleStartTime = this.clockMs; // timers are scan counts: restart after a pause or a restart
         b.dischargeStartTime = this.clockMs; b.emptySinceMs = undefined;
-        b.faultReason = undefined;
+        b.faultReason = undefined; b.dosingError = undefined;
         b.state = b.previousState ?? 'DOSING';
         persistBatch(b);
         return ok();
@@ -369,7 +369,7 @@ export class Mill {
       case 'AbortBatch': {
         const b = this.activeBatch;
         if (!b) return reject('No active batch');
-        if (b.state !== 'PAUSED') return reject('Pause the batch before aborting');
+        if (b.state !== 'PAUSED' && b.state !== 'ABORTED_HOLD') return reject('Pause the batch before aborting'); // ABORTED_HOLD: a failed batch holding material
         const mode = cmd.parameters?.mode;
         if (mode !== 'mixUnload' && mode !== 'unload' && mode !== 'cancel') return reject('Choose Mix + Unload, Unload or Cancel');
         if (mode === 'cancel' && cmd.parameters?.acknowledged !== true) return reject('Cancel must be acknowledged');
@@ -389,28 +389,21 @@ export class Mill {
         return ok();
       }
 
-      // After an abort/failure with material in the mixer: discharge it (to the original or another finished bin) ...
-      case 'UnloadBatch': {
+      // After a dosing problem (batch paused): take what was dosed for the step and carry on with the next ingredient.
+      case 'AcceptDosing': {
         const b = this.activeBatch;
-        if (!b || b.state !== 'ABORTED_HOLD') return reject('No aborted batch to unload');
-        const dest = (cmd.parameters?.destination as string | undefined) ?? b.destination;
-        if (!this.bins.some(x => x.id === dest && x.type === 'finished')) return reject('Destination must be a finished bin');
+        if (!b?.dosingError || b.state !== 'PAUSED') return reject('No dosing problem to accept');
         if (!this.estopOk()) return reject('E-stop active'); if (this.outputForcesActive()) return reject('Clear the forced outputs first');
-        b.destination = dest;
-        b.unloading = true;
-        b.faultReason = undefined;
-        b.state = 'ROUTE_PRECHECK';
-        persistBatch(b);
-        return ok();
-      }
-
-      // ... or, if the operator emptied the mixer another way, close it without crediting anything.
-      case 'DiscardBatch': {
-        const b = this.activeBatch;
-        if (!b || b.state !== 'ABORTED_HOLD') return reject('No aborted batch to discard');
+        const step = b.dosingSteps[b.dosingError.stepIndex];
         const scale = this.getMixerScale();
-        if (!scale || !scale.valid || scale.weight >= this.emptyLbs()) return reject('The mixer scale must read empty first');
-        this.closeBatch(b, 'ABORTED');
+        if (scale?.valid) step.actual = Math.max(0, scale.weight - step.baselineWeight);
+        step.deviation = round1(step.actual - step.target);
+        step.clean = false; // an accepted problem never calibrates freefall
+        step.state = 'complete';
+        b.dosingIndex = b.dosingError.stepIndex + 1;
+        b.dosingError = undefined; b.faultReason = undefined; b.tolHold = undefined;
+        b.state = 'DOSING';
+        persistBatch(b);
         return ok();
       }
 
@@ -1834,7 +1827,7 @@ export class Mill {
       }
 
       case 'ABORTED_HOLD': {
-        // everything stopped through its own stop delay; the batch now waits for Unload or Discard
+        // everything stopped through its own stop delay; the batch now waits for the operator (Mix + Unload, Unload or Cancel)
         if (this.allOwnedEquipmentStopped(b.id)) this.releaseEquipment(b.id);
         break;
       }
@@ -1994,8 +1987,7 @@ export class Mill {
               if (step.progressMs >= NO_PROGRESS_WINDOW_MS) {
                 const minLbs = Number(binEq?.config.noProgressMinLbs ?? 2);
                 if (step.actual - (step.progressRef ?? 0) < minLbs) {
-                  step.state = 'faulted';
-                  this.batchFault(b, `No flow from ${step.sourceBinId}`);
+                  this.dosingProblem(b, step, `No flow from ${step.sourceBinId}`);
                   return;
                 }
                 step.progressRef = step.actual; step.progressMs = 0;
@@ -2055,7 +2047,7 @@ export class Mill {
         break;
 
       case 'faulted':
-        this.batchFault(b, `Dosing step ${step.ingredientName} faulted`);
+        this.dosingProblem(b, step, `Dosing step ${step.ingredientName} faulted`);
         break;
     }
 
@@ -2109,17 +2101,6 @@ export class Mill {
     this.activeBatch = null;
     archiveBatch(b);
     clearActiveBatch(b.id);
-  }
-
-  // Abort or failure: stop the batch's equipment and deduct what was dosed. With material in the mixer the batch waits in
-  // ABORTED_HOLD for Unload (or Discard once the scale reads empty); with none it closes at once.
-  private abortActive(b: BatchRuntime, reason: string, finalIfEmpty: 'ABORTED' | 'FAULTED') {
-    this.initiateEquipmentStop(b.id);
-    b.tolHold = undefined;
-    b.faultReason = reason;
-    this.postConsumption(b);
-    if (b.dosingSteps.some(st => st.actual > 0)) { b.previousState = undefined; b.state = 'ABORTED_HOLD'; persistBatch(b); }
-    else this.closeBatch(b, finalIfEmpty);
   }
 
   // What the saved progress of the step in progress says the scale should read, vs. what it reads now (checked on Resume).
@@ -2428,7 +2409,7 @@ export class Mill {
         })),
         mixTimeRemainingMs: b.mixTimeRemainingMs, mixTimeTotalMs: b.mixTimeTotalMs,
         faultReason: b.faultReason,
-        scheduledAt: b.scheduledAt, late: b.late, warnings: b.warnings, tolHold: b.tolHold,
+        scheduledAt: b.scheduledAt, late: b.late, warnings: b.warnings, tolHold: b.tolHold, dosingError: b.dosingError,
       };
     };
 
@@ -2598,11 +2579,14 @@ export class Mill {
     }
   }
 
-  private batchFault(b: BatchRuntime, reason: string) {
-    this.raiseFault('BATCH', 'CRITICAL', `Batch ${b.id}: ${reason}`, 'E-BA-01');
-    this.abortActive(b, reason, 'FAULTED');
+  // A dosing problem pauses the batch (the feeders stop) and raises a popup on the HMI: Resume tries the step again,
+  // Accept takes what was dosed and carries on, Abort gives the batch up.
+  private dosingProblem(b: BatchRuntime, step: DosingStep, message: string) {
+    this.raiseFault('BATCH', 'CRITICAL', `Batch ${b.id}: ${message}`, 'E-BA-01');
+    b.dosingError = { stepIndex: b.dosingIndex, ingredientName: step.ingredientName, message, actual: step.actual, target: step.target };
+    this.pauseActiveBatch();
+    b.faultReason = message;
   }
-
   private releaseEquipment(ownerId: string) {
     for (const eq of this.equipment.values()) {
       if (eq.owner === ownerId) { eq.request = false; eq.owner = undefined; }

@@ -67,12 +67,16 @@ export interface QueueEntry {
   warnings?: string[];
   faultReason?: string;
   tolHold?: ToleranceHold;
+  dosingError?: DosingError;
 }
 
 // An out-of-tolerance step waiting for the operator (Ignore / Update freefall / Abort).
 export interface ToleranceHold {
   stepIndex: number; ingredientName: string; desired: number; actual: number; difference: number; currentFreefall: number; newFreefall: number;
 }
+
+// A dosing step that failed (no flow ...): the batch is paused; Resume retries, Accept carries on, Abort gives up.
+export interface DosingError { stepIndex: number; ingredientName: string; message: string; actual: number; target: number }
 
 export interface Fault {
   id: string;

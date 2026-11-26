@@ -1,7 +1,7 @@
 'use client';
 
 import { createContext, useContext, useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
-import type { Fault, Ingredient, Bin, Recipe, ToleranceHold } from './sim-data';
+import type { Fault, Ingredient, Bin, Recipe, ToleranceHold, DosingError } from './sim-data';
 import type { EquipmentStatus, EquipmentMode } from './store';
 
 export interface BackendEquipment {
@@ -62,6 +62,7 @@ export interface BackendBatch {
   late?: boolean;
   warnings?: string[];
   tolHold?: ToleranceHold;
+  dosingError?: DosingError;
 }
 
 export interface BackendSignal {

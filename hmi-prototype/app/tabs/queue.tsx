@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { type QueueEntry, type Recipe, type Bin, type ToleranceHold } from '../sim-data';
+import { type QueueEntry, type Recipe, type Bin, type ToleranceHold, type DosingError } from '../sim-data';
 import { useBackend, type BackendBatch } from '../backend';
 import { useMillStore, type FlowConnection } from '../store';
 
@@ -35,7 +35,7 @@ function backendToQueueEntry(b: BackendBatch): QueueEntry {
     state: b.state as QueueEntry['state'],
     progress: b.progress,
     startedAt: b.startedAt, completedAt: b.completedAt,
-    scheduledAt: b.scheduledAt, late: b.late, warnings: b.warnings, faultReason: b.faultReason, tolHold: b.tolHold,
+    scheduledAt: b.scheduledAt, late: b.late, warnings: b.warnings, faultReason: b.faultReason, tolHold: b.tolHold, dosingError: b.dosingError,
     actuals: b.dosingSteps?.map(s => ({
       ingredientId: s.ingredientId, target: s.target, actual: s.actual,
       unit: s.unit, sourceBinId: s.sourceBinId,
@@ -86,6 +86,7 @@ export function QueueTab() {
   const [editBatchId, setEditBatchId] = useState<string | null>(null);
   const [abortMenu, setAbortMenu] = useState(false); // Abort pressed on a paused batch: the choices replace Resume/Abort
   const [cancelAckOpen, setCancelAckOpen] = useState(false);
+  const [dosingDismissed, setDosingDismissed] = useState<string | null>(null); // dosing-error popup closed for this batch/step
   // questions the backend asks before going on: queue-time warnings, a scale that disagrees on resume
   const [warnAsk, setWarnAsk] = useState<{ warnings: string[]; action: string; targetId?: string; data: Record<string, unknown> } | null>(null);
   const [mismatchAsk, setMismatchAsk] = useState<{ saved: number; current: number; ingredientName: string } | null>(null);
@@ -156,7 +157,7 @@ export function QueueTab() {
 
   async function handleResume(rebaseline = false) {
     if (!backend?.connected) return;
-    setAbortMenu(false);
+    setAbortMenu(false); setDosingDismissed(null);
     const r = await backend.sendCommand('ResumeBatch', undefined, rebaseline ? { rebaseline: true } : undefined);
     if (!r.accepted && r.reason === 'Scale mismatch') setMismatchAsk(r.data as { saved: number; current: number; ingredientName: string });
     else setMismatchAsk(null);
@@ -164,6 +165,8 @@ export function QueueTab() {
 
   const aborted = activeBatchEntry?.state === 'ABORTED_HOLD';
   // the tolerance popup steps aside once the batch is paused, so the Abort choices are reachable
+  const dosingError: DosingError | undefined = activeBatchEntry?.dosingError;
+  const dosingKey = dosingError ? `${activeBatchEntry!.id}:${dosingError.stepIndex}` : null;
   const tolHold: ToleranceHold | undefined = isPaused ? undefined : activeBatchEntry?.tolHold;
 
   return (
@@ -200,14 +203,7 @@ export function QueueTab() {
               </div>
               {backend?.connected && (
                 <div className="flex gap-2">
-                  {aborted ? (
-                    <>
-                      <button onClick={() => backend.sendCommand('UnloadBatch')}
-                        style={{ ...btnBase, background: 'var(--green)', color: '#000' }}>Unload</button>
-                      <button onClick={() => backend.sendCommand('DiscardBatch')}
-                        style={{ ...btnBase, background: 'transparent', border: '1px solid var(--border)', color: 'var(--fg-dim)' }}>Discard (mixer empty)</button>
-                    </>
-                  ) : abortMenu && activeBatchEntry.state === 'PAUSED' ? (
+                  {(aborted || (abortMenu && activeBatchEntry.state === 'PAUSED')) ? (
                     <>
                       <button onClick={() => { setAbortMenu(false); backend.sendCommand('AbortBatch', undefined, { mode: 'mixUnload' }); }}
                         style={{ ...btnBase, background: 'var(--green)', color: '#000' }}>Mix + Unload</button>
@@ -215,13 +211,19 @@ export function QueueTab() {
                         style={{ ...btnBase, background: 'var(--orange)', color: '#000' }}>Unload</button>
                       <button onClick={() => setCancelAckOpen(true)}
                         style={{ ...btnBase, background: 'var(--red)', color: '#fff' }}>Cancel Batch</button>
-                      <button onClick={() => setAbortMenu(false)}
-                        style={{ ...btnBase, background: 'transparent', border: '1px solid var(--border)', color: 'var(--fg-dim)' }}>Back</button>
+                      {!aborted && (
+                        <button onClick={() => setAbortMenu(false)}
+                          style={{ ...btnBase, background: 'transparent', border: '1px solid var(--border)', color: 'var(--fg-dim)' }}>Back</button>
+                      )}
                     </>
                   ) : isPaused ? (
                     <>
                       <button onClick={() => handleResume()}
                         style={{ ...btnBase, background: 'var(--green)', color: '#000' }}>Resume</button>
+                      {activeBatchEntry.state === 'PAUSED' && dosingError && (
+                        <button onClick={() => backend.sendCommand('AcceptDosing')}
+                          style={{ ...btnBase, background: 'var(--accent)', color: '#000' }}>Accept and Continue</button>
+                      )}
                       {activeBatchEntry.state === 'PAUSED' && (
                         <button onClick={() => setAbortMenu(true)}
                           style={{ ...btnBase, background: 'var(--red)', color: '#fff' }}>Abort</button>
@@ -401,6 +403,24 @@ export function QueueTab() {
               style={{ ...btnBase, background: 'var(--bg)', color: 'var(--fg)', border: '1px solid var(--border)' }}>Cancel</button>
             <button onClick={async () => { const a = warnAsk; setWarnAsk(null); await backend?.sendCommand(a.action, a.targetId, { ...a.data, acknowledged: true }); setNewBatchOpen(false); setEditBatchId(null); }}
               style={{ ...btnBase, background: 'var(--accent)', color: '#000' }}>{warnAsk.action === 'EditBatch' ? 'Save anyway' : 'Add anyway'}</button>
+          </div>
+        </ModalOverlay>
+      )}
+
+      {/* Dosing problem: the batch is paused with the error; accept it and carry on, or close this and Resume / Abort */}
+      {dosingError && activeBatchEntry?.state === 'PAUSED' && dosingKey !== dosingDismissed && (
+        <ModalOverlay onClose={() => setDosingDismissed(dosingKey)}>
+          <div style={{ fontWeight: 600, fontSize: '13px', marginBottom: '8px', color: 'var(--fg-bright)' }}>Dosing problem: {dosingError.ingredientName}</div>
+          <div style={{ fontSize: '12px', color: 'var(--orange)', marginBottom: '8px' }}>{dosingError.message}</div>
+          <div style={{ fontSize: '12px', color: 'var(--fg)', marginBottom: '14px' }}>
+            Dosed {dosingError.actual.toFixed(1)} of {dosingError.target} lbs. The batch is paused. Accept takes what was dosed and carries on with the next ingredient;
+            or close this and Resume to try again, or Abort.
+          </div>
+          <div className="flex gap-2 justify-end">
+            <button onClick={() => setDosingDismissed(dosingKey)}
+              style={{ ...btnBase, background: 'var(--bg)', color: 'var(--fg)', border: '1px solid var(--border)' }}>Close</button>
+            <button onClick={() => backend?.sendCommand('AcceptDosing')}
+              style={{ ...btnBase, background: 'var(--accent)', color: '#000' }}>Accept and Continue</button>
           </div>
         </ModalOverlay>
       )}

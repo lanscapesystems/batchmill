@@ -76,6 +76,8 @@ export interface DosingStep {
 }
 
 // Out-of-tolerance step waiting for the operator (Ignore / Update freefall / Abort).
+export interface DosingError { stepIndex: number; ingredientName: string; message: string; actual: number; target: number }
+
 export interface ToleranceHold {
   stepIndex: number;
   ingredientName: string;
@@ -107,6 +109,7 @@ export interface BatchRuntime {
   late?: boolean;                // released more than a minute after its scheduled time
   warnings?: string[];           // queue-time warnings (inventory / mixer capacity) the operator accepted
   tolHold?: ToleranceHold;
+  dosingError?: DosingError;
   dischargeStartWeight?: number; // mixer weight when discharge began (credited weight = this minus what is left)
   emptySinceMs?: number;         // when the scale first declared the mixer empty (cleanout time counts from here)
   consumptionPosted?: boolean;   // dosed material already deducted from the bins
@@ -264,6 +267,7 @@ export interface QueueSnapshot {
   late?: boolean;
   warnings?: string[];
   tolHold?: ToleranceHold;
+  dosingError?: DosingError;
 }
 
 export interface BatchSnapshot extends QueueSnapshot {}

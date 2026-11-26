@@ -145,7 +145,9 @@ finished();
 // ── watchdogs ──
 // no flow: the auger runs but the weight never rises
 reset(); queue(); run(); rate = 0; coast = 0; scan(3); // released and feeding
-assert.ok(until(() => m.activeBatch === null, 400)); assert.equal(m.queue[0].state, 'FAULTED', 'nothing dosed: closes as faulted');
+assert.ok(until(() => !!m.activeBatch?.dosingError, 400)); assert.ok(until(() => m.activeBatch.state === 'PAUSED')); assert.match(m.activeBatch.dosingError.message, /No flow from B1/, 'pauses with the error for the popup');
+assert.equal(cmd('ResumeBatch').accepted, true); assert.equal(m.activeBatch.dosingError, undefined, 'resume retries the step'); assert.ok(until(() => !!m.activeBatch?.dosingError, 400)); assert.ok(until(() => m.activeBatch.state === 'PAUSED'));
+rate = 20; feed(); assert.equal(cmd('AcceptDosing').accepted, true); assert.equal(m.activeBatch.dosingIndex, 1, 'accept takes the step as dosed and carries on'); assert.equal(m.activeBatch.dosingSteps[0].state, 'complete'); assert.equal(cmd('AcceptDosing').accepted, false);
 assert.ok(m.faults.some((f: any) => f.active && f.code === 'E-BA-01' && /No flow from B1/.test(f.message)));
 // scale lost mid-feed: feeder stops, batch pauses, resume needs the scale back
 reset(); queue(); run(); assert.ok(until(() => m.activeBatch?.dosingSteps[0].state === 'feeding'));
@@ -195,10 +197,6 @@ assert.ok(until(() => m.activeBatch === null && m.queue[0].state === 'ABORTED'))
 reset(); queue(); run(); assert.ok(until(() => m.activeBatch?.dosingSteps[0].state === 'feeding')); scan(3); cmd('PauseBatch'); assert.ok(until(() => m.activeBatch.state === 'PAUSED'));
 const d2 = dosed0(); assert.equal(cmd('AbortBatch', undefined, { mode: 'cancel', acknowledged: true }).accepted, true); assert.equal(m.activeBatch, null); assert.equal(m.queue[0].state, 'ABORTED');
 assert.ok(Math.abs(m.bins.find((b: any) => b.id === 'B1').balance - (1000 - d2)) < 0.01);
-// a failure with material in the mixer still holds it for Unload / Discard
-reset(); queue(); run(); assert.ok(until(() => m.activeBatch?.dosingSteps[0].state === 'feeding')); scan(3); (m as any).batchFault(m.activeBatch, 'test'); assert.equal(m.activeBatch.state, 'ABORTED_HOLD');
-assert.equal(cmd('DiscardBatch').accepted, false, 'cannot discard while the scale reads material'); assert.equal(cmd('UnloadBatch', undefined, { destination: 'B1' }).accepted, false, 'destination must be a finished bin');
-weight = 0; scan(2); assert.equal(cmd('DiscardBatch').accepted, true); assert.equal(m.activeBatch, null);
 // aborting before anything was dosed closes at once
 reset(); queue(); run(); scan(2); cmd('PauseBatch'); assert.ok(until(() => m.activeBatch.state === 'PAUSED')); assert.equal(cmd('AbortBatch', undefined, { mode: 'unload' }).accepted, true); assert.equal(m.activeBatch, null); assert.equal(m.queue[0].state, 'ABORTED');
 
