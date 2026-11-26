@@ -8,7 +8,7 @@ import {
   EQUIPMENT_DEFS,
 } from './types.js';
 import { listCandidateNics } from './network.js';
-import { verifyEthercatRack, syncIoConf, checkRackPresence, clearCouplerErrors, runRs1201Calibration, type ScaleCalStep } from './ethercat.js';
+import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresence, clearCouplerErrors, runRs1201Calibration, type ScaleCalStep } from './ethercat.js';
 import { MovingAverage, OnDelay, LoadPid, RelayTuner, scaleLinear } from './loadControl.js';
 import { Debounce } from './monitors.js';
 import { readIoState, writeIoCommand, rawToPct, fullScaleFor, NX_ANALOG_DISCONNECT_RAW } from './ioDaemon.js';
@@ -580,6 +580,11 @@ export class Mill {
       }
 
       case 'ReadOmronRack': {
+        // probe: read the rack off the bus while the coupler is still being set up (nothing saved, no cards needed)
+        if (cmd.parameters?.probe === true) {
+          const r = discoverRack();
+          return r.ok ? { ...ok(`${r.cards.length} unit(s) detected`), data: r } : reject(r.error ?? 'Rack read failed');
+        }
         if (this.omronConfig.couplerType === 'none') return reject('No coupler configured');
         this.readOmronRack();
         this.persistConfig(); // discoveredRack must survive a restart, or every reboot would need a fresh Read Rack

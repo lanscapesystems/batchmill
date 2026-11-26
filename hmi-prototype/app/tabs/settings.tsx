@@ -915,6 +915,7 @@ function IOSection() {
   const [dragIdx, setDragIdx] = useState<number | null>(null);
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
   const [confirmReadRack, setConfirmReadRack] = useState(false);
+  const [rackNotes, setRackNotes] = useState<{ text: string; warn: boolean }[] | null>(null); // result of the last Read from Coupler while configuring
 
   const inputStyle = { background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: '3px', color: 'var(--fg-bright)', padding: '4px 8px', fontFamily: 'inherit', fontSize: '12px', width: '100%' } as const;
 
@@ -943,13 +944,14 @@ function IOSection() {
   ];
 
   function renumberCards(cards: BackendIoRackCard[]) { return cards.map((c, i) => ({ ...c, slot: i + 1 })); }
-  function startEditOmron() { setOmDraft({ ...om, cards: om.cards.map(c => ({ ...c })) }); setOmEditing(true); }
+  function startEditOmron() { setOmDraft({ ...om, cards: om.cards.map(c => ({ ...c })) }); setRackNotes(null); setOmEditing(true); }
   function saveOmron() {
     const sorted = { ...omDraft, cards: renumberCards(omDraft.cards) };
     backend?.sendCommand('ConfigureOmron', undefined, sorted as unknown as Record<string, unknown>);
     setOmEditing(false);
+    setRackNotes(null);
   }
-  function cancelOmron() { setOmEditing(false); }
+  function cancelOmron() { setOmEditing(false); setRackNotes(null); }
   function addCard() {
     const nextSlot = omDraft.cards.length + 1;
     setOmDraft({ ...omDraft, cards: [...omDraft.cards, { slot: nextSlot, model: nextSlot === 1 ? 'NX-PF0730' : 'NX-ID5342', status: 'unchecked' as const }] });
@@ -973,7 +975,22 @@ function IOSection() {
     setDragIdx(null);
     setDragOverIdx(null);
   }
-  function doReadRack() { backend?.sendCommand('ReadOmronRack'); setConfirmReadRack(false); }
+  // While configuring, Read from Coupler reads the rack off the bus with nothing saved and fills the draft card list.
+  // Outside the editor it verifies the saved configuration against the bus.
+  async function doReadRack() {
+    setConfirmReadRack(false);
+    if (!omEditing) { backend?.sendCommand('ReadOmronRack'); return; }
+    const r = await backend?.sendCommand('ReadOmronRack', undefined, { probe: true });
+    const d = r?.data as { eccModel?: string; couplerName?: string; cards: { slot: number; model: string; confidence: string }[]; warnings: string[] } | undefined;
+    if (!r?.accepted || !d) { setRackNotes([{ text: r?.reason ?? 'Read failed', warn: true }]); return; }
+    setOmDraft(prev => ({ ...prev, eccModel: (d.eccModel as BackendEccModel | undefined) ?? prev.eccModel, cards: d.cards.map(c => ({ slot: c.slot, model: c.model, status: 'unchecked' as const })) }));
+    const why: Record<string, string> = { inferred: 'identified from its process data', ambiguous: 'one of several models with this process data - confirm it', assumed: 'no way to tell - confirm it' };
+    setRackNotes([
+      { text: `${d.couplerName ?? 'Coupler'}: ${d.cards.length} unit(s) detected. Nothing is saved until you press Save.`, warn: false },
+      ...d.cards.filter(c => c.confidence !== 'ident').map(c => ({ text: `Slot ${c.slot}: ${c.model} (${why[c.confidence] ?? c.confidence})`, warn: c.confidence !== 'inferred' })),
+      ...d.warnings.map(w => ({ text: w, warn: true })),
+    ]);
+  }
 
   // Commissioning
   function toggleCommissioningMode(en: boolean) {
@@ -1062,6 +1079,12 @@ function IOSection() {
                   style={{ background: 'transparent', color: 'var(--fg-bright)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer' }}>
                   Configure
                 </button>
+                {om.couplerType !== 'none' && (
+                  <button onClick={() => setConfirmReadRack(true)} className="px-3 py-1.5 text-xs font-medium" title="Check the saved cards against what the coupler reports"
+                    style={{ background: 'transparent', color: 'var(--accent)', border: '1px solid var(--accent)', borderRadius: '3px', cursor: 'pointer' }}>
+                    Verify Rack
+                  </button>
+                )}
               </div>
             </>
           ) : (
@@ -1152,6 +1175,11 @@ function IOSection() {
                       </button>
                     </div>
                   </div>
+                  {rackNotes && (
+                    <div className="flex flex-col gap-1" style={{ fontSize: '11px' }}>
+                      {rackNotes.map((n, i) => <div key={i} style={{ color: n.warn ? 'var(--orange)' : 'var(--fg-dim)' }}>{n.warn ? '⚠ ' : ''}{n.text}</div>)}
+                    </div>
+                  )}
                   <table style={{ fontSize: '11px', borderCollapse: 'collapse', width: '100%' }}>
                     <thead>
                       <tr style={{ color: 'var(--fg-dim)', textAlign: 'left' }}>
@@ -1466,13 +1494,15 @@ function IOSection() {
             onClick={e => e.stopPropagation()}>
             <div style={{ color: 'var(--fg-bright)', fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>Read Rack from Coupler</div>
             <div style={{ color: 'var(--fg)', fontSize: '12px', marginBottom: '14px' }}>
-              This will query the coupler for its current card layout. Any mismatch between configured and detected cards will raise a fatal fault.
+              {omEditing
+                ? 'Reads the rack off the coupler and fills in the card list. Nothing is saved until you press Save, and it works before any card is added. Units are identified from the coupler where possible; check each model.'
+                : 'This will query the coupler for its current card layout. Any mismatch between configured and detected cards will raise a fatal fault.'}
             </div>
             <div className="flex gap-2 justify-end">
               <button onClick={() => setConfirmReadRack(false)}
                 style={{ padding: '5px 14px', borderRadius: '3px', border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--fg)', fontSize: '12px', cursor: 'pointer' }}>Cancel</button>
               <button onClick={doReadRack}
-                style={{ padding: '5px 14px', borderRadius: '3px', border: 'none', background: 'var(--accent)', color: '#000', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}>Read Rack</button>
+                style={{ padding: '5px 14px', borderRadius: '3px', border: 'none', background: 'var(--accent)', color: '#000', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}>{omEditing ? 'Read Rack' : 'Verify Rack'}</button>
             </div>
           </div>
         </div>

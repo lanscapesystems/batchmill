@@ -211,6 +211,74 @@ export function allocateRackEntries(cards: IoRackCard[], inputEntries: PdoEntry[
   return bySlot;
 }
 
+export interface DiscoveredCard {
+  slot: number;
+  model: string;
+  ident?: number;
+  // ident = matched a confirmed module ident; inferred = the only catalog model with that process-data layout;
+  // ambiguous = several catalog models share it (the first is picked); assumed = nothing to go on (e.g. a power unit)
+  confidence: 'ident' | 'inferred' | 'ambiguous' | 'assumed';
+}
+export interface RackDiscovery { ok: boolean; error?: string; couplerName?: string; eccModel?: string; cards: DiscoveredCard[]; warnings: string[] }
+
+type Shape = { category: 'DI' | 'DO' | 'AI' | 'AO' | 'scale'; points: number };
+
+// Process-data layout of one NX unit -> what kind of card it is. Digital cards expose packed entries (or one BOOL per point on
+// 2/4-point cards); analog cards one 16-bit entry per channel (never a lone 16-bit entry: that is a 16-point digital card);
+// the RS1201 exposes Detection Status (16), Executing Status (16) and Gross Weight (32).
+function unitShape(ins: PdoEntry[], outs: PdoEntry[]): Shape | undefined {
+  if (ins.length >= 3 && ins[0].bits === 16 && ins[1].bits === 16 && ins[2].bits === 32) return { category: 'scale', points: 1 };
+  const bitsOf = (es: PdoEntry[]) => es.reduce((n, e) => n + e.bits, 0);
+  if (ins.length && !outs.length) return ins.length >= 2 && ins.every(e => e.bits === 16) ? { category: 'AI', points: ins.length } : { category: 'DI', points: bitsOf(ins) };
+  if (outs.length && !ins.length) return outs.length >= 2 && outs.every(e => e.bits === 16) ? { category: 'AO', points: outs.length } : { category: 'DO', points: bitsOf(outs) };
+  return undefined;
+}
+
+/** Build a card list from what the coupler exposes alone (no saved config needed). Each NX unit's data objects sit in their own
+ * 0x20-wide block (W519 A-7-3), so unit n's entries are found by index; `idents` is the CoE 0xF050 detected-module list
+ * (1-based by unit) and lets units with no process data (power units) be counted. */
+export function cardsFromRack(entries: PdoEntry[], idents: (number | null)[], unitCount: number): { cards: DiscoveredCard[]; warnings: string[] } {
+  const warnings: string[] = [];
+  const unitOf = (e: PdoEntry) => ((e.index - (e.dir === 'input' ? 0x6000 : 0x7000)) >> 5) + 1;
+  const cards: DiscoveredCard[] = [];
+  for (let u = 1; u <= unitCount; u++) {
+    const ins = entries.filter(e => e.dir === 'input' && unitOf(e) === u);
+    const outs = entries.filter(e => e.dir === 'output' && unitOf(e) === u);
+    const ident = idents[u] ?? undefined;
+    const known = ident === undefined ? undefined : Object.entries(NX_CARD_IDENTS).find(([, v]) => v === ident)?.[0];
+    if (known) { cards.push({ slot: u, model: known, ident, confidence: 'ident' }); continue; }
+    if (!ins.length && !outs.length) { cards.push({ slot: u, model: u === 1 ? 'NX-PF0730' : 'NX-PD1000', ident, confidence: 'assumed' }); continue; }
+    const shape = unitShape(ins, outs);
+    const candidates = shape ? NX_CARD_CATALOG.filter(d => d.category === shape.category && d.points === shape.points) : [];
+    if (!candidates.length) {
+      warnings.push(`Unit ${u}: process data layout not recognised — pick its model by hand`);
+      cards.push({ slot: u, model: 'NX-ID5342', ident, confidence: 'assumed' });
+    } else cards.push({ slot: u, model: candidates[0].model, ident, confidence: candidates.length === 1 ? 'inferred' : 'ambiguous' });
+  }
+  return { cards, warnings };
+}
+
+/** Read the rack straight off the bus using nothing from the saved config — works on a fresh install, before any card is
+ * entered or the coupler settings are saved (the IgH master is set up by install.sh, not by this backend). */
+export function discoverRack(): RackDiscovery {
+  const master = getMasterStatus();
+  if (!master.toolAvailable) return { ok: false, error: `cannot reach the EtherCAT master (${master.error ?? 'unknown reason'})`, cards: [], warnings: [] };
+  if (master.linkUp === false) return { ok: false, error: 'EtherCAT link is down - check the cable and the master NIC', cards: [], warnings: [] };
+  const coupler = listSlaves().find(s => s.position === 0);
+  if (!coupler) return { ok: false, error: 'No EtherCAT slaves detected on the bus', cards: [], warnings: [] };
+  const eccMatch = /ECC20([23])/i.exec(coupler.name);
+  const entries = getRackPdoEntries(0);
+  const identCount = sdoUpload('uint8', '0xf050', '0');
+  const idents: (number | null)[] = [null];
+  for (let i = 1; i <= (identCount ?? 0); i++) idents[i] = getSlotModuleIdent(i);
+  const unitOf = (e: PdoEntry) => ((e.index - (e.dir === 'input' ? 0x6000 : 0x7000)) >> 5) + 1;
+  const unitCount = Math.max(identCount ?? 0, ...entries.map(unitOf), 0);
+  const { cards, warnings } = cardsFromRack(entries, idents, unitCount);
+  if (identCount === null) warnings.push('Could not read the module list (CoE 0xF050): units without process data, such as power units, may be missing');
+  if (!entries.length) warnings.push('The coupler exposes no process data entries yet');
+  return { ok: true, couplerName: coupler.name, eccModel: eccMatch ? `NX-ECC20${eccMatch[1]}` : undefined, cards, warnings };
+}
+
 /** Real rack verification via the IgH `ethercat` CLI, with a simulated echo
  * fallback when the tool isn't installed (dev machine, or master not set up
  * yet). Reads the coupler's product ID and PDO entry lists ONCE (position 0

@@ -118,7 +118,7 @@ export interface BackendOmronConfig {
   warnings: string[];
 }
 
-type CommandResult = { accepted: boolean; reason?: string };
+type CommandResult = { accepted: boolean; reason?: string; data?: unknown };
 
 interface BackendState {
   connected: boolean;

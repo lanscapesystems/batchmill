@@ -243,6 +243,7 @@ export interface CommandResult {
   accepted: boolean;
   reason?: string;
   revision: number;
+  data?: unknown; // optional payload (e.g. a rack read)
 }
 
 export type ScaleConnectionType = 'serial' | 'rs1201';
