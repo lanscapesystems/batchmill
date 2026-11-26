@@ -7,6 +7,7 @@ import { Mill } from './mill.js';
 import type { Command, StateSnapshot } from './types.js';
 import { reconcileScaleReaders } from './scaleReader.js';
 import { registerUpdateRoutes } from './updateApi.js';
+import { registerBackupRoutes } from './backupApi.js';
 
 let PKG_VERSION = '0.0.0';
 try { PKG_VERSION = JSON.parse(fs.readFileSync('package.json', 'utf-8')).version; } catch {}
@@ -122,6 +123,7 @@ app.get('/api/v1/health', (_req, res) => {
 });
 
 registerUpdateRoutes(app, mill);
+registerBackupRoutes(app, mill);
 
 app.post('/api/v1/shutdown', (_req, res) => {
   if (mill.activeBatch) {

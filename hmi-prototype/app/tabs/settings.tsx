@@ -5,6 +5,7 @@ import { useMillStore, EQUIPMENT_DEFS, IO_POOL, getPortsForEquipment, GRID_SNAP,
 import { useBackend, type BackendScaleConfig, type BackendOmronConfig, type BackendIoRackCard, type BackendCouplerType, type BackendEccModel } from '../backend';
 import { IOSignalList, STATE_STYLE, stateColor } from './system';
 import { UpdateSection } from './update';
+import { BackupSection } from './backup';
 
 function useIOPools(backend: ReturnType<typeof useBackend>) {
   if (!backend?.connected || backend.ioSignals.length === 0) return IO_POOL;
@@ -18,7 +19,7 @@ function useIOPools(backend: ReturnType<typeof useBackend>) {
   };
 }
 
-type SettingsSection = 'equipment' | 'io' | 'global' | 'update';
+type SettingsSection = 'equipment' | 'io' | 'global' | 'backup' | 'update';
 
 export function SettingsTab() {
   const [section, setSection] = useState<SettingsSection>('equipment');
@@ -26,7 +27,7 @@ export function SettingsTab() {
   return (
     <div className="flex gap-4 h-full">
       <div className="flex flex-col w-40 flex-shrink-0" style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: '3px' }}>
-        {([['equipment', 'Equipment'], ['io', 'I/O Config'], ['global', 'Global'], ['update', 'Update']] as [SettingsSection, string][]).map(([key, label]) => (
+        {([['equipment', 'Equipment'], ['io', 'I/O Config'], ['global', 'Global'], ['backup', 'Backup'], ['update', 'Update']] as [SettingsSection, string][]).map(([key, label]) => (
           <button
             key={key}
             onClick={() => setSection(key)}
@@ -47,6 +48,7 @@ export function SettingsTab() {
         {section === 'equipment' && <FlowPathSection />}
         {section === 'io' && <IOSection />}
         {section === 'global' && <GlobalSection />}
+        {section === 'backup' && <BackupSection />}
         {section === 'update' && <UpdateSection />}
       </div>
     </div>

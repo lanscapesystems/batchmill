@@ -18,7 +18,7 @@ done
 systemctl daemon-reload
 
 echo ">> removing nginx site, sudoers, udev rule"
-rm -f /etc/nginx/conf.d/feedmill.conf /etc/sudoers.d/feedmill /etc/udev/rules.d/99-feedmill-ethercat.rules
+rm -f /etc/nginx/conf.d/feedmill.conf /etc/sudoers.d/feedmill /etc/udev/rules.d/99-feedmill-ethercat.rules /etc/udev/rules.d/98-feedmill-usb.rules /etc/systemd/system/feedmill-usb@.service /usr/local/sbin/feedmill-usb-mount
 nginx -t 2>/dev/null && systemctl reload nginx
 udevadm control --reload-rules
 

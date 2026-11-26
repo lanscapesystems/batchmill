@@ -185,3 +185,9 @@ export function persistFault(f: Fault): void {
     f.raisedAt, f.clearedAt, f.acknowledgedAt,
   );
 }
+
+export const dbFilePath = DB_PATH;
+// consistent online snapshot (safe while the db is in use, WAL included)
+export function backupDb(dest: string): Promise<unknown> {
+  return db.backup(dest);
+}

@@ -323,11 +323,51 @@ cat >"$SUDOERS_TMP" <<EOF
 $APP_USER ALL=(root) NOPASSWD: /bin/systemctl restart feedmill-io-daemon.service, \\
   /bin/systemctl start --no-block feedmill-update.service, \\
   /bin/systemctl start --no-block feedmill-update-github.service, \\
-  /bin/systemctl start --no-block feedmill-rollback.service
+  /bin/systemctl start --no-block feedmill-rollback.service, \\
+  /bin/systemctl restart --no-block feedmill-backend.service
 EOF
 visudo -c -f "$SUDOERS_TMP" >/dev/null || { rm -f "$SUDOERS_TMP"; die "generated sudoers file is invalid"; }
 install -m 0440 -o root -g root "$SUDOERS_TMP" /etc/sudoers.d/feedmill
 rm -f "$SUDOERS_TMP"
+
+# USB sticks: mount every USB partition at /mnt/feedmill-usb/<dev>, owned by $APP_USER, so the
+# backend can write backups there (Settings > Backup). udev starts the template unit on plug-in;
+# BindsTo the device unit makes systemd unmount it on removal.
+install -m 0755 -o root -g root /dev/stdin /usr/local/sbin/feedmill-usb-mount <<'EOF'
+#!/bin/bash
+# usage: feedmill-usb-mount <kernel name e.g. sdb1> <owner user>
+set -eu
+dev="/dev/$1"; user="$2"; mp="/mnt/feedmill-usb/$1"
+fs="$(blkid -o value -s TYPE "$dev")"
+uid="$(id -u "$user")"; gid="$(id -g "$user")"
+mkdir -p "$mp"
+opts="nosuid,nodev,noexec,sync"
+case "$fs" in
+  vfat|exfat) mount -o "$opts,uid=$uid,gid=$gid,umask=007" "$dev" "$mp" ;;
+  ntfs)       mount -t ntfs3 -o "$opts,uid=$uid,gid=$gid,umask=007" "$dev" "$mp" ;;
+  ext2|ext3|ext4) # no uid= option: own just the backups folder instead
+    mount -o "$opts" "$dev" "$mp"
+    mkdir -p "$mp/feedmill-backups"; chown "$uid:$gid" "$mp/feedmill-backups" ;;
+  *) rmdir "$mp"; echo "unsupported filesystem '$fs' on $dev" >&2; exit 1 ;;
+esac
+EOF
+install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/feedmill-usb@.service <<EOF
+[Unit]
+Description=Mount USB stick %I for feedmill backups
+BindsTo=dev-%i.device
+After=dev-%i.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/feedmill-usb-mount %I $APP_USER
+ExecStop=-/bin/umount /mnt/feedmill-usb/%I
+ExecStopPost=-/bin/rmdir /mnt/feedmill-usb/%I
+EOF
+install -m 0644 -o root -g root /dev/stdin /etc/udev/rules.d/98-feedmill-usb.rules <<'EOF'
+SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", TAG+="systemd", ENV{SYSTEMD_WANTS}+="feedmill-usb@%k.service"
+EOF
+udevadm control --reload-rules
 
 # ---- 4. build a new release (native deps must be built ON this box) -----
 VERSION="$(node -p "require('$PROJECT_DIR/package.json').version")"
