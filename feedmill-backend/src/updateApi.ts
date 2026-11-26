@@ -38,8 +38,8 @@ function startUnit(unit: 'feedmill-update.service' | 'feedmill-rollback.service'
 export function registerUpdateRoutes(app: Express, mill: Mill) {
   // same preconditions as /api/v1/shutdown: never swap code under a live batch
   const busyReason = (): string | null => {
-    if (mill.activeBatch) return 'Active batch running — abort or complete it first';
-    for (const eq of mill.equipment.values()) if (eq.status === 'running') return 'Equipment still running — stop all equipment first';
+    const guard = mill.guardConfigEdit();
+    if (guard) return guard;
     const s = readStatus().state;
     if (uploading || s === 'running' || s === 'queued') return 'An update is already in progress';
     return null;

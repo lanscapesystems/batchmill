@@ -678,13 +678,14 @@ export class Mill {
     }
   }
 
-  private guardConfigEdit(): string | null {
-    if (this.refills.size > 0) return 'Wait for hammermill refill to finish before editing config';
-    if (this.activeBatch && this.activeBatch.state !== 'PAUSED') {
-      return 'Mill must be paused or idle to edit equipment/IO config';
+  // Config edits, scale calibration and software updates need: batch paused (or none), hammermills disabled, motors not running.
+  guardConfigEdit(): string | null {
+    if (this.activeBatch && !['PAUSED', 'COMPLETED', 'FAULTED', 'IDLE'].includes(this.activeBatch.state)) {
+      return 'Pause the batch first';
     }
     for (const eq of this.equipment.values()) {
-      if (eq.status === 'running') return 'Stop all motors before editing config';
+      if (eq.equipmentType === 'hammermill' && eq.enabled) return `Disable ${eq.name} first`;
+      if (this.isMotor(eq) && eq.status === 'running') return `Stop ${eq.name} first`;
     }
     return null;
   }
