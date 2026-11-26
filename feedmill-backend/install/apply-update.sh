@@ -120,6 +120,9 @@ elif [[ $RC -eq 3 ]]; then
     systemctl stop feedmill-backend.service
     rm -f "$DATA_DIR/mill.db" "$DATA_DIR/mill.db-wal" "$DATA_DIR/mill.db-shm"
     install -m 0640 -o "$APP_USER" -g "$APP_USER" "$SNAP" "$DATA_DIR/mill.db"
+    # the new backend may also have rewritten config.json / io.conf
+    [[ ! -f "$BACKUPS/pre-$TS.config.json" ]] || install -m 0640 -o "$APP_USER" -g "$APP_USER" "$BACKUPS/pre-$TS.config.json" "$DATA_DIR/config.json"
+    [[ ! -f "$BACKUPS/pre-$TS.io.conf" ]] || install -m 0640 -o "$APP_USER" -g "$APP_USER" "$BACKUPS/pre-$TS.io.conf" /etc/feedmill/io.conf
     systemctl start feedmill-backend.service
   fi
   status rolled_back "$VERSION failed its health check; previous release and database restored"
