@@ -1265,7 +1265,7 @@ export class Mill {
     if (eq.mode === 'Auto') st = running ? 'auto_running' : 'auto_stopped';
     if (bypassed) st = 'bypass';
     if (eq.mode === 'Off') st = 'off';
-    if (eq.mode === 'Hand' && running) st = 'hand_running';
+    if (eq.mode === 'Hand') st = running ? 'hand_running' : 'hand_stopped';
     if (eq.warningReason || this.faults.some(f => f.active && f.equipment === eq.id && f.severity === 'WARNING')) st = 'alarm';
     if (eq.status === 'fault') st = 'fault';
     return st;

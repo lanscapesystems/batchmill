@@ -21,7 +21,7 @@ export interface BackendEquipment {
   speed?: number;
   refillState?: 'STARTING' | 'FILLING' | 'STOPPING';
   gatePosition?: string;
-  state?: string; // PLC-style motor display state (off, auto_stopped, auto_running, hand_running, bypass, alarm, fault, disabled)
+  state?: string; // PLC-style motor display state (off, auto_stopped, auto_running, hand_running, hand_stopped, bypass, alarm, fault, disabled)
   loadAmps?: number;
   loadDisconnected?: boolean;
   loadControlAuto?: boolean;
