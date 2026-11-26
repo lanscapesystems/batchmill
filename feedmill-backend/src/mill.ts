@@ -33,7 +33,7 @@ const EDITABLE_STATES = new Set(['IDLE', 'READY']);
 const BYPASSABLE = ['runConfirmAux', 'vfdAuxInput', 'motorAuxInput', 'analogLoadInput', 'rotationPulseInput', 'openLimitInput', 'closedLimitInput',
   'highLevelInput', 'lowLevelInput'];
 // Faults that latch their equipment in 'fault' until reset (restored on boot if the equipment state was lost).
-const TRIP_CODES = ['E-MT-01', 'E-MT-02', 'E-MT-03', 'E-LD-01', 'E-LD-03', 'E-GT-01', 'E-GT-03', 'W-GT-02'];
+const TRIP_CODES = ['E-MT-01', 'E-MT-02', 'E-MT-03', 'E-LD-01', 'E-LD-03', 'E-GT-01', 'E-GT-03', 'E-GT-04', 'W-GT-02'];
 type LoadMon = { avgSize: number; avg: MovingAverage; hiWarn: OnDelay; hiPause: OnDelay; pid: LoadPid; tuner?: RelayTuner; tuneBase?: number; tuneWasAuto?: boolean };
 
 // One hammermill refill cycle: all path equipment is requested at once and runs until the destination high switch.
@@ -124,7 +124,8 @@ export class Mill {
   private hornInPrev = false;
   private hornOn = false;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
-  private lastRackCheckMs = 0;
+  private lastWatchHealthy = false;
+  private rackCheckedStart: number | null = null; // daemonStartUs the rack identity was last confirmed for
   private rackWatchdogHandle: ReturnType<typeof setInterval> | null = null;
   private onChange?: () => void;
 
@@ -189,12 +190,16 @@ export class Mill {
   private rackWatchdogCheck() {
     const om = this.omronConfig;
     if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return;
-    // The CLI check is synchronous and stalls the mill scan: while the daemon reports a healthy bus (complete working
-    // counter every cycle) re-check identity only once a minute; any doubt goes back to the 3 s cadence.
-    const now = Date.now();
-    if (readIoState()?.healthy && now - this.lastRackCheckMs < 60_000) return;
-    this.lastRackCheckMs = now;
+    // The CLI check is synchronous and stalls the mill scan. A card that drops or faults breaks the working counter, which
+    // the daemon reports as unhealthy every cycle, so identity (is it still the same cards?) only needs checking when the
+    // bus comes up healthy: first time for this daemon run, and after any unhealthy stretch. While unhealthy, keep polling.
+    const st = readIoState();
+    const healthy = !!st?.healthy;
+    const settled = healthy && this.lastWatchHealthy && this.rackCheckedStart === st!.daemonStartUs;
+    this.lastWatchHealthy = healthy;
+    if (settled) return;
     const result = checkRackPresence(om);
+    if (healthy && !result.unreachable) this.rackCheckedStart = st!.daemonStartUs;
     om.cards = result.cards;
     if (result.unreachable) {
       // Can't verify at all — fail safe with the same shutdown response as a
@@ -1575,7 +1580,15 @@ export class Mill {
       // Off (or a starter trip): both outputs de-energized, just read feedback for position display
       this.out(openOutput, false);
       this.out(closeOutput, false);
-      if (openFb) eq.gatePosition = 'open';
+      if (openFb && closedFb) {
+        // Both limit switches on (or one overridden while the other is on): the position cannot be determined.
+        eq.gatePosition = 'unknown';
+        if (eq.status !== 'fault') {
+          eq.status = 'fault';
+          eq.faultReason = 'Gate position undetermined';
+          this.raiseFault(eq.id, 'CRITICAL', `${eq.name}: both limit switches on, position undetermined`, 'E-GT-04');
+        }
+      } else if (openFb) eq.gatePosition = 'open';
       else if (closedFb) eq.gatePosition = 'closed';
       else if (openFb === undefined && closedFb === undefined) { /* no sensors, keep last known */ }
       else eq.gatePosition = 'unknown';
@@ -1701,6 +1714,7 @@ export class Mill {
         }
         const gate = this.findGateForDischarge();
         if (gate) { gate.owner = b.id; gate.request = true; gate.gatePort = this.gatePortToward(gate, b.destination) ?? 1; }
+        if (gate && !this.pathReady(gate.id)) { b.dischargeStartTime = Date.now(); break; } // wait for the gate to reach the destination's outlet
         const scale = this.getMixerScale();
         if (scale && scale.weight < 10 && scale.stable) {
           b.state = 'CLEAROUT';
@@ -2079,7 +2093,14 @@ export class Mill {
     if (!this.hammermillReady(hm) || (dest !== 'empty' && dest !== 'normal')) return this.beginRefillStop(r);
 
     for (const id of r.path) { const e = this.equipment.get(id); if (e) e.request = true; }
-    if (r.state === 'STARTING' && r.path.every(id => this.equipment.get(id)?.status === 'running')) r.state = 'FILLING';
+    if (r.state === 'STARTING' && r.path.every(id => this.pathReady(id))) r.state = 'FILLING';
+  }
+
+  // A path device is ready when a motor is running, or a gate sits on the outlet the sequence needs (P1 or P2), per its limit switch.
+  private pathReady(id: string): boolean {
+    const e = this.equipment.get(id);
+    if (e?.equipmentType === 'gate') return e.gatePosition === (e.gatePort === 2 ? 'closed' : 'open');
+    return e?.status === 'running';
   }
 
   private beginRefillStop(r: Refill, fault?: { code: string; message: string }) {
