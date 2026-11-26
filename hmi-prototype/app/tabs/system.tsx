@@ -297,10 +297,6 @@ export function SystemTab() {
               <div style={{ color: 'var(--orange)', fontSize: '11px' }}>{beq.warningReason}</div>
             )}
 
-            {beq && activeBypasses(beq).length > 0 && (
-              <div style={{ color: 'var(--orange)', fontSize: '11px', fontWeight: 600 }}>Bypassed: {activeBypasses(beq).join(', ')}</div>
-            )}
-
             {beq && backend?.connected && !!beq.config.analogLoadInput && (
               <LoadPanel key={beq.id} beq={beq} backend={backend} />
             )}
@@ -340,7 +336,6 @@ export function SystemTab() {
                   </button>
                 ))}
               </div>
-              {selectedItem.equipmentType === 'gate' && <div className="mt-1" style={{ color: 'var(--fg-bright)', fontSize: '11px' }}>Auto sends the gate to the outlet a batch or refill needs. When released, a single-coil valve returns to P2; a double-coil or motorized gate stays where it is.</div>}
             </div>}
 
             {beq && backend?.connected && !!beq.config.analogSpeedOutput && (
@@ -500,9 +495,7 @@ const BYPASS_LABELS: Record<string, string> = {
 };
 const bypassKeys = (beq: BackendEquipment) =>
   Object.keys(BYPASS_LABELS).filter(k => !!beq.config[k] && (k !== 'vfdAuxInput' || !!beq.config.masterVfd) && (k !== 'motorAuxInput' || !!beq.config.motorGate));
-const activeBypasses = (beq: BackendEquipment) => bypassKeys(beq).filter(k => beq.config[`bypass_${k}`] === true).map(k => BYPASS_LABELS[k]);
 
-// Bottom of the sidebar: every bypass this device offers. A bypassed input is ignored as if it were not wired.
 // Every configured digital point of this device with its live state. Orange = forced (commissioning) or the input is bypassed.
 function IOMonitor({ beq, backend }: { beq: BackendEquipment; backend: Backend }) {
   const sigs = backend.ioSignals.filter(s => s.equipmentId === beq.id && (s.direction === 'DI' || s.direction === 'DO'));
@@ -535,15 +528,17 @@ function OverridesPanel({ beq, backend }: { beq: BackendEquipment; backend: Back
       <div style={{ color: 'var(--fg-bright)', fontSize: '11px', fontWeight: 500 }}>OVERRIDES</div>
       {keys.map(k => {
         const on = beq.config[`bypass_${k}`] === true;
+        // A gate's two limit switch overrides are exclusive: turn one off before the other can be turned on.
+        const other = k === 'openLimitInput' ? 'closedLimitInput' : k === 'closedLimitInput' ? 'openLimitInput' : undefined;
+        const blocked = !on && !!other && beq.config[`bypass_${other}`] === true;
         return (
-          <label key={k} className="flex items-center gap-2" style={{ color: on ? 'var(--orange)' : 'var(--fg)', fontSize: '12px' }}>
-            <input type="checkbox" checked={on} style={{ accentColor: 'var(--accent)' }}
+          <label key={k} className="flex items-center gap-2" style={{ color: on ? 'var(--orange)' : 'var(--fg)', fontSize: '12px', opacity: blocked ? 0.5 : 1 }}>
+            <input type="checkbox" checked={on} disabled={blocked} style={{ accentColor: 'var(--accent)' }}
               onChange={e => backend.sendCommand('SetBypass', beq.id, { key: k, value: e.target.checked })} />
-            <span>Bypass {BYPASS_LABELS[k]} <span style={{ color: 'var(--fg-bright)', fontSize: '11px' }}>({String(beq.config[k])})</span></span>
+            <span>{BYPASS_LABELS[k]} <span style={{ color: 'var(--fg-bright)', fontSize: '11px' }}>({String(beq.config[k])})</span></span>
           </label>
         );
       })}
-      <div style={{ color: 'var(--fg-bright)', fontSize: '11px' }}>A bypassed input is ignored as if it were not wired: its faults and trips are off until you clear the box.</div>
     </div>
   );
 }
