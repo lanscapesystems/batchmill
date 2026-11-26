@@ -94,6 +94,8 @@ export class Mill {
   }
   private handRun = new Set<string>(); // motors whose current run was started in Hand (no start/stop delays)
   private rotationState = new Map<string, { runningMs: number; rpm?: number }>();
+  private busState: 'idle' | 'ok' | 'fault' | 'offline' = 'idle'; // live EtherCAT state for the HMI indicator (set every scan)
+  private ioFault = false; // commissioned rack but bus invalid / daemon silent: the daemon has zeroed the outputs
   private lastDaemonStartUs: number | null = null; // detects an io_daemon restart (see updateBusHealth)
   ioOverrides: Record<string, SignalValue> = {};
   // Gates forcing an output via SetOverride; never persisted, so a restart
@@ -1051,6 +1053,8 @@ export class Mill {
   // silently resume commanding a value the daemon no longer agrees with.
   private updateBusHealth(state: ReturnType<typeof readIoState>) {
     const om = this.omronConfig;
+    this.busState = om.couplerType !== 'NX-ECC' ? 'idle' : !state ? 'offline' : state.healthy === false ? 'fault' : 'ok';
+    this.ioFault = om.couplerType === 'NX-ECC' && om.rackVerified && this.busState !== 'ok';
     if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return; // not commissioned yet — nothing to enforce
 
     if (state && this.lastDaemonStartUs !== null && state.daemonStartUs !== this.lastDaemonStartUs) {
@@ -1199,8 +1203,9 @@ export class Mill {
     // Like the PLC's FaultIntlTmp: a trip cancels Hand, so the operator's reset can't restart the motor on its own.
     if (eq.status === 'fault' && eq.mode === 'Hand') eq.mode = 'Off';
 
-    // E-stop: nothing runs, Hand is cancelled (Auto selection survives), and the start timers re-arm on release.
-    if (!this.estopOk()) {
+    // E-stop, or an I/O fault (the daemon has already zeroed the outputs): nothing runs, Hand is cancelled so the
+    // motor cannot restart by itself when the bus recovers (Auto selection survives), and the start timers re-arm.
+    if (!this.estopOk() || this.ioFault) {
       if (eq.mode === 'Hand') eq.mode = 'Off';
       eq.runCmd = false;
       eq.startTimerMs = 0;
@@ -2152,7 +2157,7 @@ export class Mill {
       io: { inputs: { ...this.ioInputs }, outputs: { ...this.ioOutputs }, signals: this.signals.map(s => ({ ...s, assignment: tags.get(s.id) })), overrides: { ...this.ioOverrides } },
       scales: { ...this.scales },
       scaleConfigs: this.scaleConfigs,
-      omronConfig: { ...this.omronConfig, cards: this.omronConfig.cards.map(c => ({ ...c })) },
+      omronConfig: { ...this.omronConfig, bus: this.busState, cards: this.omronConfig.cards.map(c => ({ ...c })) },
       globalConfig: { ...this.globalConfig },
       networkInterfaces: this.networkInterfaces,
       commissioningMode: this.commissioningMode,

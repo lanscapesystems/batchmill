@@ -379,6 +379,7 @@ export interface OmronConfig {
   ringTopology: boolean; // NX-ECC203 v1.5+ only
   cards: IoRackCard[];
   rackVerified: boolean;
+  bus?: 'idle' | 'ok' | 'fault' | 'offline'; // live, snapshot-only (never persisted): daemon healthy / bus invalid / daemon silent
   lastReadAt?: string;
   warnings: string[];
   discoveredRack?: DiscoveredRack; // from the last Read Rack; persists across restarts and reconfiguration

@@ -116,6 +116,7 @@ export interface BackendOmronConfig {
   ringTopology: boolean;
   cards: BackendIoRackCard[];
   rackVerified: boolean;
+  bus?: 'idle' | 'ok' | 'fault' | 'offline'; // live EtherCAT state from the backend
   lastReadAt?: string;
   warnings: string[];
 }

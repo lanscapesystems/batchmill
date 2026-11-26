@@ -156,6 +156,9 @@ static volatile unsigned diag_slaves = 0;
 static volatile unsigned diag_wc = 0;
 static volatile unsigned diag_wc_state = 0;
 static volatile bool bus_healthy = false; /* false until the first fully-healthy cycle */
+/* Time of the last command whose seq ADVANCED. Enforced in run_cycle itself (not only in the
+ * reader thread) so a hung/dead reader can never leave the last command on the bus. */
+static uint64_t last_cmd_us = 0;
 
 static void on_signal(int sig) { (void)sig; running = false; }
 
@@ -334,7 +337,6 @@ typedef struct { char sig[32]; int32_t val; } pending_output_t;
 
 static void *reader_thread(void *arg) {
     (void)arg;
-    uint64_t last_applied_us = now_us();
     uint64_t last_seq = 0;
     bool have_seq = false;
     while (running) {
@@ -367,13 +369,17 @@ static void *reader_thread(void *arg) {
             }
             fclose(f);
             if (ok && got_seq && (!have_seq || seq != last_seq)) {
-                for (int i = 0; i < n_pending; i++) {
-                    channel_t *c = find_output_channel(pending[i].sig);
-                    if (c) __atomic_store_n(&c->value, pending[i].val, __ATOMIC_RELAXED);
+                /* The first image seen after daemon start is only a baseline: it may be a
+                 * leftover from a backend that has since died. Apply only once seq advances. */
+                if (have_seq) {
+                    for (int i = 0; i < n_pending; i++) {
+                        channel_t *c = find_output_channel(pending[i].sig);
+                        if (c) __atomic_store_n(&c->value, pending[i].val, __ATOMIC_RELAXED);
+                    }
+                    __atomic_store_n(&last_cmd_us, now_us(), __ATOMIC_RELAXED);
                 }
                 last_seq = seq;
                 have_seq = true;
-                last_applied_us = now_us();
             }
             /* seq unchanged (Node hasn't written since our last poll — the
              * normal case, since this thread polls every 20ms and Node
@@ -386,7 +392,7 @@ static void *reader_thread(void *arg) {
              * stale-command fail-safe at all. Only a seq that actually
              * ADVANCES counts as proof of life. */
         }
-        if (now_us() - last_applied_us > COMMAND_STALE_US) {
+        if (now_us() - __atomic_load_n(&last_cmd_us, __ATOMIC_RELAXED) > COMMAND_STALE_US) {
             force_outputs_safe(); /* Node backend isn't updating commands — fail safe, not last-known-good */
         }
         usleep(20000);
@@ -442,6 +448,14 @@ static void setup_ethercat(void) {
                                                  slaves[i].vendor_id, slaves[i].product_id);
         if (!slaves[i].sc) {
             fprintf(stderr, "io_daemon: slave_config failed for position %u\n", slaves[i].position);
+            exit(1);
+        }
+        /* Slave-side SM watchdog, set explicitly (not left to the slave's power-on default): if this
+         * process is killed, hangs, or the cable is pulled, the coupler stops getting process data and
+         * drops to its fault output state after 100ms (2498 x 100us divider, 1000 intervals). The host
+         * cannot zero outputs in those cases -- this is the only thing that does. */
+        if (ecrt_slave_config_watchdog(slaves[i].sc, 2498, 1000)) {
+            fprintf(stderr, "io_daemon: watchdog config failed for position %u\n", slaves[i].position);
             exit(1);
         }
     }
@@ -538,6 +552,8 @@ static void run_cycle(void) {
     __atomic_store_n(&diag_wc_state, ds.wc_state, __ATOMIC_RELAXED);
 
     uint64_t t = now_us();
+    /* Outputs go on the bus only while the bus is valid AND the backend's command seq is advancing. */
+    bool drive = healthy && (t - __atomic_load_n(&last_cmd_us, __ATOMIC_RELAXED) <= COMMAND_STALE_US);
     for (int i = 0; i < n_channels; i++) {
         channel_t *c = &channels[i];
         switch (c->dir) {
@@ -561,10 +577,10 @@ static void run_cycle(void) {
             if (healthy) __atomic_store_n(&c->value, read_i32(c->offset), __ATOMIC_RELAXED);
             break;
         case DIR_DO:
-            write_bit(c->offset, c->bit, healthy && __atomic_load_n(&c->value, __ATOMIC_RELAXED) != 0);
+            write_bit(c->offset, c->bit, drive && __atomic_load_n(&c->value, __ATOMIC_RELAXED) != 0);
             break;
         case DIR_AO:
-            write_i16(c->offset, healthy ? (int16_t)__atomic_load_n(&c->value, __ATOMIC_RELAXED) : 0);
+            write_i16(c->offset, drive ?(int16_t)__atomic_load_n(&c->value, __ATOMIC_RELAXED) : 0);
             break;
         }
     }

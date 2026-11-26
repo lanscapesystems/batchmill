@@ -1026,12 +1026,21 @@ function IOSection() {
           {!omEditing ? (
             <>
               <div className="flex items-center gap-2">
-                <span className="inline-block w-2 h-2 rounded-full" style={{ background: om.couplerType === 'none' ? 'var(--fg-dim)' : om.rackVerified ? 'var(--green)' : 'var(--orange)', opacity: om.couplerType === 'none' ? 0.3 : 1 }} />
+                <span className="inline-block w-2 h-2 rounded-full" style={{ background: om.couplerType === 'none' ? 'var(--fg-dim)' : !om.rackVerified ? 'var(--orange)' : om.bus === 'ok' && om.cards.every(c => c.status === 'ok') ? 'var(--green)' : 'var(--red)', opacity: om.couplerType === 'none' ? 0.3 : 1 }} />
                 <span style={{ color: om.couplerType !== 'none' ? 'var(--fg-bright)' : 'var(--fg-dim)' }}>
                   {om.couplerType === 'none' ? 'Not Used' : om.couplerType === 'NX-EIC' ? 'NX-EIC (EtherNet/IP)' : 'NX-ECC (EtherCAT)'}
                 </span>
                 {om.couplerType !== 'none' && om.rackVerified && om.cards.every(c => c.status === 'ok') && (
                   <span style={{ color: 'var(--green)', fontSize: '11px' }}>RACK VERIFIED</span>
+                )}
+                {om.couplerType === 'NX-ECC' && om.rackVerified && om.bus === 'fault' && (
+                  <span style={{ color: 'var(--red)', fontSize: '11px', fontWeight: 600 }}>BUS FAULT (link down or incomplete data)</span>
+                )}
+                {om.couplerType === 'NX-ECC' && om.rackVerified && om.bus === 'offline' && (
+                  <span style={{ color: 'var(--red)', fontSize: '11px', fontWeight: 600 }}>I/O DAEMON NOT REPORTING</span>
+                )}
+                {om.couplerType === 'NX-ECC' && om.rackVerified && om.bus === 'ok' && (
+                  <span style={{ color: 'var(--green)', fontSize: '11px' }}>BUS OK</span>
                 )}
                 {om.couplerType !== 'none' && om.rackVerified && om.cards.some(c => c.status === 'mismatch' || c.status === 'missing') && (
                   <span style={{ color: 'var(--red)', fontSize: '11px', fontWeight: 600 }}>RACK MISMATCH</span>
