@@ -56,10 +56,11 @@ install -d -m 0700 -o root -g root "$WORK" "$WORK/src"
 SHA=""
 if [[ "$MODE" == github ]]; then
   status running "downloading from GitHub"
-  # repo/branch come from a feedmill-owned file, so re-validate before they reach a URL
-  { read -r REPO; read -r BRANCH; } < <(node -e 'const s=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(s.repo+"\n"+s.branch)' "$STATE_DIR/update-source.json" 2>/dev/null)
-  [[ "${REPO:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "no valid GitHub repo configured"
-  [[ "${BRANCH:-}" =~ ^[A-Za-z0-9_][A-Za-z0-9_./-]*$ && "$BRANCH" != *..* ]] || fail "no valid branch configured"
+  REPO="lanscapesystems/batchmill" # fixed; same constant as src/updateApi.ts
+  # the branch comes from a feedmill-owned file, so re-validate before it reaches a URL
+  BRANCH="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).branch||"")' "$STATE_DIR/update-source.json" 2>/dev/null || true)"
+  [[ -n "$BRANCH" ]] || BRANCH="phase1-3-load-faults-horn"
+  [[ "$BRANCH" =~ ^[A-Za-z0-9_][A-Za-z0-9_./-]*$ && "$BRANCH" != *..* ]] || fail "invalid branch name"
   SHA="$(curl -fsSL -m 30 -H 'Accept: application/vnd.github.sha' "https://api.github.com/repos/$REPO/commits/$BRANCH")" || fail "GitHub: cannot resolve $REPO@$BRANCH (private repo, wrong name, or offline)"
   [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || fail "GitHub returned an unexpected commit id"
   # pin to the resolved sha so a push mid-download can't mix versions
@@ -105,11 +106,12 @@ ls -1t "$BACKUPS"/pre-*.db 2>/dev/null | tail -n +6 | while read -r old; do
 done
 
 status running "building $VERSION and switching (several minutes)"
-(cd "$SRC" && FEEDMILL_UPDATE=1 bash install/install.sh "$IFACE")
-RC=$?
+(cd "$SRC" && FEEDMILL_UPDATE=1 bash install/install.sh "$IFACE") 2>&1 | tee "$WORK/install.log"
+RC=${PIPESTATUS[0]}
+# last lines of the installer's output, so the HMI shows the real cause
+WHY="$(tail -n 4 "$WORK/install.log" | tr '\n' ' ' | tr -cd '[:print:]' | tail -c 300)"
 
 if [[ $RC -eq 0 ]]; then
-  [[ -z "$SHA" ]] || { printf '%s\n' "$SHA" >"$STATE_DIR/installed-commit"; chmod 0644 "$STATE_DIR/installed-commit"; }
   status success "updated to $VERSION"
 elif [[ $RC -eq 3 ]]; then
   # new code was live, failed its health check, and install.sh put the old
@@ -123,7 +125,7 @@ elif [[ $RC -eq 3 ]]; then
   status rolled_back "$VERSION failed its health check; previous release and database restored"
   RC=1
 else
-  status failed "$VERSION did not build (current release untouched) — journalctl -u feedmill-update"
+  status failed "$VERSION did not build (current release untouched): $WHY"
 fi
 rm -rf "$WORK"
 exit "$RC"

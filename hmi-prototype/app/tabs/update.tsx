@@ -8,10 +8,11 @@ interface UpdateInfo {
   current: string | null;
   previous: string | null;
   status: { state: string; message?: string; version?: string; at?: string };
-  source: { repo: string; branch: string };
-  installedCommit: string | null;
+  version: string;
+  repo: string;
+  branch: string;
 }
-interface CheckResult { sha: string; message: string; date: string; upToDate: boolean | null }
+interface CheckResult { version: string; running: string; relation: 'newer' | 'same' | 'older' }
 
 const STATE_COLOR: Record<string, string> = { success: 'var(--green)', failed: 'var(--red)', rolled_back: 'var(--orange)' };
 
@@ -27,8 +28,7 @@ export function UpdateSection() {
   const [progress, setProgress] = useState<number | null>(null);
   const [error, setError] = useState('');
   const input = useRef<HTMLInputElement>(null);
-  const [repo, setRepo] = useState('');
-  const [branch, setBranch] = useState('main');
+  const [branch, setBranch] = useState('');
   const srcLoaded = useRef(false); // fill the inputs once, so polling doesn't overwrite typing
   const [check, setCheck] = useState<CheckResult | null>(null);
   const [checking, setChecking] = useState(false);
@@ -41,7 +41,7 @@ export function UpdateSection() {
         const d: UpdateInfo = await r.json();
         if (off) return;
         setInfo(d); setOffline(false);
-        if (!srcLoaded.current && d.source) { srcLoaded.current = true; setRepo(d.source.repo); setBranch(d.source.branch); }
+        if (!srcLoaded.current) { srcLoaded.current = true; setBranch(d.branch); }
       } catch { if (!off) setOffline(true); }
     }
     poll();
@@ -78,8 +78,8 @@ export function UpdateSection() {
     } catch { setError('Request failed'); }
     return null;
   }
-  const saveSource = () => call('/api/v1/update/source', {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repo, branch }),
+  const saveSource = () => call('/api/v1/update/branch', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ branch }),
   });
 
   async function checkGithub() {
@@ -91,7 +91,7 @@ export function UpdateSection() {
     setChecking(false);
   }
   async function installGithub() {
-    if (!confirm(`Install ${repo}@${branch}? The code is NOT signature-checked. The system restarts.`)) return;
+    if (!confirm(`Install ${info?.repo}@${branch}? The code is NOT signature-checked. The system restarts.`)) return;
     if (await saveSource()) await call('/api/v1/update/github', { method: 'POST' });
   }
   async function rollback() {
@@ -113,8 +113,9 @@ export function UpdateSection() {
     <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: '3px' }}>
       <div className="px-4 py-3 flex flex-col gap-3" style={{ fontSize: '13px' }}>
         <div className="flex items-center gap-2">
-          <span style={label}>Running release</span>
-          <span style={{ color: 'var(--fg-bright)' }}>{info?.current ?? '—'}</span>
+          <span style={label}>Version</span>
+          <span style={{ color: 'var(--fg-bright)' }}>{info?.version ?? '—'}</span>
+          <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>release {info?.current ?? '—'}</span>
         </div>
         <div className="flex items-center gap-2">
           <span style={label}>Previous release</span>
@@ -123,28 +124,25 @@ export function UpdateSection() {
         </div>
 
         <div className="flex items-center gap-2">
-          <span style={label}>GitHub repo</span>
-          <input value={repo} onChange={e => setRepo(e.target.value)} placeholder="owner/name" disabled={busy} style={inputStyle} />
+          <span style={label}>GitHub</span>
+          <span style={{ color: 'var(--fg-bright)' }}>{info?.repo ?? '—'}</span>
           <span style={{ color: 'var(--fg-dim)' }}>Branch</span>
-          <input value={branch} onChange={e => setBranch(e.target.value)} disabled={busy} style={{ ...inputStyle, width: '140px' }} />
+          <input value={branch} onChange={e => setBranch(e.target.value)} disabled={busy} style={inputStyle} />
         </div>
         <div className="flex items-center gap-2">
           <span style={{ ...label, width: '200px' }} />
-          <button style={btn('ghost', !!repo && !busy && !checking)} disabled={!repo || busy || checking} onClick={checkGithub}>
+          <button style={btn('ghost', !!branch && !busy && !checking)} disabled={!branch || busy || checking} onClick={checkGithub}>
             {checking ? 'Checking…' : 'Check for updates'}
           </button>
-          <button style={btn('primary', !!repo && !busy)} disabled={!repo || busy} onClick={installGithub}>Install from GitHub</button>
+          <button style={btn('primary', !!branch && !busy)} disabled={!branch || busy} onClick={installGithub}>Install from GitHub</button>
         </div>
         {check && (
-          <div style={{ color: check.upToDate ? 'var(--green)' : check.upToDate === false ? 'var(--orange)' : 'var(--fg)' }}>
-            {check.upToDate ? 'Up to date' : check.upToDate === false ? 'Update available' : 'Installed commit unknown'}
-            {` — ${check.sha.slice(0, 7)} ${check.message} (${new Date(check.date).toLocaleDateString()})`}
+          <div style={{ color: check.relation === 'newer' ? 'var(--orange)' : check.relation === 'same' ? 'var(--green)' : 'var(--fg)' }}>
+            {check.relation === 'newer' ? `Update available — ${check.version} (running ${check.running})`
+              : check.relation === 'same' ? `Up to date (${check.running})`
+              : `Branch has an older version (${check.version}) than the one running (${check.running})`}
           </div>
         )}
-        <div style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>
-          Public repos only. GitHub installs are not signature-checked, so anyone who can reach this page can trigger one — add HMI auth before exposing it beyond a trusted network.
-          Installed commit: {info?.installedCommit ? info.installedCommit.slice(0, 7) : 'unknown'}.
-        </div>
 
         {info && !info.enabled && (
           <div style={{ color: 'var(--orange)' }}>Zip upload is disabled: no signing key is installed on this machine.</div>
@@ -157,8 +155,8 @@ export function UpdateSection() {
           </button>
         </div>
         <div style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>
-          Zip must be a signed bundle from install/make-update.sh. All updates are refused while a batch is active or equipment is running.
-          The controller restarts during the update; if the new version fails its health check it reverts automatically.
+          Updates are refused while a batch is active or equipment is running. The controller restarts during the update;
+          if the new version fails its health check it reverts automatically.
         </div>
 
         {error && <div style={{ color: 'var(--red)' }}>{error}</div>}

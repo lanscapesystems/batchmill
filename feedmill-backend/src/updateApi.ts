@@ -30,14 +30,20 @@ function writeStatus(state: string, message: string) {
   fs.renameSync(tmp, STATUS);
 }
 const SOURCE = path.join(STATE_DIR, 'update-source.json');
-const INSTALLED = path.join(STATE_DIR, 'installed-commit');
-const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const REPO = 'lanscapesystems/batchmill'; // fixed; apply-update.sh has the same constant
+const DEFAULT_BRANCH = 'phase1-3-load-faults-horn';
 const BRANCH_RE = /^[A-Za-z0-9_][A-Za-z0-9_./-]*$/; // also re-checked by the root script
-function readSource(): { repo: string; branch: string } {
-  try { return JSON.parse(fs.readFileSync(SOURCE, 'utf8')); } catch { return { repo: '', branch: 'main' }; }
+function readBranch(): string {
+  try { return JSON.parse(fs.readFileSync(SOURCE, 'utf8')).branch || DEFAULT_BRANCH; } catch { return DEFAULT_BRANCH; }
 }
-function readInstalled(): string | null {
-  try { return fs.readFileSync(INSTALLED, 'utf8').trim() || null; } catch { return null; }
+// The version is feedmill-backend/package.json "version" (see CLAUDE.md: bump it on every push).
+function runningVersion(): string {
+  try { return JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version; } catch { return 'unknown'; }
+}
+function newer(a: string, b: string): number { // >0 when a > b, numeric per dotted part
+  const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) { const d = (pa[i] || 0) - (pb[i] || 0); if (d) return d; }
+  return 0;
 }
 function startUnit(unit: 'feedmill-update.service' | 'feedmill-update-github.service' | 'feedmill-rollback.service'): Promise<void> {
   return new Promise((resolve, reject) =>
@@ -61,53 +67,45 @@ export function registerUpdateRoutes(app: Express, mill: Mill) {
       current: releaseName('current'),
       previous: releaseName('previous'),
       status: readStatus(),
-      source: readSource(),
-      installedCommit: readInstalled(),
+      version: runningVersion(),
+      repo: REPO,
+      branch: readBranch(),
     });
   });
 
-  app.put('/api/v1/update/source', (req, res) => {
-    const repo = String(req.body?.repo ?? '').trim();
+  app.put('/api/v1/update/branch', (req, res) => {
     const branch = String(req.body?.branch ?? '').trim();
-    if (!REPO_RE.test(repo)) { res.status(400).json({ error: 'Repo must look like owner/name' }); return; }
     if (!BRANCH_RE.test(branch) || branch.includes('..')) { res.status(400).json({ error: 'Invalid branch name' }); return; }
     fs.mkdirSync(STATE_DIR, { recursive: true });
-    fs.writeFileSync(`${SOURCE}.tmp`, JSON.stringify({ repo, branch }));
+    fs.writeFileSync(`${SOURCE}.tmp`, JSON.stringify({ branch }));
     fs.renameSync(`${SOURCE}.tmp`, SOURCE);
-    res.json({ repo, branch });
+    res.json({ branch });
   });
 
-  // read-only look at the branch head; public repos only (no token stored)
+  // read-only: the version in the branch's package.json vs the running one
   app.get('/api/v1/update/check', async (_req, res) => {
-    const { repo, branch } = readSource();
-    if (!REPO_RE.test(repo) || !BRANCH_RE.test(branch)) { res.status(409).json({ error: 'Set a repo and branch first' }); return; }
+    const branch = readBranch();
     try {
-      const r = await fetch(`https://api.github.com/repos/${repo}/commits/${encodeURIComponent(branch)}`, {
-        headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'feedmill-updater' },
+      const r = await fetch(`https://raw.githubusercontent.com/${REPO}/${branch}/feedmill-backend/package.json`, {
+        headers: { 'User-Agent': 'feedmill-updater' },
         signal: AbortSignal.timeout(10_000),
       });
-      if (!r.ok) { res.status(502).json({ error: r.status === 404 ? 'Repo or branch not found (private repos are not supported)' : `GitHub returned ${r.status}` }); return; }
-      const c = await r.json() as { sha: string; commit: { message: string; committer: { date: string } } };
-      const installed = readInstalled();
-      res.json({
-        sha: c.sha,
-        message: c.commit.message.split('\n')[0],
-        date: c.commit.committer.date,
-        // null = installed commit unknown (installed over SSH or never updated from GitHub)
-        upToDate: installed ? installed === c.sha : null,
-      });
+      if (!r.ok) { res.status(502).json({ error: r.status === 404 ? `Branch '${branch}' not found` : `GitHub returned ${r.status}` }); return; }
+      const remote = String((await r.json() as { version?: string }).version ?? '');
+      if (!/^\d+(\.\d+)*$/.test(remote)) { res.status(502).json({ error: 'Branch has no valid version' }); return; }
+      const d = newer(remote, runningVersion());
+      res.json({ version: remote, running: runningVersion(), relation: d > 0 ? 'newer' : d < 0 ? 'older' : 'same' });
     } catch (err) {
       res.status(502).json({ error: `Cannot reach GitHub: ${(err as Error).message}` });
     }
   });
 
   app.post('/api/v1/update/github', async (_req, res) => {
-    const { repo, branch } = readSource();
-    if (!REPO_RE.test(repo) || !BRANCH_RE.test(branch)) { res.status(409).json({ error: 'Set a repo and branch first' }); return; }
+    const branch = readBranch();
     const busy = busyReason();
     if (busy) { res.status(409).json({ error: busy }); return; }
     try {
-      writeStatus('queued', `fetching ${repo}@${branch}`);
+      writeStatus('queued', `fetching ${REPO}@${branch}`);
       await startUnit('feedmill-update-github.service');
       res.status(202).json({ accepted: true });
     } catch (err) {
