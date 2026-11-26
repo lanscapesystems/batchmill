@@ -68,6 +68,7 @@ export interface QueueEntry {
   faultReason?: string;
   tolHold?: ToleranceHold;
   dosingError?: DosingError;
+  microUnloading?: boolean;
 }
 
 // An out-of-tolerance step waiting for the operator (Ignore / Update freefall / Abort).

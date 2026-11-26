@@ -54,7 +54,9 @@ export interface BackendBatch {
     unit: string;
     state: string;
     deviation?: number;
+    micro?: boolean;
   }[];
+  microUnloading?: boolean;
   mixTimeRemainingMs?: number;
   mixTimeTotalMs?: number;
   faultReason?: string;
@@ -99,6 +101,19 @@ export interface BackendScaleConfig {
   resolution: number;
   freshnessTimeout: number;
   stabilityWindow: number;
+}
+
+export interface BackendSharedVfd {
+  id: string;
+  name: string;
+  runOutput?: string;
+  auxInput?: string;
+  analogSpeedOutput?: string;
+  startDelay: number;
+  speedMinPct: number;
+  speedMaxPct: number;
+  speedMinLimit: number;
+  speedMaxLimit: number;
 }
 
 export type BackendCouplerType = 'none' | 'NX-EIC' | 'NX-ECC';
@@ -148,6 +163,7 @@ interface BackendState {
   ioOverrides: Record<string, boolean | number>;
   scales: Record<string, BackendScaleReading>;
   scaleConfigs: BackendScaleConfig[];
+  sharedVfds: BackendSharedVfd[];
   omronConfig: BackendOmronConfig;
   globalConfig: Record<string, string | number>;
   networkInterfaces: string[];
@@ -165,7 +181,7 @@ const EMPTY_DATA: SnapshotData = {
   equipment: [], queue: [], activeBatch: null,
   faults: [], bins: [], recipes: [], ingredients: [], connections: [],
   ioSignals: [], ioInputs: {}, ioOutputs: {}, ioOverrides: {},
-  scales: {}, scaleConfigs: [],
+  scales: {}, scaleConfigs: [], sharedVfds: [],
   omronConfig: EMPTY_OMRON,
   globalConfig: {},
   networkInterfaces: [],
@@ -190,6 +206,7 @@ function parseSnapshot(d: Record<string, any>): SnapshotData { // eslint-disable
     ioOverrides: d.io?.overrides ?? {},
     scales: d.scales ?? {},
     scaleConfigs: d.scaleConfigs ?? [],
+    sharedVfds: d.sharedVfds ?? [],
     omronConfig: d.omronConfig ?? EMPTY_OMRON,
     globalConfig: d.globalConfig ?? {},
     networkInterfaces: d.networkInterfaces ?? [],

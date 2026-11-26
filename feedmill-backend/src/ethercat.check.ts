@@ -1,7 +1,8 @@
 // Rack allocation check (no hardware needed): RS1201 must be recognised wherever it sits in the rack.
 import assert from 'node:assert/strict';
-import { allocateRackEntries, cardsFromRack } from './ethercat.js';
+import { allocateRackEntries, cardsFromRack, checkAnalogSettings, generateIoConf } from './ethercat.js';
 import type { IoRackCard } from './types.js';
+import { NX_CARD_CATALOG } from './types.js';
 
 const card = (slot: number, model: string): IoRackCard => ({ slot, model, status: 'unchecked' });
 const unitBase = (n: number) => 0x6000 + (n - 1) * 0x20;
@@ -52,4 +53,27 @@ const di16 = cardsFromRack([inE(u(1), 16)], [null, null], 1).cards[0]; assert.eq
 const odd = cardsFromRack([inE(u(1), 16), outE(uo(1), 16)], [null, null], 1); assert.equal(odd.warnings.length, 1);
 // the unit's slot is its NX unit number even when earlier units have no data
 assert.equal(cardsFromRack([inE(u(3), 16)], [null], 3).cards.map(c => c.slot).join(), '1,2,3');
+
+// analog unit settings (W522, read at 0x5000 + (unit-1)*0x20): disabled channel and a non-zero load-rejection output are caught
+const sdo = (vals: Record<string, number | null>) => (_t: 'uint8', idx: string, sub: string) => vals[`${idx}:${sub}`] ?? null;
+const okAo = checkAnalogSettings({ slot: 3, model: 'NX-DA3203' }, { category: 'AO', points: 4 }, sdo(Object.fromEntries([1, 2, 3, 4].flatMap(c => [[`0x5050:${c}`, 1], [`0x5052:${2 * c - 1}`, 4]]))));
+assert.deepEqual(okAo, { problems: {}, unreadable: false });
+const badAo = checkAnalogSettings({ slot: 3, model: 'NX-DA3203' }, { category: 'AO', points: 4 }, sdo({ '0x5050:1': 1, '0x5052:1': 0, '0x5050:2': 0, '0x5050:3': 1, '0x5052:5': 4, '0x5050:4': 1, '0x5052:7': 4 }));
+assert.deepEqual(Object.keys(badAo.problems), ['AO:3.0', 'AO:3.1']); assert.match(badAo.problems['AO:3.0'], /Zero Count/); assert.match(badAo.problems['AO:3.1'], /disabled/);
+const aiOff = checkAnalogSettings({ slot: 2, model: 'NX-AD4203' }, { category: 'AI', points: 8 }, sdo(Object.fromEntries([1, 2, 3, 4, 5, 6, 7, 8].map(c => [`0x5022:${c}`, c <= 3 ? 1 : 0]))));
+assert.equal(Object.keys(aiOff.problems).length, 5, '8-ch unit: channels 4-8 are disabled by default');
+assert.equal(checkAnalogSettings({ slot: 2, model: 'NX-AD4203' }, { category: 'AI', points: 2 }, sdo({})).unreadable, true, 'unreadable is reported, not treated as a mismatch');
+// io.conf leaves out a point with a problem, and an analog entry that is not 16 bits wide
+const om: any = { cards: [{ slot: 1, model: 'NX-PF0730', status: 'ok' }, { slot: 2, model: 'NX-AD3203', status: 'ok' }], cycleTimeUs: 4000,
+  discoveredRack: { productId: 1, outputEntries: [], inputEntries: [inE(u(2), 16, 1), inE(u(2), 32, 2), inE(u(2), 16, 3), inE(u(2), 16, 4)], analogProblems: { 'AI:2.2': 'AI:2.2: channel 3 disabled' } } };
+const sigs: any[] = [0, 1, 2, 3].map(i => ({ id: `AI:2.${i}`, direction: 'AI' }));
+const gen = generateIoConf(om, sigs, [], []);
+assert.equal(gen.conf.split('\n').filter(l => l.startsWith('channel')).length, 2, 'point 1 (32-bit) and point 2 (problem) excluded');
+assert.ok(gen.warnings.some(w => /32 bits wide/.test(w)) && gen.warnings.some(w => /disabled/.test(w)));
+// NX-DA3205: 4-ch current output with 1/30000 resolution, so its full scale is 30000 (not the 1/8000 models' 8000)
+assert.equal(NX_CARD_CATALOG.find(d => d.model === 'NX-DA3205')?.fullScale, 30000);
+assert.equal(allocateRackEntries([card(1, 'NX-DA3205')], [], [1, 2, 3, 4].map(i => outE(uo(1), 16, i))).get(1)!.status, 'ok');
+// an analog output unit is recognised by its (pattern-derived) ident, so the 3203 / 3205 / 3603 ambiguity is resolved
+const aoFound = cardsFromRack([1, 2, 3, 4].map(i => outE(uo(2), 16, i)), [null, 0x00115442, 0x00233205], 2).cards[1];
+assert.deepEqual([aoFound.model, aoFound.confidence], ['NX-DA3205', 'ident']);
 console.log('ethercat checks passed');

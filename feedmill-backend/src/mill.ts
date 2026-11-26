@@ -3,7 +3,7 @@ import {
   type BatchRuntime, type DosingStep, type Recipe, type Ingredient,
   type Bin, type Fault, type ScaleReading, type FlowConnection, type LevelSwitchState,
   type StateSnapshot, type QueueSnapshot, type Command, type CommandResult,
-  type ScaleConfig, type OmronConfig, type IoRackCard,
+  type ScaleConfig, type SharedVfd, type OmronConfig, type IoRackCard,
   NX_CARD_CATALOG, NX_BUS_POWER_BUDGET_W, NX_MAX_UNITS, ECC_MODEL_MIN_CYCLE_US,
   EQUIPMENT_DEFS,
 } from './types.js';
@@ -30,7 +30,8 @@ const DISCHARGE_TIMEOUT_MS = 60000;
 // All delay settings are stored in seconds (0.1 s steps, like a 100 ms PLC timer); the scan runs in ms.
 const delayMs = (sec: unknown, fallbackSec = 0) => Math.max(0, Number(sec ?? fallbackSec) || 0) * 1000;
 const EDITABLE_STATES = new Set(['IDLE']); // a queued batch; anything released is no longer editable
-const MIXER_NOT_EMPTY = 'Mixer not empty - discharge timed out (Extend or Abort)';
+const MICRO_NOT_EMPTY = 'Micros conveyor not empty - unload timed out (waiting; Pause then Abort to give up)';
+const MIXER_NOT_EMPTY ='Mixer not empty - discharge timed out (Extend or Abort)';
 const NO_PROGRESS_WINDOW_MS = 10_000; // once past the bin's no-flow delay, weight must rise by the minimum every window
 // Per-device input bypasses ("Overrides" in the sidebar): the input is ignored as if it were not assigned.
 const BYPASSABLE = ['runConfirmAux', 'vfdAuxInput', 'motorAuxInput', 'analogLoadInput', 'rotationPulseInput', 'openLimitInput', 'closedLimitInput',
@@ -105,6 +106,7 @@ export class Mill {
   // never comes back up with this on. Resets any forced outputs on exit.
   commissioningMode = false;
   scaleConfigs: ScaleConfig[] = [];
+  sharedVfds: SharedVfd[] = [];
   scaleConfigVersion = 0; // bumped on ConfigureScale/RemoveScale — server.ts watches this to restart scale readers
   omronConfig: OmronConfig = { couplerType: 'none', ipAddress: '', nodeAddress: 1, ethercatInterface: '', eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
   globalConfig: Record<string, string | number> = { motorStarterFaultDelay: 0.5, siteName: 'FEED MILL CONTROLLER' };
@@ -245,6 +247,7 @@ export class Mill {
     this.ingredients = cfg.ingredients;
     this.recipes = cfg.recipes;
     this.scaleConfigs = cfg.scaleConfigs;
+    this.sharedVfds = cfg.sharedVfds ?? [];
     // older persisted configs predate eccModel/cycleTimeUs/ringTopology
     const savedOmron = cfg.omronConfig as Partial<OmronConfig>;
     this.omronConfig = { ...this.omronConfig, ...savedOmron };
@@ -259,6 +262,7 @@ export class Mill {
       ingredients: this.ingredients,
       recipes: this.recipes,
       scaleConfigs: this.scaleConfigs,
+      sharedVfds: this.sharedVfds,
       omronConfig: this.omronConfig,
       globalConfig: this.globalConfig,
     };
@@ -299,7 +303,7 @@ export class Mill {
       case 'SetEquipmentSpeed': {
         const eq = this.equipment.get(cmd.targetId ?? '');
         if (!eq) return reject('Unknown equipment');
-        if (!eq.config.analogSpeedOutput) return reject('No analog speed output assigned');
+        if (!this.speedOutput(eq)) return reject('No analog speed output assigned');
         if (Array.from(this.equipment.values()).some(e => (e.loadControlAuto || e.loadAtRunning) && e.config.loadControlFeeder === eq.id)) return reject('Speed is under load control or autotune (switch it to Manual first)');
         const speed = cmd.parameters?.speed;
         if (typeof speed !== 'number' || !Number.isFinite(speed)) return reject('Missing speed');
@@ -349,16 +353,23 @@ export class Mill {
         if (b.state !== 'PAUSED') return reject('Batch not paused');
         if (!this.estopOk()) return reject('E-stop active'); if (this.outputForcesActive()) return reject('Clear the forced outputs first');
         // the scale must still agree with the saved progress of the step in progress: ask the operator if it does not
-        const mismatch = this.resumeMismatch(b);
-        if (mismatch === 'invalid') return reject('Mixer scale invalid');
-        const step = b.dosingSteps[b.dosingIndex];
-        if (mismatch) {
-          if (cmd.parameters?.rebaseline !== true) return { ...reject('Scale mismatch'), data: mismatch };
-          step.baselineWeight = mismatch.current - step.actual; // carry on from what the scale reads now
-          step.clean = false;
+        const active = b.unloading ? [] : this.activeStepIdx(b).map(i => b.dosingSteps[i]); // both tracks resume together
+        const checks = active.map(step => ({ step, mm: this.resumeMismatch(b, step) }));
+        const bad = checks.find(c => c.mm === 'invalid');
+        if (bad) return reject(`${bad.step.micro ? 'Micros' : 'Mixer'} scale invalid`);
+        const off = checks.filter(c => c.mm && c.mm !== 'invalid');
+        if (off.length) {
+          if (cmd.parameters?.rebaseline !== true) return { ...reject('Scale mismatch'), data: off[0].mm };
+          for (const c of off) { // carry on from what the scale reads now
+            const mm = c.mm as { current: number };
+            c.step.baselineWeight = mm.current - c.step.actual;
+            c.step.clean = false;
+          }
         }
-        if (step && step.state === 'feeding') { step.augerRunMs = 0; step.progressMs = 0; step.progressRef = step.actual; } // no-flow delay starts again
-        if (step?.state === 'settling') step.settleStartTime = this.clockMs; // timers are scan counts: restart after a pause or a restart
+        for (const step of active) {
+          if (step.state === 'feeding') { step.augerRunMs = 0; step.progressMs = 0; step.progressRef = step.actual; } // no-flow delay starts again
+          if (step.state === 'settling') step.settleStartTime = this.clockMs; // timers are scan counts: restart after a pause or a restart
+        }
         b.dischargeStartTime = this.clockMs; b.emptySinceMs = undefined;
         b.faultReason = undefined; b.dosingError = undefined;
         b.state = b.previousState ?? 'DOSING';
@@ -384,7 +395,11 @@ export class Mill {
         b.unloading = true;
         b.faultReason = undefined;
         b.previousState = undefined;
-        b.state = mode === 'mixUnload' ? 'MIXING' : 'ROUTE_PRECHECK';
+        b.tolHold = undefined; b.dosingError = undefined;
+        // micros dosed onto the belt are still there: run the belt into the mixer first, then continue as chosen
+        const onBelt = this.hasMicros(b) && !b.microDelivered && b.dosingSteps.some(s => s.micro && s.actual > 0);
+        if (onBelt) { b.abortMode = mode; b.microUnloading = false; b.microUnloadRunMs = 0; b.state = 'DOSING'; }
+        else b.state = mode === 'mixUnload' ? 'MIXING' : 'ROUTE_PRECHECK';
         persistBatch(b);
         return ok();
       }
@@ -395,12 +410,12 @@ export class Mill {
         if (!b?.dosingError || b.state !== 'PAUSED') return reject('No dosing problem to accept');
         if (!this.estopOk()) return reject('E-stop active'); if (this.outputForcesActive()) return reject('Clear the forced outputs first');
         const step = b.dosingSteps[b.dosingError.stepIndex];
-        const scale = this.getMixerScale();
+        const scale = this.stepScale(step);
         if (scale?.valid) step.actual = Math.max(0, scale.weight - step.baselineWeight);
         step.deviation = round1(step.actual - step.target);
         step.clean = false; // an accepted problem never calibrates freefall
         step.state = 'complete';
-        b.dosingIndex = b.dosingError.stepIndex + 1;
+        if (step.micro) b.microIndex = b.dosingError.stepIndex + 1; else b.dosingIndex = b.dosingError.stepIndex + 1;
         b.dosingError = undefined; b.faultReason = undefined; b.tolHold = undefined;
         b.state = 'DOSING';
         persistBatch(b);
@@ -426,7 +441,7 @@ export class Mill {
         b.tolHold = undefined;
         b.faultReason = undefined;
         step.state = 'complete';
-        b.dosingIndex++;
+        if (step.micro) b.microIndex = this.microCursor(b) + 1; else b.dosingIndex++;
         persistBatch(b);
         return ok();
       }
@@ -504,7 +519,7 @@ export class Mill {
         if (typeof p.auto === 'boolean' && eq.loadAtRunning) return reject('Autotune is running (cancel it first)');
         if (p.auto === true) {
           const feeder = this.equipment.get(String(eq.config.loadControlFeeder ?? ''));
-          if (!feeder?.config.analogSpeedOutput) return reject('Load control needs a feeder with an analog speed output');
+          if (!this.speedOutput(feeder)) return reject('Load control needs a feeder with an analog speed output');
           if (!(Number(eq.config.maxAmps ?? 0) > Number(eq.config.minAmps ?? 0))) return reject('Load input needs Min/Max Amps');
           if (!(Number(eq.config.loadSetpointAmps ?? 0) > 0)) return reject('Set a load setpoint first');
           if (this.byp(eq, 'analogLoadInput')) return reject('Load monitoring is bypassed');
@@ -550,7 +565,7 @@ export class Mill {
         const m = eq && this.loadMon.get(eq.id);
         if (!eq || !m) return reject('No load input on this equipment');
         const feeder = this.equipment.get(String(eq.config.loadControlFeeder ?? ''));
-        if (!feeder?.config.analogSpeedOutput) return reject('Load control needs a feeder with an analog speed output');
+        if (!feeder || !this.speedOutput(feeder)) return reject('Load control needs a feeder with an analog speed output');
         if (this.byp(eq, 'analogLoadInput')) return reject('Load monitoring is bypassed');
         if (eq.loadAmps === undefined) return reject('No load reading');
         if (eq.status !== 'running' || feeder.status !== 'running') return reject('Run the mill and feeder first');
@@ -738,6 +753,8 @@ export class Mill {
       case 'RemoveConnection':
       case 'ConfigureOmron':
       case 'ConfigureScale':
+      case 'ConfigureSharedVfd':
+      case 'RemoveSharedVfd':
       case 'RemoveScale': {
         const guardErr = this.guardConfigEdit();
         if (guardErr) return reject(guardErr);
@@ -837,7 +854,13 @@ export class Mill {
         if (renaming && this.equipment.has(p.newId!)) return reject('ID already in use');
         if (renaming && eq.owner) return reject('Cannot rename owned equipment');
         if (p.name !== undefined) eq.name = p.name;
-        if (p.config !== undefined) { eq.config = { ...eq.config, ...p.config }; stripHammermillRotation(eq); }
+        if (p.config !== undefined) {
+          if (p.config.sharedVfdId && !this.sharedVfds.some(v => v.id === p.config!.sharedVfdId)) return reject('Unknown shared VFD');
+          eq.config = { ...eq.config, ...p.config }; stripHammermillRotation(eq);
+          // on a shared VFD the drive's I/O lives on the VFD: the auger keeps only its starter, so no stale VFD / speed I/O is left behind
+          if (eq.config.sharedVfdId) for (const k of ['analogSpeedOutput', 'vfdRunOutput', 'vfdAuxInput', 'masterVfd', 'vfdStartDelay', 'speedMinPct', 'speedMaxPct', 'speedMinLimit', 'speedMaxLimit']) delete eq.config[k];
+          else delete eq.config.sharedVfdId;
+        }
         if (renaming && p.newId) {
           const oldId = eq.id;
           eq.id = p.newId;
@@ -1009,6 +1032,44 @@ export class Mill {
         else this.scaleConfigs.push(sc);
         this.scaleConfigVersion++;
         if (this.omronConfig.couplerType === 'NX-ECC') syncIoConf(this.omronConfig, this.signals, this.equipment.values(), this.scaleConfigs);
+        return ok();
+      }
+
+      case 'ConfigureSharedVfd': {
+        const p = cmd.parameters as Partial<SharedVfd> | undefined;
+        if (!p) return reject('Missing parameters');
+        const num = (v: unknown, d: number) => (typeof v === 'number' && Number.isFinite(v) ? v : d);
+        const id = p.id || `VFD${(this.sharedVfds.reduce((mx, v) => Math.max(mx, parseInt(v.id.replace(/\D/g, '')) || 0), 0)) + 1}`;
+        const v: SharedVfd = {
+          id, name: (p.name ?? '').trim() || id,
+          runOutput: p.runOutput || undefined, auxInput: p.auxInput || undefined, analogSpeedOutput: p.analogSpeedOutput || undefined,
+          startDelay: Math.max(0, num(p.startDelay, 0.7)),
+          speedMinPct: num(p.speedMinPct, 0), speedMaxPct: num(p.speedMaxPct, 100),
+          speedMinLimit: num(p.speedMinLimit, 0), speedMaxLimit: num(p.speedMaxLimit, 100),
+        };
+        if (!(v.speedMaxLimit > v.speedMinLimit)) return reject('Speed max limit must be above the min limit');
+        // one terminal point, one job: not on another shared VFD and not on any piece of equipment
+        const mine = [v.runOutput, v.auxInput, v.analogSpeedOutput].filter((s): s is string => !!s);
+        if (new Set(mine).size !== mine.length) return reject('Run, aux and speed must be different points');
+        for (const sig of mine) {
+          const other = this.sharedVfds.find(o => o.id !== id && [o.runOutput, o.auxInput, o.analogSpeedOutput].includes(sig));
+          if (other) return reject(`${sig} is already used by ${other.name}`);
+          for (const eq of this.equipment.values()) {
+            const key = Object.keys(PORT_LABELS).find(k => eq.config[k] === sig);
+            if (key) return reject(`${sig} is already used by ${eq.id} (${PORT_LABELS[key]})`);
+          }
+        }
+        const idx = this.sharedVfds.findIndex(o => o.id === id);
+        if (idx >= 0) this.sharedVfds[idx] = v; else this.sharedVfds.push(v);
+        return ok();
+      }
+
+      case 'RemoveSharedVfd': {
+        const id = cmd.targetId;
+        if (!id) return reject('Missing shared VFD id');
+        const user = Array.from(this.equipment.values()).find(e => e.config.sharedVfdId === id);
+        if (user) return reject(`${user.id} still uses this VFD`);
+        this.sharedVfds = this.sharedVfds.filter(v => v.id !== id);
         return ok();
       }
 
@@ -1200,7 +1261,8 @@ export class Mill {
     for (const c of this.connections) {
       if (c.from !== eq.id) continue;
       const next = this.equipment.get(c.to);
-      if (next && this.isMotor(next) && !next.runCmd) return false;
+      // the micros conveyor stays stopped while the micro augers dose onto it (it only runs to unload), so it is no permissive
+      if (next && this.isMotor(next) && next.equipmentType !== 'micro_drag' && !next.runCmd) return false;
     }
     return true;
   }
@@ -1338,7 +1400,7 @@ export class Mill {
     for (const c of this.connections) {
       if (c.to !== eq.id) continue;
       const prev = this.equipment.get(c.from);
-      if (prev && this.isMotor(prev) && prev.runCmd && !prev.request) return true;
+      if (prev && this.isMotor(prev) && prev.runCmd && !prev.request && eq.equipmentType !== 'micro_drag') return true;
     }
     return false;
   }
@@ -1442,7 +1504,7 @@ export class Mill {
       const feeder = this.equipment.get(String(eq.config.loadControlFeeder ?? ''));
       const bypass = this.byp(eq, 'analogLoadInput');
       if (bypass) eq.loadControlAuto = false;
-      const ready = !!feeder?.config.analogSpeedOutput && eq.loadAmps !== undefined && !bypass;
+      const ready = !!this.speedOutput(feeder) && eq.loadAmps !== undefined && !bypass;
       const bothRun = eq.status === 'running' && feeder?.status === 'running';
       if (m.tuner) {
         if (!ready || !bothRun) { this.endTune(eq, m, 'Autotune aborted: mill, feeder or load input not available', feeder); continue; }
@@ -1511,7 +1573,11 @@ export class Mill {
   }
 
   // Master VFD: a second starter that follows the run command and must confirm on its aux input.
+  // A shared VFD (several augers on one drive) replaces the auger's own: the drive's run output is the OR of the augers
+  // running on it (outOr), and its aux is only waited for by an auger that is running, so only running augers fault.
   private vfdOf(eq: EquipmentRuntime) {
+    const shared = this.sharedVfdOf(eq);
+    if (shared) return { run: shared.runOutput, aux: shared.auxInput };
     return eq.config.masterVfd
       ? { run: eq.config.vfdRunOutput as string | undefined, aux: this.byp(eq, 'vfdAuxInput') ? undefined : eq.config.vfdAuxInput as string | undefined }
       : undefined;
@@ -1534,7 +1600,7 @@ export class Mill {
     // Same sequence as the PLC's micros VFD (M11): the starter closes first and the VFD is started only once the starter
     // has been confirmed for vfdStartDelay (0.7 s); it drops with the run command. Its aux is only expected once it was started.
     eq.vfdStartMs = vfd && usable && eq.runCmd && eq.feedback ? (eq.vfdStartMs ?? 0) + SCAN_MS : 0;
-    eq.vfdCmd = !!vfd && eq.vfdStartMs >= delayMs(eq.config.vfdStartDelay, 0.7);
+    eq.vfdCmd = !!vfd && eq.vfdStartMs >= delayMs(this.sharedVfdOf(eq)?.startDelay ?? eq.config.vfdStartDelay, 0.7);
 
     if (usable) {
       if ((eq.runCmd && !eq.feedback) || (eq.vfdCmd && !vfdOk)) {
@@ -1693,7 +1759,11 @@ export class Mill {
   private batchHold(b: BatchRuntime): string | null {
     const need: (EquipmentRuntime | undefined)[] = [];
     if (['READY', 'DOSING', 'MIXING'].includes(b.state)) need.push(this.findEquipmentByType('mixer'));
-    if (b.state === 'DOSING') { const st = b.dosingSteps[b.dosingIndex]; if (st?.augerId) need.push(this.equipment.get(st.augerId)); }
+    if (b.state === 'DOSING') {
+      if (!b.unloading) for (const i of this.activeStepIdx(b)) { const st = b.dosingSteps[i]; if (st?.augerId) need.push(this.equipment.get(st.augerId)); }
+      if (b.microUnloading || b.unloading) need.push(this.microConveyor(b));
+      else if (this.activeStepIdx(b).length === 0 && this.hasMicros(b) && !b.microDelivered) need.push(this.microConveyor(b));
+    }
     if (['ROUTE_PRECHECK', 'DISCHARGING'].includes(b.state)) {
       const mx = this.findEquipmentByType('mixer');
       for (const id of (mx ? flowPath(mx.id, b.destination, this.connections) ?? [] : [])) {
@@ -1733,6 +1803,8 @@ export class Mill {
       case 'READY': {
         b.state = 'DOSING';
         b.dosingIndex = 0;
+        b.microIndex = this.majorCount(b);
+        b.microUnloading = false; b.microUnloadRunMs = 0; b.microDelivered = false;
         this.requestMixer(b);
         break;
       }
@@ -1886,6 +1958,21 @@ export class Mill {
       if (!a) return `no auger below ${st.sourceBinId}`;
       if (a.mode !== 'Auto') return `${a.id} is not in Auto`;
       if (a.status === 'fault') return `${a.id} is faulted`;
+      const conv = this.findMicroConveyor(a.id);
+      if (!st.micro && conv) return `${st.ingredientName} is in the major list but ${a.id} feeds the micros conveyor ${conv}`;
+      if (st.micro && !conv) return `${st.ingredientName} is a micro but ${a.id} does not feed a micros conveyor`;
+    }
+    const mconvIds = new Set(b.dosingSteps.filter(s => s.micro).map(s => s.conveyorId));
+    if (mconvIds.size > 1) return 'the micro ingredients feed different micros conveyors';
+    const mconv = this.microConveyor(b);
+    if (mconv) {
+      if (mconv.mode !== 'Auto') return `${mconv.id} is not in Auto`;
+      if (mconv.status === 'fault') return `${mconv.id} is faulted`;
+      const ms = this.stepScale(b.dosingSteps.find(s => s.micro)!);
+      if (!mconv.config.scaleId) return `${mconv.id} has no scale assigned`;
+      if (!ms || !ms.valid) return 'micros scale invalid';
+      if (!ms.stable) return 'micros scale not stable';
+      if (ms.weight >= this.microZeroLbs(mconv)) return `micros conveyor not empty (${round1(ms.weight)} lb)`;
     }
     if (!this.bins.some(x => x.id === b.destination && x.type === 'finished')) return `destination ${b.destination} not found`;
     const lvl = this.levelState(b.destination);
@@ -1919,29 +2006,76 @@ export class Mill {
     persistBatch(batch);
   }
 
+  // Two tracks run at once: the majors one after another into the mixer (mixer scale) and the micros one after another onto
+  // the micros conveyor (its own scale). The belt only runs into the mixer once both are finished.
   private advanceDosing(b: BatchRuntime) {
-    if (b.dosingIndex >= b.dosingSteps.length) {
+    if (b.unloading) { this.runMicroUnload(b); return; } // aborted with micros on the belt: empty it first
+    const majorsDone = b.dosingIndex >= this.majorCount(b);
+    const microsDone = this.microCursor(b) >= b.dosingSteps.length;
+    if (majorsDone && microsDone) {
+      if (this.hasMicros(b) && !b.microDelivered) { this.runMicroUnload(b); return; }
       b.state = 'MIXING';
       persistBatch(b);
       return;
     }
+    for (const idx of this.activeStepIdx(b)) {
+      this.advanceStep(b, idx);
+      if (b.state !== 'DOSING') return; // a pause or dosing problem in one track stops the other in the same scan
+    }
+  }
 
-    const step = b.dosingSteps[b.dosingIndex];
+  // The belt runs into the mixer until its minimum time has passed and the micros scale reads empty. A timeout only alarms:
+  // the batch keeps waiting (Abort from the pause gives up), like the mixer discharge.
+  private runMicroUnload(b: BatchRuntime) {
+    const conv = this.microConveyor(b);
+    const first = b.dosingSteps.find(s => s.micro);
+    if (!conv || !first) { b.microDelivered = true; this.afterMicroUnload(b); return; }
+    if (!b.microUnloading) { b.microUnloading = true; b.microUnloadRunMs = 0; persistBatch(b); }
+    conv.owner = b.id; conv.request = true;
+    if (conv.runCmd) b.microUnloadRunMs = (b.microUnloadRunMs ?? 0) + SCAN_MS;
+    const scale = this.stepScale(first);
+    if (!scale || !scale.valid) { b.faultReason = 'Waiting: micros scale invalid'; return; }
+    if (b.faultReason === 'Waiting: micros scale invalid') b.faultReason = undefined;
+    const minMs = delayMs(conv.config.unloadMinSec, 10);
+    if ((b.microUnloadRunMs ?? 0) >= minMs && scale.stable && scale.weight < this.microZeroLbs(conv)) {
+      conv.request = false; // stops through its own stop delay
+      b.microUnloading = false; b.microDelivered = true;
+      if (b.faultReason === MICRO_NOT_EMPTY) b.faultReason = undefined;
+      this.afterMicroUnload(b);
+      return;
+    }
+    const limit = delayMs(conv.config.failedToEmptySec, 60);
+    if ((b.microUnloadRunMs ?? 0) > limit && b.faultReason !== MICRO_NOT_EMPTY) {
+      b.faultReason = MICRO_NOT_EMPTY;
+      this.raiseFault('BATCH', 'WARNING', `Batch ${b.id}: micros conveyor not empty - unload timed out`, 'W-BA-03');
+    }
+  }
+
+  private afterMicroUnload(b: BatchRuntime) {
+    if (b.unloading) { b.state = b.abortMode === 'mixUnload' ? 'MIXING' : 'ROUTE_PRECHECK'; b.abortMode = undefined; }
+    else b.state = 'MIXING';
+    persistBatch(b);
+  }
+
+  private advanceStep(b: BatchRuntime, idx: number) {
+    const step = b.dosingSteps[idx];
     const prevStepState = step.state;
     const binEq = this.equipment.get(step.sourceBinId);
     const auger = step.augerId ? this.equipment.get(step.augerId) : undefined;
-    const hasAnalogSpeed = !!(auger?.config.analogSpeedOutput);
+    const hasAnalogSpeed = !!this.speedOutput(auger);
     const freefall = (binEq?.config.freefall as number) ?? 0;
     const slowFeedLbs = (hasAnalogSpeed && (binEq?.config.slowFeedLbs as number)) ? (binEq!.config.slowFeedLbs as number) : 0;
     // Real weight only: no scale reading means nothing is dosed (there is no simulated mode).
-    const scale = this.getMixerScale();
+    const scale = this.stepScale(step);
     const scaleOk = !!scale && scale.valid;
+    const label = step.micro ? 'micros' : 'mixer';
     const waitScale = (needStable: boolean): boolean => {
-      if (!scaleOk) { b.faultReason = 'Waiting: mixer scale invalid'; return true; }
-      if (needStable && !scale!.stable) { b.faultReason = 'Waiting: mixer scale not stable'; return true; }
-      if (b.faultReason?.startsWith('Waiting: mixer scale')) b.faultReason = undefined;
+      if (!scaleOk) { b.faultReason = `Waiting: ${label} scale invalid`; return true; }
+      if (needStable && !scale!.stable) { b.faultReason = `Waiting: ${label} scale not stable`; return true; }
+      if (b.faultReason?.startsWith(`Waiting: ${label} scale`)) b.faultReason = undefined;
       return false;
     };
+    const done = () => { if (step.micro) b.microIndex = idx + 1; else b.dosingIndex = idx + 1; };
 
     switch (step.state) {
       case 'pending': {
@@ -1964,9 +2098,10 @@ export class Mill {
           step.clean = false;
           if (auger) auger.request = false;
           this.pauseActiveBatch();
-          b.faultReason = 'Mixer scale invalid - restore it, then Resume';
+          b.faultReason = `${step.micro ? 'Micros' : 'Mixer'} scale invalid - restore it, then Resume`;
           return;
         }
+        if (step.micro && !this.checkMicroCapacity(b, step, scale!.weight)) return;
         if (auger) { auger.owner = b.id; auger.request = true; }
         step.actual = Math.max(0, scale!.weight - step.baselineWeight);
         const remaining = step.target - step.actual;
@@ -1975,6 +2110,12 @@ export class Mill {
           const inSlowZone = slowFeedLbs > 0 && (remaining <= slowFeedLbs || slowFeedLbs >= step.target);
           const normal = auger?.speed ?? 100;
           this.setAugerSpeed(auger, inSlowZone ? Math.min(slowSpeed, normal) : normal);
+        }
+        // Failed to achieve weight (PLC): the bin's total feed time for this step; 0 = off
+        const failedMs = delayMs(binEq?.config.failedToAchieveSec, 0);
+        if (failedMs > 0 && auger?.runCmd && (step.augerRunMs ?? 0) >= failedMs) {
+          this.dosingProblem(b, step, `${step.sourceBinId} failed to achieve the weight in time`, idx);
+          return;
         }
         // No-flow watchdog: once the auger has run for the bin's delay, the weight must keep rising
         if (auger?.runCmd) {
@@ -1987,7 +2128,7 @@ export class Mill {
               if (step.progressMs >= NO_PROGRESS_WINDOW_MS) {
                 const minLbs = Number(binEq?.config.noProgressMinLbs ?? 2);
                 if (step.actual - (step.progressRef ?? 0) < minLbs) {
-                  this.dosingProblem(b, step, `No flow from ${step.sourceBinId}`);
+                  this.dosingProblem(b, step, `No flow from ${step.sourceBinId}`, idx);
                   return;
                 }
                 step.progressRef = step.actual; step.progressMs = 0;
@@ -2024,9 +2165,10 @@ export class Mill {
         const tol = toleranceFor(binEq?.config.toleranceLbs, step.target);
         if (Math.abs(step.deviation) > tol) {
           // out of tolerance: hold for the operator (Ignore / Update freefall / Abort), like the PLC popup
+          if (b.tolHold) break; // the other track already has the operator's attention: this one waits its turn
           const ff = freefall;
           const { newFreefall } = freefallAdjust(step.actual, step.target, ff, Number(binEq?.config.ffStrengthPct ?? 50));
-          b.tolHold = { stepIndex: b.dosingIndex, ingredientName: step.ingredientName, desired: step.target, actual: step.actual,
+          b.tolHold = { stepIndex: idx, ingredientName: step.ingredientName, desired: step.target, actual: step.actual,
             difference: step.deviation, currentFreefall: ff, newFreefall };
           b.faultReason = `${step.ingredientName} is ${round1(Math.abs(step.deviation))} lb ${step.deviation > 0 ? 'over' : 'under'} target - choose Ignore or Update freefall`;
           step.state = 'hold';
@@ -2035,7 +2177,7 @@ export class Mill {
         }
         if (binEq?.config.ffAuto === true && step.clean !== false) this.applyFreefall(b, step, binEq, true);
         step.state = 'complete';
-        b.dosingIndex++;
+        done();
         break;
       }
 
@@ -2043,11 +2185,11 @@ export class Mill {
         break; // waiting for ResolveTolerance
 
       case 'complete':
-        b.dosingIndex++;
+        done();
         break;
 
       case 'faulted':
-        this.dosingProblem(b, step, `Dosing step ${step.ingredientName} faulted`);
+        this.dosingProblem(b, step, `Dosing step ${step.ingredientName} faulted`, idx);
         break;
     }
 
@@ -2104,10 +2246,9 @@ export class Mill {
   }
 
   // What the saved progress of the step in progress says the scale should read, vs. what it reads now (checked on Resume).
-  private resumeMismatch(b: BatchRuntime): 'invalid' | { saved: number; current: number; ingredientName: string } | null {
-    const step = b.dosingSteps[b.dosingIndex];
+  private resumeMismatch(b: BatchRuntime, step: DosingStep): 'invalid' | { saved: number; current: number; ingredientName: string } | null {
     if ((b.previousState ?? 'DOSING') !== 'DOSING' || !step || !['feeding', 'cutoff', 'settling', 'hold'].includes(step.state)) return null;
-    const scale = this.getMixerScale();
+    const scale = this.stepScale(step);
     if (!scale || !scale.valid) return 'invalid';
     const saved = step.baselineWeight + step.actual;
     if (Math.abs(scale.weight - saved) <= Number(this.globalConfig.resumeMismatchLbs ?? 10)) return null;
@@ -2115,15 +2256,11 @@ export class Mill {
   }
 
   private setAugerSpeed(auger: EquipmentRuntime | undefined, pct: number) {
-    if (!auger) return;
-    const aoSig = auger.config.analogSpeedOutput as string | undefined;
-    if (aoSig) {
-      const [lo, hi] = this.speedLimits(auger);
-      const limited = Math.min(hi, Math.max(lo, pct));
-      const minPct = (auger.config.speedMinPct as number) ?? 0;
-      const maxPct = (auger.config.speedMaxPct as number) ?? 100;
-      const scaled = minPct + (limited / 100) * (maxPct - minPct);
-      this.out(aoSig, Math.round(scaled * 100) / 100);
+    const o = this.speedOutput(auger);
+    if (o) {
+      const limited = Math.min(o.hi, Math.max(o.lo, pct));
+      const scaled = o.minPct + (limited / 100) * (o.maxPct - o.minPct);
+      this.out(o.sig, Math.round(scaled * 100) / 100);
     }
   }
 
@@ -2132,8 +2269,7 @@ export class Mill {
   private pauseActiveBatch(): boolean {
     const b = this.activeBatch;
     if (!b || ['COMPLETED', 'FAULTED', 'ABORTED', 'ABORTED_HOLD', 'PAUSED', 'PAUSING', 'IDLE'].includes(b.state)) return false;
-    const st = b.dosingSteps[b.dosingIndex];
-    if (b.state === 'DOSING' && st) st.clean = false; // a paused feed is not a clean run: no freefall calibration from it
+    if (b.state === 'DOSING') for (const i of this.activeStepIdx(b)) b.dosingSteps[i].clean = false; // a paused feed is not a clean run: no freefall calibration from it
     b.previousState = b.state;
     b.state = 'PAUSING';
     this.initiateEquipmentStop(b.id);
@@ -2224,13 +2360,20 @@ export class Mill {
   // ── VFD speed ──
 
   private speedLimits(eq: EquipmentRuntime): [number, number] {
-    return [Number(eq.config.speedMinLimit ?? 0), Number(eq.config.speedMaxLimit ?? 100)];
+    const o = this.speedOutput(eq);
+    return o ? [o.lo, o.hi] : [Number(eq.config.speedMinLimit ?? 0), Number(eq.config.speedMaxLimit ?? 100)];
   }
 
   // Runs before the batch engine, which overrides the active auger's speed while dosing.
   private applyAugerSpeeds() {
-    for (const eq of this.equipment.values()) {
-      if (eq.config.analogSpeedOutput) this.setAugerSpeed(eq, eq.speed ?? 100);
+    // augers on one shared VFD write its single output: a running (or requested) auger decides the speed, idle ones do not overwrite it
+    const seen = new Set<string>();
+    const busyFirst = Array.from(this.equipment.values()).sort((a, b) => Number(b.runCmd || b.request) - Number(a.runCmd || a.request));
+    for (const eq of busyFirst) {
+      if (!this.speedOutput(eq)) continue;
+      const shared = this.sharedVfdOf(eq)?.id;
+      if (shared) { if (seen.has(shared)) continue; seen.add(shared); }
+      this.setAugerSpeed(eq, eq.speed ?? 100);
     }
   }
 
@@ -2384,6 +2527,9 @@ export class Mill {
     for (const eq of this.equipment.values()) {
       for (const [key, label] of Object.entries(PORT_LABELS)) { const id = eq.config[key]; if (id) tags.set(String(id), `${eq.id} ${label}`); }
     }
+    for (const v of this.sharedVfds) {
+      for (const [sig, label] of [[v.runOutput, 'VFD Run'], [v.auxInput, 'VFD Aux'], [v.analogSpeedOutput, 'VFD Speed']] as const) if (sig) tags.set(sig, `${v.name} ${label}`);
+    }
     for (const [key, label] of [['estopInput', 'E-Stop'], ['hornOutput', 'Horn'], ['hornSilenceInput', 'Horn Silence']] as const) {
       if (this.globalConfig[key]) tags.set(String(this.globalConfig[key]), label);
     }
@@ -2405,8 +2551,9 @@ export class Mill {
         dosingSteps: b.dosingSteps.map(s => ({
           ingredientId: s.ingredientId, ingredientName: s.ingredientName,
           sourceBinId: s.sourceBinId, target: s.target,
-          actual: Math.round(s.actual * 10) / 10, unit: s.unit, state: s.state, deviation: s.deviation,
+          actual: Math.round(s.actual * 10) / 10, unit: s.unit, state: s.state, deviation: s.deviation, micro: s.micro,
         })),
+        microUnloading: b.microUnloading,
         mixTimeRemainingMs: b.mixTimeRemainingMs, mixTimeTotalMs: b.mixTimeTotalMs,
         faultReason: b.faultReason,
         scheduledAt: b.scheduledAt, late: b.late, warnings: b.warnings, tolHold: b.tolHold, dosingError: b.dosingError,
@@ -2420,13 +2567,15 @@ export class Mill {
       queue: this.queue.map(batchToQueue),
       activeBatch: this.activeBatch ? batchToQueue(this.activeBatch) : null,
       faults: this.faults,
-      bins: this.bins.map(b => ({ ...b, hidden: this.isHidden(b.id) || undefined, levelSwitchState: this.levelState(b.id) })),
+      // a bin is a micro bin when its auger discharges onto a micros conveyor (no separate bin type to configure)
+      bins: this.bins.map(b => ({ ...b, type: b.type === 'ingredient' && this.isMicroBin(b.id) ? 'micro_hopper' as const : b.type, hidden: this.isHidden(b.id) || undefined, levelSwitchState: this.levelState(b.id) })),
       recipes: this.recipes,
       ingredients: this.ingredients,
       connections: this.connections,
       io: { inputs: { ...this.ioInputs }, outputs: { ...this.ioOutputs }, signals: this.signals.map(s => ({ ...s, assignment: tags.get(s.id) })), overrides: { ...this.ioOverrides } },
       scales: { ...this.scales },
       scaleConfigs: this.scaleConfigs,
+      sharedVfds: this.sharedVfds,
       omronConfig: { ...this.omronConfig, bus: this.busState, cards: this.omronConfig.cards.map(c => ({ ...c })) },
       globalConfig: { ...this.globalConfig },
       networkInterfaces: this.networkInterfaces,
@@ -2581,9 +2730,9 @@ export class Mill {
 
   // A dosing problem pauses the batch (the feeders stop) and raises a popup on the HMI: Resume tries the step again,
   // Accept takes what was dosed and carries on, Abort gives the batch up.
-  private dosingProblem(b: BatchRuntime, step: DosingStep, message: string) {
+  private dosingProblem(b: BatchRuntime, step: DosingStep, message: string, idx: number) {
     this.raiseFault('BATCH', 'CRITICAL', `Batch ${b.id}: ${message}`, 'E-BA-01');
-    b.dosingError = { stepIndex: b.dosingIndex, ingredientName: step.ingredientName, message, actual: step.actual, target: step.target };
+    b.dosingError = { stepIndex: idx, ingredientName: step.ingredientName, message, actual: step.actual, target: step.target };
     this.pauseActiveBatch();
     b.faultReason = message;
   }
@@ -2603,11 +2752,14 @@ export class Mill {
   private buildBatch(id: string, recipe: Recipe, destination: string, targetMass?: number, scheduledAt?: string): BatchRuntime {
     // a requested size scales every line (micros included); no size = the recipe as written
     const lines = scaleLines([...recipe.lines, ...recipe.microLines], targetMass);
-    const steps: DosingStep[] = lines.map(line => {
+    const steps: DosingStep[] = lines.map((line, i) => {
       const ing = this.ingredients.find(i => i.id === line.ingredientId);
       const bin = this.findBinForIngredient(line.ingredientId);
       const augerId = this.findAugerForBin(bin?.id ?? '');
+      const micro = i >= recipe.lines.length; // the recipe's micro list: majors first, then micros, each in list order
       return {
+        micro: micro || undefined,
+        conveyorId: micro && augerId ? this.findMicroConveyor(augerId) : undefined,
         ingredientId: line.ingredientId,
         ingredientName: ing?.name ?? line.ingredientId,
         sourceBinId: bin?.id ?? '',
@@ -2628,6 +2780,7 @@ export class Mill {
       state: 'IDLE',
       startedAt: '',
       dosingIndex: 0,
+      microIndex: steps.filter(s => !s.micro).length,
       dosingSteps: steps,
       mixTimeRemainingMs: recipe.mixTime * 1000,
       mixTimeTotalMs: recipe.mixTime * 1000,
@@ -2691,6 +2844,73 @@ export class Mill {
       if (conn.from === binId) return conn.to;
     }
     return undefined;
+  }
+
+  private isMicroBin(binId: string): boolean {
+    return this.connections.some(c => c.from === binId && this.equipment.get(c.to)?.equipmentType === 'auger' && !!this.findMicroConveyor(c.to));
+  }
+
+  // The micros conveyor an auger discharges onto (auger -> micro_drag), if any.
+  private findMicroConveyor(augerId: string): string | undefined {
+    for (const c of this.connections) {
+      if (c.from === augerId && this.equipment.get(c.to)?.equipmentType === 'micro_drag') return c.to;
+    }
+    return undefined;
+  }
+
+  // Majors are the steps before the first micro (buildBatch puts them first); each track has its own cursor.
+  private majorCount(b: BatchRuntime): number {
+    const i = b.dosingSteps.findIndex(s => s.micro);
+    return i < 0 ? b.dosingSteps.length : i;
+  }
+  private microCursor(b: BatchRuntime): number { return b.microIndex ?? this.majorCount(b); }
+  /** Indexes of the steps being dosed right now: the current major and the current micro. */
+  private activeStepIdx(b: BatchRuntime): number[] {
+    const idx: number[] = [];
+    if (b.dosingIndex < this.majorCount(b)) idx.push(b.dosingIndex);
+    if (this.microCursor(b) < b.dosingSteps.length) idx.push(this.microCursor(b));
+    return idx;
+  }
+  private hasMicros(b: BatchRuntime) { return b.dosingSteps.some(s => s.micro); }
+  private microConveyor(b: BatchRuntime): EquipmentRuntime | undefined {
+    const id = b.dosingSteps.find(s => s.micro)?.conveyorId;
+    return id ? this.equipment.get(id) : undefined;
+  }
+  /** The scale a step is weighed on: a micro on its conveyor's scale, anything else on the mixer's. */
+  private stepScale(step: DosingStep): ScaleReading | undefined {
+    if (!step.micro) return this.getMixerScale();
+    const id = step.conveyorId ? this.equipment.get(step.conveyorId)?.config.scaleId as string | undefined : undefined;
+    return id ? this.scales[id] : undefined;
+  }
+  private microZeroLbs(conv: EquipmentRuntime) { return Number(conv.config.zeroToleranceLbs ?? 2); }
+
+  // PLC Micros Over Capacity: more on the belt than the conveyor can hold stops the feeders and pauses the batch.
+  private checkMicroCapacity(b: BatchRuntime, step: DosingStep, weight: number): boolean {
+    const conv = step.conveyorId ? this.equipment.get(step.conveyorId) : undefined;
+    const cap = Number(conv?.config.capacityLbs ?? 0);
+    if (!conv || !(cap > 0) || weight <= cap) return true;
+    step.clean = false;
+    const auger = step.augerId ? this.equipment.get(step.augerId) : undefined;
+    if (auger) auger.request = false;
+    this.raiseFault(conv.id, 'CRITICAL', `${conv.name}: micros scale over capacity (${round1(weight)} lb)`, 'E-BA-02');
+    this.pauseActiveBatch();
+    b.faultReason = `Micros scale over capacity (${round1(weight)} of ${cap} lb) - clear the belt, then Resume`;
+    return false;
+  }
+
+  // ── shared VFDs: one drive for several augers; its I/O lives on the VFD, the auger keeps only its starter ──
+  private sharedVfdOf(eq: EquipmentRuntime | undefined): SharedVfd | undefined {
+    const id = eq?.config.sharedVfdId;
+    return id ? this.sharedVfds.find(v => v.id === id) : undefined;
+  }
+  /** The analog speed output that drives this feeder (its own, or its shared VFD's) with the span and limits that go with it. */
+  private speedOutput(eq: EquipmentRuntime | undefined): { sig: string; minPct: number; maxPct: number; lo: number; hi: number } | undefined {
+    if (!eq) return undefined;
+    const v = this.sharedVfdOf(eq);
+    if (v) return v.analogSpeedOutput ? { sig: v.analogSpeedOutput, minPct: v.speedMinPct, maxPct: v.speedMaxPct, lo: v.speedMinLimit, hi: v.speedMaxLimit } : undefined;
+    const sig = eq.config.analogSpeedOutput as string | undefined;
+    return sig ? { sig, minPct: Number(eq.config.speedMinPct ?? 0), maxPct: Number(eq.config.speedMaxPct ?? 100),
+      lo: Number(eq.config.speedMinLimit ?? 0), hi: Number(eq.config.speedMaxLimit ?? 100) } : undefined;
   }
 
   // Only the scale assigned to the mixer counts: with none assigned (or none reading) the batch has no weight to work with.

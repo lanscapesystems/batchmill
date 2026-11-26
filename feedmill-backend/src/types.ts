@@ -73,6 +73,22 @@ export interface DosingStep {
   deviation?: number;    // actual - target once settled
   ffOld?: number;        // freefall before / after the calibration of this step (set when one was applied)
   ffNew?: number;
+  micro?: boolean;       // dosed from the recipe's micro list: weighed on the micros conveyor's scale, unloaded into the mixer after all dosing
+  conveyorId?: string;   // micro steps: the micro_drag its auger feeds
+}
+
+// A VFD shared by several augers: its I/O is configured once here, and the augers on it only keep their starter.
+export interface SharedVfd {
+  id: string;
+  name: string;
+  runOutput?: string;
+  auxInput?: string;
+  analogSpeedOutput?: string;
+  startDelay: number;    // s: the VFD run output closes this long after the auger's starter is confirmed (PLC M11: 0.7)
+  speedMinPct: number;   // analog output span: 0..100 % of the speed setpoint maps to these % of the output
+  speedMaxPct: number;
+  speedMinLimit: number; // operator limits for the speed setpoint, %
+  speedMaxLimit: number;
 }
 
 // Out-of-tolerance step waiting for the operator (Ignore / Update freefall / Abort).
@@ -110,6 +126,12 @@ export interface BatchRuntime {
   warnings?: string[];           // queue-time warnings (inventory / mixer capacity) the operator accepted
   tolHold?: ToleranceHold;
   dosingError?: DosingError;
+  // Micros: dosingIndex walks the majors (steps before the first micro), microIndex walks the micros; both tracks run at once.
+  microIndex?: number;
+  microUnloading?: boolean;      // belt running into the mixer (after every major and micro is done, or at the start of an abort unload)
+  microUnloadRunMs?: number;     // time the belt has run in this unload
+  microDelivered?: boolean;      // the belt has been emptied into the mixer
+  abortMode?: 'mixUnload' | 'unload'; // an aborted batch with micros on the belt: what to do once the belt is empty
   dischargeStartWeight?: number; // mixer weight when discharge began (credited weight = this minus what is left)
   emptySinceMs?: number;         // when the scale first declared the mixer empty (cleanout time counts from here)
   consumptionPosted?: boolean;   // dosed material already deducted from the bins
@@ -230,6 +252,7 @@ export interface StateSnapshot {
   };
   scales: Record<string, ScaleReading>;
   scaleConfigs: ScaleConfig[];
+  sharedVfds: SharedVfd[];
   omronConfig: OmronConfig;
   globalConfig: Record<string, string | number>;
   networkInterfaces: string[];
@@ -259,7 +282,9 @@ export interface QueueSnapshot {
     unit: string;
     state: string;
     deviation?: number;
+    micro?: boolean;
   }[];
+  microUnloading?: boolean;
   mixTimeRemainingMs?: number;
   mixTimeTotalMs?: number;
   faultReason?: string;
@@ -366,6 +391,7 @@ export const NX_CARD_CATALOG: NxCardDef[] = [
   // Analog Output
   { model: 'NX-DA2203', category: 'AO', points: 2, label: '2ch Current Output (4-20mA)', fullScale: 8000, busWatts: 1.40 },
   { model: 'NX-DA3203', category: 'AO', points: 4, label: '4ch Current Output (4-20mA)', fullScale: 8000, busWatts: 1.80 },
+  { model: 'NX-DA3205', category: 'AO', points: 4, label: '4ch Current Output (4-20mA, 1/30000)', fullScale: 30000, busWatts: 1.80 }, // W522: 0..30000 = 4..20 mA
   { model: 'NX-DA3603', category: 'AO', points: 4, label: '4ch Voltage Output (±10V)', fullScale: 4000, busWatts: 1.80 },
   // Load Cell
   { model: 'NX-RS1201', category: 'scale', points: 1, label: '1ch Load Cell Input (24-bit)', busWatts: 1.70 },
@@ -398,6 +424,7 @@ export interface DiscoveredRack {
   productId: number;
   inputEntries: PdoEntry[];  // in physical rack order among DI/AI/scale cards
   outputEntries: PdoEntry[]; // in physical rack order among DO/AO cards
+  analogProblems?: Record<string, string>; // signal id -> why that analog point must not be used (unit settings read at the last Read Rack)
 }
 
 export interface IoRackCard {

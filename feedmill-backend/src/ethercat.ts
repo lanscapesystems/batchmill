@@ -124,6 +124,12 @@ const NX_CARD_IDENTS: Record<string, number> = {
   'NX-ID5442': 0x00115442,
   'NX-RS1201': 0x00251201,
   'NX-AD3203': 0x00213203,
+  // NOT confirmed on hardware: derived from the pattern of the confirmed codes above (0x00 + category byte + model digits;
+  // DI 0x11, DO 0x13, AI 0x21, load cell 0x25, so analog output = 0x23). A wrong guess shows as a "wrong card" mismatch
+  // on Read Rack with the real code in the warning: replace the value then.
+  'NX-DA3203': 0x00233203,
+  'NX-DA3205': 0x00233205,
+  'NX-DA3603': 0x00233603,
 };
 
 // shortcut: `ethercat upload`'s exact output format for a uint32 SDO
@@ -356,7 +362,49 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
     return card;
   });
 
+  // unit settings the analog points depend on (W522): a disabled channel or the wrong load-rejection output is not visible in the PDOs
+  if (om.discoveredRack) {
+    const problems: Record<string, string> = {};
+    for (const card of identifiedCards) {
+      if (card.status !== 'ok') continue;
+      const def = NX_CARD_CATALOG.find(d => d.model === card.model);
+      if (def?.category !== 'AI' && def?.category !== 'AO') continue;
+      const r = checkAnalogSettings(card, def, sdoUpload);
+      Object.assign(problems, r.problems);
+      for (const p of Object.values(r.problems)) warnings.push(p);
+      if (r.unreadable) warnings.push(`${card.model} in slot ${card.slot}: could not read its unit settings over SDO - channel enable and load-rejection settings are unverified`);
+    }
+    om.discoveredRack.analogProblems = problems;
+  }
+
   return { cards: identifiedCards, warnings };
+}
+
+/** W522 unit operation settings, read at 0x5000 + (unit - 1) * 0x20 (W519 A-7-10). Checks every channel of one analog card:
+ * - AI 0x5002:n / AO 0x5010:n Ch Enable/Disable must be TRUE (a disabled channel reads or drives nothing, with no other sign);
+ * - AO 0x5012:(2n-1) Load Rejection Hold Value must be 4 = Zero Count (0 V / 4 mA), so a lost host or bus drops the output to
+ *   zero instead of holding the last speed. The input and output ranges of the xx03 / xx603 models are fixed by the model (W522
+ *   range tables), so nothing else can differ from the catalog's full scale.
+ * A positive mismatch lands in `problems` (the point is left out of io.conf); an unreadable object only sets `unreadable`
+ * (same policy as the module identity check: warn, don't block on a read that may not be possible). */
+export function checkAnalogSettings(
+  card: { slot: number; model: string }, def: { category: string; points: number },
+  read: (type: 'uint8', index: string, sub: string) => number | null,
+): { problems: Record<string, string>; unreadable: boolean } {
+  const problems: Record<string, string> = {};
+  let unreadable = false;
+  const at = (base: number) => '0x' + (base + (card.slot - 1) * 0x20).toString(16);
+  for (let ch = 1; ch <= def.points; ch++) {
+    const id = `${def.category}:${card.slot}.${ch - 1}`;
+    const enabled = read('uint8', at(def.category === 'AI' ? 0x5002 : 0x5010), String(ch));
+    if (enabled === null) { unreadable = true; continue; }
+    if (enabled === 0) { problems[id] = `${id}: channel ${ch} is disabled in the ${card.model} (Ch Enable/Disable) - enable it before using this point`; continue; }
+    if (def.category !== 'AO') continue;
+    const hold = read('uint8', at(0x5012), String(2 * ch - 1));
+    if (hold === null) unreadable = true;
+    else if (hold !== 4) problems[id] = `${id}: ${card.model} channel ${ch} load-rejection output is not Zero Count (setting ${hold}) - the output would not drop to zero when the host or bus is lost`;
+  }
+  return { problems, unreadable };
 }
 
 /** Cheap, poll-safe rack presence check for the watchdog — same coupler-
@@ -405,7 +453,7 @@ export function checkRackPresence(om: OmronConfig): { cards: IoRackCard[]; unrea
 // raw scaling are taken from the manuals; NOT yet bench-tested — until then, generateIoConf excludes it from io.conf entirely
 // rather than generating a channel against an unverified guess.
 const VERIFIED_ANALOG_MODELS = new Set<string>([
-  'NX-AD2203', 'NX-AD3203', 'NX-AD4203', 'NX-AD4603', 'NX-DA2203', 'NX-DA3203', 'NX-DA3603', 'NX-RS1201',
+  'NX-AD2203', 'NX-AD3203', 'NX-AD4203', 'NX-AD4603', 'NX-DA2203', 'NX-DA3203', 'NX-DA3205', 'NX-DA3603', 'NX-RS1201',
 ]);
 
 /** Builds the io_daemon's full channel config from every signal currently
@@ -474,6 +522,8 @@ export function generateIoConf(
     }
     const alloc = allocations.get(slot);
     if (!alloc || alloc.status !== 'ok' || !alloc.pdoEntries) { warnings.push(`${sig.id}: ${card.model} in slot ${slot} — not enough PDO entries discovered; re-run Read Rack`); continue; }
+    const analogProblem = (sig.direction === 'AI' || sig.direction === 'AO') ? om.discoveredRack.analogProblems?.[sig.id] : undefined;
+    if (analogProblem) { warnings.push(`${analogProblem} - excluded from io.conf`); continue; }
 
     // Digital cards pack every point into the ONE entry they were allocated,
     // addressed as a bit within it; analog cards get one entry PER point.
@@ -488,6 +538,8 @@ export function generateIoConf(
       }
     } else entry = alloc.pdoEntries[point];
     if (!entry) { warnings.push(`${sig.id}: ${card.model}'s allocated PDO entries have nothing for point ${point}`); continue; }
+    // the daemon reads and writes analog points as 16-bit words: anything else mapped there would give wrong values
+    if (!isDigital && entry.bits !== 16) { warnings.push(`${sig.id}: ${card.model}'s PDO entry is ${entry.bits} bits wide, expected 16 - excluded from io.conf`); continue; }
 
     const index = entry.index.toString(16).padStart(4, '0');
     const subindex = entry.subindex.toString(16).padStart(2, '0');

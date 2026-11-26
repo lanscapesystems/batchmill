@@ -35,7 +35,7 @@ function backendToQueueEntry(b: BackendBatch): QueueEntry {
     state: b.state as QueueEntry['state'],
     progress: b.progress,
     startedAt: b.startedAt, completedAt: b.completedAt,
-    scheduledAt: b.scheduledAt, late: b.late, warnings: b.warnings, faultReason: b.faultReason, tolHold: b.tolHold, dosingError: b.dosingError,
+    scheduledAt: b.scheduledAt, late: b.late, warnings: b.warnings, faultReason: b.faultReason, tolHold: b.tolHold, dosingError: b.dosingError, microUnloading: b.microUnloading,
     actuals: b.dosingSteps?.map(s => ({
       ingredientId: s.ingredientId, target: s.target, actual: s.actual,
       unit: s.unit, sourceBinId: s.sourceBinId,
@@ -186,7 +186,7 @@ export function QueueTab() {
                   </div>
                 </div>
                 <span style={{ color: stateColor[activeBatchEntry.state] ?? 'var(--fg)', fontWeight: 600 }}>
-                  {stateLabel(activeBatchEntry.state)}
+                  {stateLabel(activeBatchEntry.state)}{activeBatchEntry.microUnloading ? ' · UNLOADING MICROS' : ''}
                 </span>
               </div>
               {activeBatchEntry.faultReason && (
@@ -482,7 +482,7 @@ function BatchRow({ entry: q, expanded, onToggle, onEdit, onDelete, onMove, ingr
         <td className="py-2 px-3">
           <span className="inline-flex items-center gap-1.5">
             <span className="w-1.5 h-1.5 rounded-full inline-block" style={{ background: stateColor[q.state] ?? 'var(--gray)' }} />
-            <span style={{ color: stateColor[q.state] ?? 'var(--fg)' }}>{stateLabel(q.state)}</span>
+            <span style={{ color: stateColor[q.state] ?? 'var(--fg)' }}>{stateLabel(q.state)}{q.microUnloading ? ' · unloading micros' : ''}</span>
             {q.state === 'IDLE' && q.scheduledAt && <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>starts {new Date(q.scheduledAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>}
             {q.late && <span style={{ color: 'var(--orange)', fontSize: '11px' }}>late</span>}
           </span>

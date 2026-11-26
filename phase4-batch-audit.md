@@ -65,3 +65,45 @@ Found and fixed while building:
 4. **Not exercised in the browser:** the tolerance popup, the scale-mismatch popup and the Unload / Discard buttons (they need a live scale feed); they are type-checked and the backend side is tested.
 5. **Not done on hardware:** everything above runs against a simulated scale.
 6. Defaults I chose where you did not say: auto freefall strength 50 %, max adjust 2 lb per batch, resume mismatch 10 lb, mixer empty 10 lb, discharge timeout 60 s, settle 2 s.
+
+---
+
+# Micro dosing audit (PLC `Operate` / `Faults` / `HOAs` vs `mill.ts`)
+
+Read from the Sysmac project (`DLRBatcher2026_09_29.smc2`, Main program: Operate steps 10-21, Faults R72-R101, HOAs M-1..M-12). Backend read: `buildBatch`, `advanceDosing`, `releaseBlocker`. Nothing run on hardware.
+
+## What the PLC does (micro path)
+- Micros are bins 20-27 (`CurrentBin > 19`), dosed by 8 augers M1-M8 into a **separate micros hopper on Scale2**, not the mixer scale. A shared VFD (M11) drives whichever micro auger is running; a **micros scale conveyor (M12)** moves the hopper contents into the mixer.
+- Zero check at batch start: Scale2 must be within `MicrosZeroToleranceSV` of 0 (else Micros Empty Tolerance fault, batch will not start), same as the mixer scale.
+- Step 10: if the previous recipe line was a major, run M12 first for 30 (timer units, probably 0.1 s) to clear the conveyor, then wait for Scale2 to settle (`FillSettleTDSV`). Consecutive micros skip this.
+- Steps 13-15: baseline = Scale2, `StopLbs = start + amount - FF_Lbs`, slow when `>= start + amount - Slow_Lbs`; VFD speed = bin `Dispense_Speed`, or `Slow_Speed` in the slow zone; stop at `StopLbs`; bin `SettleTime` wait on `!Scale2Moving`; ending weight and actual recorded.
+- Steps 16-18: per-bin tolerance, popup (Ignore / Update freefall), freefall auto-adjust with `Max_Adj_lbs`: identical to majors.
+- Steps 19-20: if the **next line is a major or the recipe ends**, run M12 until `MicrosUnloadTimeSV` has elapsed *and* Scale2 < zero tolerance (Micros Failed to Empty fault if not within `MicrosFailedToEmptyTDSV`). If the next line is another micro, nothing is unloaded: micros accumulate on Scale2 and each step re-baselines.
+- Step 21: inventory, run log, batch log (same as majors).
+- Interlocks: micro auger run chain requires `!M12.OkNxtTd.UP` (no dosing while the conveyor is running); VFD starts 0.7 s after any auger coil and stops when none is requested; per-bin auger stop counter keeps the auger running through the freefall.
+- Micro faults: Over Capacity (`Scale2 > MicrosCapacity`, only while the current bin is a micro), Failed to Achieve Weight (per-bin minutes, counts down while the bin requests dispense), Failed to Empty, Empty Tolerance.
+
+## Findings
+
+**P0**
+1. **Micros are weighed on the mixer scale.** `getMixerScale()` is the only scale `advanceDosing` knows. The `micro_drag` settings (`scaleId`, `weightStopSetpoint`, `timerBasedDosing`) and the `micro_hopper` bin type are never read by the batch engine. Real micros would be dosed against a scale that does not see them (they sit in the hopper until the conveyor runs), so actual = 0 and the auger feeds until the no-flow watchdog or a timeout fault. *Fix:* give the micros hopper its own scale (the micro drag's `scaleId`) and have a micro step use that scale for baseline, actual and settle.
+2. **The micros conveyor is never run.** Nothing requests M12/`micro_drag`: not before the first micro after a major, not after the last micro. Micro material would never reach the mixer. *Fix:* implement the unload step (run until minimum time elapsed and hopper scale below zero tolerance, with a failed-to-empty fault) as part of dosing a micro group.
+3. **`findAugerForBin` returns the first connection from the bin with no type check.** For a micro hopper that is possibly the micro drag, so the "auger" is the conveyor and the step runs it per ingredient. `releaseBlocker` only checks the thing exists and is in Auto. *Fix:* require a real micro auger, and treat the drag as a separate unload device.
+
+**P1**
+4. **No micro-scale checks.** Missing: hopper empty at batch start (Scale2 zero tolerance), over-capacity fault, scale-lost handling for the micro scale. Release gate checks only the mixer scale.
+5. **Shared VFD not modelled.** PLC sets one VFD speed from the bin (`Dispense_Speed` / `Slow_Speed`) and starts the VFD only after an auger starter closes. The backend's slow-speed path needs `analogSpeedOutput` on each auger; micro augers share one drive, so it must be an equipment-level output set per bin (the VFD start order already exists at mill.ts ~1534).
+6. **Interlock between conveyor and augers** (no micro dosing while M12 runs) is absent; irrelevant until finding 2 is fixed, then required.
+7. **Accumulation semantics.** On the PLC consecutive micros stay on Scale2 and each step re-baselines from the current gross; unloading happens only at a micro-to-major transition or at the end. The backend's per-step baseline works for that, but with the unload step added the order matters: majors-first/micros-last ordering (`[...recipe.lines, ...recipe.microLines]`) means one unload, whereas the PLC follows the recipe's own order (a micro between two majors unloads twice). Keep micros last unless the recipe order is something you want to preserve.
+
+**P2**
+8. **Failed-to-achieve-weight timer** is a per-bin total time (minutes) while dispensing; the backend has only the no-flow watchdog (rate-based). A slow but never-finishing feed is not caught. Add a per-step total timeout.
+9. **Zero-amount line.** PLC treats a line with amount <= 0 as end of recipe and jumps to mixing; the backend scales lines and dosing a 0-target step would complete instantly (harmless) but is unchecked.
+10. Settle uses the bin settle time on the same scale; carry over when the micro scale exists.
+
+## Unknowns
+- Timer units of the 30 in the initial conveyor cleanout and the default of `MicrosUnloadTimeSV` (set in HMI, not in the program).
+- Whether the real machine's micro hopper scale will be a second EtherCAT load cell (RS1201) at a fixed slot; the I/O config would need it.
+
+## Suggested order
+1 and 2 together (micro scale + conveyor unload), then 3 and 4, then 5-8. Until 1 and 2 are done, micro lines should not be allowed in a recipe that is run for real (reject in `releaseBlocker`): that is a small guard I can add now.

@@ -2,7 +2,7 @@
 
 import { useState, useRef, useCallback, useEffect, type MouseEvent as ReactMouseEvent } from 'react';
 import { useMillStore, EQUIPMENT_DEFS, IO_POOL, getPortsForEquipment, GRID_SNAP, FLOW_HIDDEN_TYPES, GLOBAL_DEFAULTS, type EquipmentItem, type PortDef, type Position, type FlowConnection } from '../store';
-import { useBackend, type BackendScaleConfig, type BackendOmronConfig, type BackendIoRackCard, type BackendCouplerType, type BackendEccModel } from '../backend';
+import { useBackend, type BackendSharedVfd, type BackendScaleConfig, type BackendOmronConfig, type BackendIoRackCard, type BackendCouplerType, type BackendEccModel } from '../backend';
 import { IOSignalList, STATE_STYLE, stateColor } from './system';
 import { UpdateSection } from './update';
 import { BackupSection } from './backup';
@@ -101,6 +101,7 @@ function FlowPathSection() {
 
   // Flow path edit mode — locks positions/connections only
   const [editMode, setEditMode] = useState(false);
+  const [vfdDialogOpen, setVfdDialogOpen] = useState(false);
   const [savedPositions, setSavedPositions] = useState<Record<string, Position> | null>(null);
   const [savedConnections, setSavedConnections] = useState<FlowConnection[] | null>(null);
   const [confirmAction, setConfirmAction] = useState<'save' | 'cancel' | null>(null);
@@ -605,6 +606,8 @@ function FlowPathSection() {
                 setCfg={(key, val) => updateSidebarDraft({ ...sidebarDraft, config: { ...sidebarDraft.config, [key]: val } })}
                 inputStyle={inputStyle}
                 scaleConfigs={backend?.scaleConfigs ?? []}
+                sharedVfds={backend?.sharedVfds ?? []}
+                onManageVfds={() => setVfdDialogOpen(true)}
                 ioPools={ioPools}
                 equipmentId={selectedItem.id}
                 connections={connections}
@@ -640,6 +643,86 @@ function FlowPathSection() {
           </div>
         </div>
       )}
+      {vfdDialogOpen && backend && <SharedVfdDialog vfds={backend.sharedVfds} ioPools={ioPools} send={backend.sendCommand} onClose={() => setVfdDialogOpen(false)} />}
+    </div>
+  );
+}
+
+// ─── Shared VFD dialog: create / edit the drives that several augers share (their I/O lives here, not on the augers) ───
+
+const EMPTY_VFD: BackendSharedVfd = { id: '', name: '', startDelay: 0.7, speedMinPct: 0, speedMaxPct: 100, speedMinLimit: 0, speedMaxLimit: 100 };
+
+function SharedVfdDialog({ vfds, ioPools, send, onClose }: {
+  vfds: BackendSharedVfd[]; ioPools: IOPools; onClose: () => void;
+  send: (action: string, targetId?: string, parameters?: Record<string, unknown>) => Promise<{ accepted: boolean; reason?: string }>;
+}) {
+  const [draft, setDraft] = useState<BackendSharedVfd>(vfds[0] ?? EMPTY_VFD);
+  const [error, setError] = useState('');
+  const isNew = !draft.id;
+  const set = <K extends keyof BackendSharedVfd>(k: K, val: BackendSharedVfd[K]) => setDraft(d => ({ ...d, [k]: val }));
+  const field: React.CSSProperties = { background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: '3px', color: 'var(--fg-bright)', padding: '4px 8px', fontSize: '12px', width: '100%' };
+  const sig = (label: string, key: 'runOutput' | 'auxInput' | 'analogSpeedOutput', pool: string[]) => (
+    <label className="flex flex-col gap-1"><span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>{label}</span>
+      <select value={draft[key] ?? ''} onChange={e => set(key, e.target.value || undefined)} style={field}>
+        <option value="">Not Assigned</option>
+        {pool.map(p => <option key={p} value={p}>{p}</option>)}
+      </select></label>
+  );
+  const num = (label: string, key: 'startDelay' | 'speedMinPct' | 'speedMaxPct' | 'speedMinLimit' | 'speedMaxLimit', suffix: string, step?: number) => (
+    <label className="flex flex-col gap-1"><span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>{label} ({suffix})</span>
+      <input type="number" value={draft[key]} step={step} onChange={e => set(key, Number(e.target.value))} style={field} /></label>
+  );
+  async function save() {
+    const r = await send('ConfigureSharedVfd', undefined, { ...draft });
+    if (!r.accepted) { setError(r.reason ?? 'Not saved'); return; }
+    setError('');
+    if (isNew) setDraft(EMPTY_VFD);
+  }
+  async function remove() {
+    const r = await send('RemoveSharedVfd', draft.id);
+    if (!r.accepted) { setError(r.reason ?? 'Not deleted'); return; }
+    setError(''); setDraft(EMPTY_VFD);
+  }
+  const btn = (primary: boolean, destructive = false): React.CSSProperties => ({
+    padding: '6px 14px', fontSize: '12px', fontWeight: 600, borderRadius: '3px', cursor: 'pointer',
+    background: destructive ? 'var(--red)' : primary ? 'var(--accent)' : 'transparent',
+    color: destructive ? '#fff' : primary ? '#000' : 'var(--fg-dim)', border: primary || destructive ? 'none' : '1px solid var(--border)',
+  });
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+      <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: '6px', padding: '16px 20px', width: '640px', maxWidth: '95vw', maxHeight: '90vh', overflow: 'auto' }}>
+        <div style={{ fontSize: '13px', fontWeight: 600, color: 'var(--fg-bright)', marginBottom: '10px' }}>Shared VFDs</div>
+        <div className="flex gap-4" style={{ fontSize: '12px' }}>
+          <div className="flex flex-col gap-1" style={{ width: '160px', flexShrink: 0 }}>
+            {vfds.map(d => (
+              <button key={d.id} onClick={() => { setDraft(d); setError(''); }} style={{ ...btn(false), textAlign: 'left', color: d.id === draft.id ? 'var(--fg-bright)' : 'var(--fg-dim)', background: d.id === draft.id ? 'var(--bg-row)' : 'transparent' }}>{d.name}</button>
+            ))}
+            <button onClick={() => { setDraft(EMPTY_VFD); setError(''); }} style={btn(false)}>+ New VFD</button>
+          </div>
+          <div className="flex flex-col gap-2" style={{ flex: 1 }}>
+            <label className="flex flex-col gap-1"><span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Name</span>
+              <input value={draft.name} onChange={e => set('name', e.target.value)} placeholder={isNew ? 'New shared VFD' : ''} style={field} /></label>
+            {sig('VFD Run Output', 'runOutput', ioPools.do)}
+            {sig('VFD Aux Input', 'auxInput', ioPools.di)}
+            {sig('Analog Speed Output', 'analogSpeedOutput', ioPools.ao)}
+            <div className="grid grid-cols-2 gap-2">
+              {num('Start Delay', 'startDelay', 's', 0.1)}
+              <span />
+              {num('Speed Min', 'speedMinPct', '%')}
+              {num('Speed Max', 'speedMaxPct', '%')}
+              {num('Speed Min Limit', 'speedMinLimit', '%')}
+              {num('Speed Max Limit', 'speedMaxLimit', '%')}
+            </div>
+            <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>An auger on this VFD keeps only its starter; its own speed output and VFD fields are hidden.</span>
+            {error && <span style={{ color: 'var(--red)', fontSize: '12px' }}>{error}</span>}
+          </div>
+        </div>
+        <div className="flex items-center gap-2" style={{ justifyContent: 'flex-end', marginTop: '12px' }}>
+          {!isNew && <button onClick={remove} style={{ ...btn(false, true), marginRight: 'auto' }}>Delete</button>}
+          <button onClick={onClose} style={btn(false)}>Close</button>
+          <button onClick={save} style={btn(true)}>{isNew ? 'Create' : 'Save'}</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -655,13 +738,15 @@ interface ConfigPanelProps {
   setCfg: (key: string, val: string | number | boolean) => void;
   inputStyle: React.CSSProperties;
   scaleConfigs: BackendScaleConfig[];
+  sharedVfds: BackendSharedVfd[];
+  onManageVfds: () => void;
   ioPools: IOPools;
   equipmentId?: string;
   connections?: FlowConnection[];
   allEquipment?: EquipmentItem[];
 }
 
-function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfigs, ioPools, equipmentId, connections, allEquipment }: ConfigPanelProps) {
+function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfigs, sharedVfds, onManageVfds, ioPools, equipmentId, connections, allEquipment }: ConfigPanelProps) {
   const v = (key: string, fb: string | number | boolean = '') => cfg[key] ?? fb;
 
   const row = (label: string, content: React.ReactNode) => (
@@ -741,8 +826,8 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
         {row('Stop Delay', numIn('stopDelay', 0, 's', 0.1))}
          {row('Starter Fault Delay (overrides global)', numIn('starterFaultDelay', Number(GLOBAL_DEFAULTS.motorStarterFaultDelay), 's', 0.1))}
       </>}
-      {row('Analog Speed Output', ioSel(ioPools.ao, 'analogSpeedOutput'))}
-      {v('analogSpeedOutput') && <>
+      {!v('sharedVfdId') && row('Analog Speed Output', ioSel(ioPools.ao, 'analogSpeedOutput'))}
+      {!v('sharedVfdId') && v('analogSpeedOutput') && <>
         {row('Speed Min %', numIn('speedMinPct', 0, '%'))}
         {row('Speed Max %', numIn('speedMaxPct', 100, '%'))}
         {row('Speed Min Limit %', numIn('speedMinLimit', 0, '%'))}
@@ -763,7 +848,7 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
     case 'bin': {
       const connectedAugerId = connections?.find(c => c.from === equipmentId)?.to;
       const connectedAuger = connectedAugerId ? allEquipment?.find(e => e.id === connectedAugerId) : undefined;
-      const augerHasAnalog = !!(connectedAuger?.config.analogSpeedOutput);
+      const augerHasAnalog = !!(connectedAuger?.config.analogSpeedOutput || connectedAuger?.config.sharedVfdId);
       // A bin that discharges only to a hammermill (augers in between are fine) is not a batching bin and can be hidden from tracking.
       const hammermillOnly = (() => {
         if (!connections || !allEquipment || !equipmentId || !connections.some(c => c.from === equipmentId)) return false;
@@ -791,6 +876,7 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
         {row('Tolerance (blank = 2 % of target)', numIn('toleranceLbs', 0, 'lbs', 0.1))}
         {row('Settle Time', numIn('settleSec', 2, 's', 0.1))}
         {row('No-Flow Delay', numIn('noProgressDelaySec', 60, 's', 1))}
+        {row('Failed to Achieve Weight (0 = off)', numIn('failedToAchieveSec', 0, 's', 1))}
         {row('No-Flow Minimum Rise (per 10 s)', numIn('noProgressMinLbs', 2, 'lbs', 0.1))}
         {row('Auto Freefall', check('ffAuto', 'Adjust freefall after each in-tolerance step'))}
         {!!v('ffAuto') && <>
@@ -807,8 +893,18 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
     case 'auger':
       return <>
         {motorFields({ rotation: true, load: true, delays: true })}
-        {row('Master VFD', check('masterVfd', 'Master VFD'))}
-        {v('masterVfd') && <>
+        {row('Shared VFD', <div className="flex items-center gap-2">
+          {editing
+            ? <select value={(v('sharedVfdId') as string) || ''} onChange={e => setCfg('sharedVfdId', e.target.value)} style={{ ...inputStyle, flex: 1 }}>
+                <option value="">None (own drive)</option>
+                {sharedVfds.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+              </select>
+            : <span style={{ color: v('sharedVfdId') ? 'var(--fg-bright)' : 'var(--fg-dim)', fontSize: '12px' }}>{sharedVfds.find(d => d.id === v('sharedVfdId'))?.name ?? 'None (own drive)'}</span>}
+          <button type="button" onClick={onManageVfds} className="px-2 py-1 text-xs font-medium"
+            style={{ background: 'transparent', color: 'var(--fg-dim)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer' }}>Manage…</button>
+        </div>)}
+        {!v('sharedVfdId') && row('Master VFD', check('masterVfd', 'Master VFD'))}
+        {!v('sharedVfdId') && v('masterVfd') && <>
           {row('VFD Fwd', ioSel(ioPools.do, 'vfdRunOutput'))}
           {row('VFD Aux Input', ioSel(ioPools.di, 'vfdAuxInput'))}
           {row('VFD Start Delay', numIn('vfdStartDelay', 0.7, 's', 0.1))}
@@ -846,7 +942,7 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
         )}
         {motorFields({ rotation: false, load: true, delays: true })}
         {v('analogLoadInput') && <>
-          {row('Load Control Feeder', ioSel((allEquipment ?? []).filter(e => e.config.analogSpeedOutput).map(e => e.id), 'loadControlFeeder'))}
+          {row('Load Control Feeder', ioSel((allEquipment ?? []).filter(e => e.config.analogSpeedOutput || e.config.sharedVfdId).map(e => e.id), 'loadControlFeeder'))}
         </>}
         {row('Auto Enable', check('autoEnable', 'Auto Enable'))}
         {row('Max Fill Time', numIn('maxFillMinutes', 60, 'min'))}
@@ -875,9 +971,11 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
         {row('MS Aux', ioSel(ioPools.di, 'runConfirmAux'))}
         {row('Start Delay', numIn('startDelay', 0, 's', 0.1))}
         {row('Stop Delay', numIn('stopDelay', 0, 's', 0.1))}
-        {row('Timer Based Dosing', check('timerBasedDosing', 'Timer Based Dosing'))}
-        {!v('timerBasedDosing') && row('Scale', scaleSel('scaleId', scaleConfigs))}
-        {row('Weight Stop Setpoint', numIn('weightStopSetpoint', 0, 'lbs'))}
+        {row('Scale (belt)', scaleSel('scaleId', scaleConfigs))}
+        {row('Empty Tolerance', numIn('zeroToleranceLbs', 2, 'lbs', 0.1))}
+        {row('Capacity (0 = off)', numIn('capacityLbs', 0, 'lbs', 1))}
+        {row('Minimum Unload Time', numIn('unloadMinSec', 10, 's', 1))}
+        {row('Failed to Empty Time', numIn('failedToEmptySec', 60, 's', 1))}
       </>;
 
     case 'gate':
@@ -967,6 +1065,7 @@ function IOSection() {
     { model: 'NX-AD3203', label: 'NX-AD3203 — 4ch AI (4-20mA)', cat: 'Analog Input' },
     { model: 'NX-DA2203', label: 'NX-DA2203 — 2ch AO (4-20mA)', cat: 'Analog Output' },
     { model: 'NX-DA3203', label: 'NX-DA3203 — 4ch AO (4-20mA)', cat: 'Analog Output' },
+    { model: 'NX-DA3205', label: 'NX-DA3205 — 4ch AO (4-20mA, 1/30000)', cat: 'Analog Output' },
     { model: 'NX-DA3603', label: 'NX-DA3603 — 4ch AO (±10V)', cat: 'Analog Output' },
     { model: 'NX-RS1201', label: 'NX-RS1201 — 1ch Load Cell (24-bit)', cat: 'Scale' },
     { model: 'NX-PD1000', label: 'NX-PD1000 — Addl NX Bus Power (10W)', cat: 'Power' },

@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import type {
   EquipmentRuntime, FlowConnection, Bin, Recipe, Ingredient,
-  ScaleConfig, OmronConfig,
+  ScaleConfig, OmronConfig, SharedVfd,
 } from './types.js';
 
 export interface MillConfig {
@@ -12,6 +12,7 @@ export interface MillConfig {
   ingredients: Ingredient[];
   recipes: Recipe[];
   scaleConfigs: ScaleConfig[];
+  sharedVfds?: SharedVfd[]; // absent in configs saved before shared VFDs existed
   omronConfig: OmronConfig;
   globalConfig: Record<string, string | number>;
 }
