@@ -13,6 +13,9 @@
 #   3. only then unpack and run the bundle's install.sh in update mode,
 #      which builds a new release, switches, health-checks, and reverts
 #
+# `feedmill-apply-update github` skips the signature and instead pulls the
+# repo/branch in $STATE_DIR/update-source.json (stopgap until the HMI has auth).
+#
 # Bundle = outer .zip holding exactly two members: release.zip (monorepo
 # source: feedmill-backend/ + hmi-prototype/) and release.sig (signature over
 # release.zip). Build one with install/make-update.sh.
@@ -44,26 +47,40 @@ fail() { echo "ERROR: $*" >&2; status failed "$*"; rm -rf "$WORK" "$STAGED"; exi
 exec 9>/run/feedmill-update.lock
 flock -n 9 || { echo "an update is already running" >&2; exit 1; }
 
-status running "verifying upload"
-[[ -f "$TRUST_DIR/pubkey.pem" ]] || fail "updates disabled: no signing key installed"
-[[ -f "$STAGED" && ! -L "$STAGED" ]] || fail "no staged upload"
-[[ "$(stat -c %s "$STAGED")" -le "$MAX_BYTES" ]] || fail "upload too large"
+MODE="${1:-zip}" # zip = signed upload; github = pull the configured repo/branch (unsigned until the HMI has auth)
 IFACE="$(sed -n 's/^IFACE=//p' "$TRUST_DIR/install.env" 2>/dev/null | head -n1)"
 [[ -n "$IFACE" && -d "/sys/class/net/$IFACE" ]] || fail "EtherCAT NIC '$IFACE' from install.env not found"
 
 rm -rf "$WORK"
 install -d -m 0700 -o root -g root "$WORK" "$WORK/src"
-mv "$STAGED" "$WORK/bundle.zip" || fail "could not take the staged upload"
-# exact member names only: nothing in the bundle picks its own path
-unzip -p "$WORK/bundle.zip" release.zip >"$WORK/release.zip" 2>/dev/null || fail "bundle has no release.zip"
-unzip -p "$WORK/bundle.zip" release.sig >"$WORK/release.sig" 2>/dev/null || fail "bundle has no release.sig"
-openssl pkeyutl -verify -pubin -inkey "$TRUST_DIR/pubkey.pem" -rawin \
-  -in "$WORK/release.zip" -sigfile "$WORK/release.sig" >/dev/null 2>&1 || fail "signature check failed — not an authentic update"
-
-unzip -q "$WORK/release.zip" -d "$WORK/src" || fail "release.zip is corrupt"
+SHA=""
+if [[ "$MODE" == github ]]; then
+  status running "downloading from GitHub"
+  # repo/branch come from a feedmill-owned file, so re-validate before they reach a URL
+  { read -r REPO; read -r BRANCH; } < <(node -e 'const s=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(s.repo+"\n"+s.branch)' "$STATE_DIR/update-source.json" 2>/dev/null)
+  [[ "${REPO:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "no valid GitHub repo configured"
+  [[ "${BRANCH:-}" =~ ^[A-Za-z0-9_][A-Za-z0-9_./-]*$ && "$BRANCH" != *..* ]] || fail "no valid branch configured"
+  SHA="$(curl -fsSL -m 30 -H 'Accept: application/vnd.github.sha' "https://api.github.com/repos/$REPO/commits/$BRANCH")" || fail "GitHub: cannot resolve $REPO@$BRANCH (private repo, wrong name, or offline)"
+  [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || fail "GitHub returned an unexpected commit id"
+  # pin to the resolved sha so a push mid-download can't mix versions
+  curl -fsSL -m 600 --max-filesize "$MAX_BYTES" "https://codeload.github.com/$REPO/tar.gz/$SHA" -o "$WORK/src.tgz" || fail "GitHub download failed"
+  tar -xzf "$WORK/src.tgz" -C "$WORK/src" --strip-components=1 --no-same-owner || fail "GitHub archive is corrupt"
+else
+  status running "verifying upload"
+  [[ -f "$TRUST_DIR/pubkey.pem" ]] || fail "updates disabled: no signing key installed"
+  [[ -f "$STAGED" && ! -L "$STAGED" ]] || fail "no staged upload"
+  [[ "$(stat -c %s "$STAGED")" -le "$MAX_BYTES" ]] || fail "upload too large"
+  mv "$STAGED" "$WORK/bundle.zip" || fail "could not take the staged upload"
+  # exact member names only: nothing in the bundle picks its own path
+  unzip -p "$WORK/bundle.zip" release.zip >"$WORK/release.zip" 2>/dev/null || fail "bundle has no release.zip"
+  unzip -p "$WORK/bundle.zip" release.sig >"$WORK/release.sig" 2>/dev/null || fail "bundle has no release.sig"
+  openssl pkeyutl -verify -pubin -inkey "$TRUST_DIR/pubkey.pem" -rawin \
+    -in "$WORK/release.zip" -sigfile "$WORK/release.sig" >/dev/null 2>&1 || fail "signature check failed — not an authentic update"
+  unzip -q "$WORK/release.zip" -d "$WORK/src" || fail "release.zip is corrupt"
+fi
 SRC="$WORK/src/feedmill-backend"
 for f in feedmill-backend/package.json feedmill-backend/install/install.sh hmi-prototype/package.json; do
-  [[ -f "$WORK/src/$f" ]] || fail "release.zip is missing $f"
+  [[ -f "$WORK/src/$f" ]] || fail "update is missing $f"
 done
 VERSION="$(node -p "require('$SRC/package.json').version" 2>/dev/null)" || fail "cannot read release version"
 
@@ -92,6 +109,7 @@ status running "building $VERSION and switching (several minutes)"
 RC=$?
 
 if [[ $RC -eq 0 ]]; then
+  [[ -z "$SHA" ]] || { printf '%s\n' "$SHA" >"$STATE_DIR/installed-commit"; chmod 0644 "$STATE_DIR/installed-commit"; }
   status success "updated to $VERSION"
 elif [[ $RC -eq 3 ]]; then
   # new code was live, failed its health check, and install.sh put the old

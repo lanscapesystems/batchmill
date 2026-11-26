@@ -29,7 +29,17 @@ function writeStatus(state: string, message: string) {
   fs.writeFileSync(tmp, JSON.stringify({ state, message, at: new Date().toISOString() }));
   fs.renameSync(tmp, STATUS);
 }
-function startUnit(unit: 'feedmill-update.service' | 'feedmill-rollback.service'): Promise<void> {
+const SOURCE = path.join(STATE_DIR, 'update-source.json');
+const INSTALLED = path.join(STATE_DIR, 'installed-commit');
+const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const BRANCH_RE = /^[A-Za-z0-9_][A-Za-z0-9_./-]*$/; // also re-checked by the root script
+function readSource(): { repo: string; branch: string } {
+  try { return JSON.parse(fs.readFileSync(SOURCE, 'utf8')); } catch { return { repo: '', branch: 'main' }; }
+}
+function readInstalled(): string | null {
+  try { return fs.readFileSync(INSTALLED, 'utf8').trim() || null; } catch { return null; }
+}
+function startUnit(unit: 'feedmill-update.service' | 'feedmill-update-github.service' | 'feedmill-rollback.service'): Promise<void> {
   return new Promise((resolve, reject) =>
     // --no-block: the unit restarts this very process, so don't wait on it
     execFile('sudo', ['-n', '/bin/systemctl', 'start', '--no-block', unit], err => (err ? reject(err) : resolve())));
@@ -51,7 +61,59 @@ export function registerUpdateRoutes(app: Express, mill: Mill) {
       current: releaseName('current'),
       previous: releaseName('previous'),
       status: readStatus(),
+      source: readSource(),
+      installedCommit: readInstalled(),
     });
+  });
+
+  app.put('/api/v1/update/source', (req, res) => {
+    const repo = String(req.body?.repo ?? '').trim();
+    const branch = String(req.body?.branch ?? '').trim();
+    if (!REPO_RE.test(repo)) { res.status(400).json({ error: 'Repo must look like owner/name' }); return; }
+    if (!BRANCH_RE.test(branch) || branch.includes('..')) { res.status(400).json({ error: 'Invalid branch name' }); return; }
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(`${SOURCE}.tmp`, JSON.stringify({ repo, branch }));
+    fs.renameSync(`${SOURCE}.tmp`, SOURCE);
+    res.json({ repo, branch });
+  });
+
+  // read-only look at the branch head; public repos only (no token stored)
+  app.get('/api/v1/update/check', async (_req, res) => {
+    const { repo, branch } = readSource();
+    if (!REPO_RE.test(repo) || !BRANCH_RE.test(branch)) { res.status(409).json({ error: 'Set a repo and branch first' }); return; }
+    try {
+      const r = await fetch(`https://api.github.com/repos/${repo}/commits/${encodeURIComponent(branch)}`, {
+        headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'feedmill-updater' },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!r.ok) { res.status(502).json({ error: r.status === 404 ? 'Repo or branch not found (private repos are not supported)' : `GitHub returned ${r.status}` }); return; }
+      const c = await r.json() as { sha: string; commit: { message: string; committer: { date: string } } };
+      const installed = readInstalled();
+      res.json({
+        sha: c.sha,
+        message: c.commit.message.split('\n')[0],
+        date: c.commit.committer.date,
+        // null = installed commit unknown (installed over SSH or never updated from GitHub)
+        upToDate: installed ? installed === c.sha : null,
+      });
+    } catch (err) {
+      res.status(502).json({ error: `Cannot reach GitHub: ${(err as Error).message}` });
+    }
+  });
+
+  app.post('/api/v1/update/github', async (_req, res) => {
+    const { repo, branch } = readSource();
+    if (!REPO_RE.test(repo) || !BRANCH_RE.test(branch)) { res.status(409).json({ error: 'Set a repo and branch first' }); return; }
+    const busy = busyReason();
+    if (busy) { res.status(409).json({ error: busy }); return; }
+    try {
+      writeStatus('queued', `fetching ${repo}@${branch}`);
+      await startUnit('feedmill-update-github.service');
+      res.status(202).json({ accepted: true });
+    } catch (err) {
+      writeStatus('failed', `update not started: ${(err as Error).message}`); // else 'queued' would block every later update
+      res.status(500).json({ error: `Could not start update: ${(err as Error).message}` });
+    }
   });
 
   app.post('/api/v1/update', async (req, res) => {

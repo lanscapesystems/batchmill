@@ -322,6 +322,7 @@ SUDOERS_TMP="$(mktemp)"
 cat >"$SUDOERS_TMP" <<EOF
 $APP_USER ALL=(root) NOPASSWD: /bin/systemctl restart feedmill-io-daemon.service, \\
   /bin/systemctl start --no-block feedmill-update.service, \\
+  /bin/systemctl start --no-block feedmill-update-github.service, \\
   /bin/systemctl start --no-block feedmill-rollback.service
 EOF
 visudo -c -f "$SUDOERS_TMP" >/dev/null || { rm -f "$SUDOERS_TMP"; die "generated sudoers file is invalid"; }
@@ -393,6 +394,17 @@ Description=Feedmill signed web update (root)
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/feedmill-apply-update
+TimeoutStartSec=1800
+EOF
+install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/feedmill-update-github.service <<EOF
+[Unit]
+Description=Feedmill GitHub update (root)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/feedmill-apply-update github
 TimeoutStartSec=1800
 EOF
 install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/feedmill-rollback.service <<EOF
