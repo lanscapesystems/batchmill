@@ -308,6 +308,7 @@ export interface CommandResult {
   reason?: string;
   revision: number;
   data?: unknown; // optional payload (e.g. a rack read)
+  later?: Promise<CommandResult>; // set while the work runs in the background: send this result instead, once it resolves
 }
 
 export type ScaleConnectionType = 'serial' | 'rs1201';

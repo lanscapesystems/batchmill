@@ -1,7 +1,7 @@
-import { execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import type { OmronConfig, IoRackCard, EquipmentRuntime, SignalDef, ScaleConfig, PdoEntry } from './types.js';
-import { NX_CARD_CATALOG, OMRON_VENDOR_ID } from './types.js';
+import { NX_CARD_CATALOG, NX_MAX_UNITS, OMRON_VENDOR_ID } from './types.js';
 
 const ioConfPath = () => process.env.FEEDMILL_IO_CONF_PATH ?? '/etc/feedmill/io.conf';
 
@@ -19,36 +19,24 @@ export interface EthercatSlave {
   name: string;
 }
 
-// shortcut: every call below is synchronous (execFileSync) and blocks the
-// WHOLE Node event loop for the subprocess's duration, including the
-// mill's own 100ms scan timer and any WebSocket traffic — not just the
-// caller. verifyEthercatRack/syncIoConf run from explicit, infrequent user
-// actions (Read Rack, reconfigure), so the stall is bounded and visible;
-// checkRackPresence runs on rackWatchdogCheck's unconditional 3s timer in
-// mill.ts, so it stalls the scan loop on every tick. Upgrade to converge
-// on when the scan's own measured jitter (see io_daemon.c's P1 timing
-// finding) demands it — would need runEthercat and every caller async
-// (execFile, not execFileSync), which ripples into mill.ts's command
-// dispatch; not done here. See ethercat-io-audit.md's P1 timing finding.
-function runEthercat(args: string[]): { out: string | null; error?: string } {
-  try {
-    return { out: execFileSync('ethercat', args, { encoding: 'utf8', timeout: 3000 }) };
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException & { stderr?: Buffer | string };
-    if (e.code === 'ENOENT') return { out: null, error: 'ethercat CLI not found on PATH' };
-    const stderr = e.stderr ? String(e.stderr).trim() : '';
+// Every CLI call is asynchronous: the scan and the screens keep running while it waits on the bus.
+function runEthercat(args: string[]): Promise<{ out: string | null; error?: string }> {
+  return new Promise(resolve => execFile('ethercat', args, { encoding: 'utf8', timeout: 3000 }, (err, stdout, stderr) => {
+    if (!err) return resolve({ out: stdout });
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === 'ENOENT') return resolve({ out: null, error: 'ethercat CLI not found on PATH' });
     // Most common real cause on a freshly-installed box: the backend runs as an
     // unprivileged user, and /dev/EtherCAT0 is root-owned until a udev rule grants
     // group access (see install.sh) — that shows up here as an EACCES in stderr/message.
-    return { out: null, error: stderr || e.message || 'ethercat command failed' };
-  }
+    resolve({ out: null, error: String(stderr ?? '').trim() || e.message || 'ethercat command failed' });
+  }));
 }
 
 // shortcut: parses the default IgH `ethercat` CLI text format (tested against documented
 // `ethercat master`/`ethercat slaves` samples, not live hardware). If the installed IgH
 // version's column layout differs, update these regexes against `ethercat --version`.
-export function getMasterStatus(): EthercatMasterStatus {
-  const { out, error } = runEthercat(['master']);
+export async function getMasterStatus(): Promise<EthercatMasterStatus> {
+  const { out, error } = await runEthercat(['master']);
   if (out === null) return { toolAvailable: false, error };
   const phase = /Phase:\s*(.+)/.exec(out)?.[1]?.trim();
   const slaveCountStr = /Slaves:\s*(\d+)/.exec(out)?.[1];
@@ -61,8 +49,8 @@ export function getMasterStatus(): EthercatMasterStatus {
   };
 }
 
-export function listSlaves(): EthercatSlave[] {
-  const { out } = runEthercat(['slaves']);
+export async function listSlaves(): Promise<EthercatSlave[]> {
+  const { out } = await runEthercat(['slaves']);
   if (out === null) return [];
   const slaves: EthercatSlave[] = [];
   for (const line of out.split('\n')) {
@@ -78,8 +66,8 @@ export function listSlaves(): EthercatSlave[] {
 // documented IgH samples, not verified against a live box's actual output —
 // if it comes back undefined for a real slave, run `ethercat slaves -p
 // <pos> -v` by hand and fix this regex to match what your IgH version prints.
-function getSlaveProductId(position: number): number | null {
-  const { out } = runEthercat(['slaves', '-p', String(position), '-v']);
+async function getSlaveProductId(position: number): Promise<number | null> {
+  const { out } = await runEthercat(['slaves', '-p', String(position), '-v']);
   if (out === null) return null;
   const m = /Product code:\s*0x([0-9a-fA-F]+)/.exec(out);
   return m ? parseInt(m[1], 16) : null;
@@ -94,8 +82,8 @@ function getSlaveProductId(position: number): number | null {
 // diagnostics/padding, not a card's data. Called ONCE for the whole rack
 // (position 0, the coupler) — see allocateRackEntries for how individual
 // cards' entries get sliced out of the result.
-function getRackPdoEntries(position: number): PdoEntry[] {
-  const { out } = runEthercat(['pdos', '-p', String(position)]);
+async function getRackPdoEntries(position: number): Promise<PdoEntry[]> {
+  const { out } = await runEthercat(['pdos', '-p', String(position)]);
   if (out === null) return [];
   const entries: PdoEntry[] = [];
   let dir: PdoEntry['dir'] | null = null;
@@ -139,29 +127,29 @@ export const SCALE_ID_RE = /^[A-Za-z0-9_-]{1,24}$/;
 // returns null on real hardware, check the raw CLI output here first.
 // IgH prints an upload as "0x<hex> <decimal>" (e.g. "0x00135256 1266262"), so
 // Number() on the whole line is NaN — take the first token only.
-function sdoUpload(type: 'uint8' | 'uint16' | 'uint32', index: string, sub: string): number | null {
-  const { out } = runEthercat(['upload', '-p', '0', '-t', type, index, sub]);
+async function sdoUpload(type: 'uint8' | 'uint16' | 'uint32', index: string, sub: string): Promise<number | null> {
+  const { out } = await runEthercat(['upload', '-p', '0', '-t', type, index, sub]);
   if (out === null) return null;
   const n = Number(out.trim().split(/\s+/)[0]);
   return Number.isFinite(n) ? n : null;
 }
 
-function getSlotModuleIdent(slot: number): number | null {
+function getSlotModuleIdent(slot: number): Promise<number | null> {
   return sdoUpload('uint32', '0xf050', String(slot));
 }
 
 /** Number of current errors held by the coupler + NX units (W519 A-5-2:
  * CoE 0x3809:00 is the error count plus 1). null = could not read. */
-export function readCouplerErrorCount(): number | null {
-  const n = sdoUpload('uint8', '0x3809', '0');
+export async function readCouplerErrorCount(): Promise<number | null> {
+  const n = await sdoUpload('uint8', '0x3809', '0');
   return n === null ? null : Math.max(0, n - 1);
 }
 
 /** Clears the coupler's + NX units' current errors by writing 01 to CoE
  * 0x2002:02 "Sysmac Error Status Clear" (W519 A-5-3). Does not fix the cause —
  * the same error returns if it's still present. */
-export function clearCouplerErrors(): { ok: boolean; error?: string } {
-  const { out, error } = runEthercat(['download', '-p', '0', '-t', 'uint8', '0x2002', '2', '1']);
+export async function clearCouplerErrors(): Promise<{ ok: boolean; error?: string }> {
+  const { out, error } = await runEthercat(['download', '-p', '0', '-t', 'uint8', '0x2002', '2', '1']);
   return out === null ? { ok: false, error } : { ok: true };
 }
 
@@ -270,21 +258,25 @@ export function cardsFromRack(entries: PdoEntry[], idents: (number | null)[], un
 
 /** Read the rack straight off the bus using nothing from the saved config — works on a fresh install, before any card is
  * entered or the coupler settings are saved (the IgH master is set up by install.sh, not by this backend). */
-export function discoverRack(): RackDiscovery {
-  const master = getMasterStatus();
+export async function discoverRack(): Promise<RackDiscovery> {
+  const master = await getMasterStatus();
   if (!master.toolAvailable) return { ok: false, error: `cannot reach the EtherCAT master (${master.error ?? 'unknown reason'})`, cards: [], warnings: [] };
   if (master.linkUp === false) return { ok: false, error: 'EtherCAT link is down - check the cable and the master NIC', cards: [], warnings: [] };
-  const coupler = listSlaves().find(s => s.position === 0);
+  const coupler = (await listSlaves()).find(s => s.position === 0);
   if (!coupler) return { ok: false, error: 'No EtherCAT slaves detected on the bus', cards: [], warnings: [] };
   const eccMatch = /ECC20([23])/i.exec(coupler.name);
-  const entries = getRackPdoEntries(0);
-  const identCount = sdoUpload('uint8', '0xf050', '0');
+  const entries = await getRackPdoEntries(0);
+  // CoE 0xF050:00 is the size of the list (always 125, W519 A-7), NOT the number of units: read positions until one is empty
   const idents: (number | null)[] = [null];
-  for (let i = 1; i <= (identCount ?? 0); i++) idents[i] = getSlotModuleIdent(i);
+  for (let i = 1; i <= NX_MAX_UNITS; i++) {
+    const ident = await getSlotModuleIdent(i);
+    if (!ident) break;
+    idents[i] = ident;
+  }
   const unitOf = (e: PdoEntry) => ((e.index - (e.dir === 'input' ? 0x6000 : 0x7000)) >> 5) + 1;
-  const unitCount = Math.max(identCount ?? 0, ...entries.map(unitOf), 0);
-  const { cards, warnings } = cardsFromRack(entries, idents, unitCount);
-  if (identCount === null) warnings.push('Could not read the module list (CoE 0xF050): units without process data, such as power units, may be missing');
+  const lastWithData = Math.max(0, ...entries.map(unitOf));
+  const { cards, warnings } = cardsFromRack(entries, idents, Math.max(idents.length - 1, lastWithData));
+  if (idents.length - 1 < Math.max(1, lastWithData)) warnings.push('Could not read the whole module list (CoE 0xF050): units without process data, such as power units, may be missing');
   if (!entries.length) warnings.push('The coupler exposes no process data entries yet');
   return { ok: true, couplerName: coupler.name, eccModel: eccMatch ? `NX-ECC20${eccMatch[1]}` : undefined, cards, warnings };
 }
@@ -294,8 +286,8 @@ export function discoverRack(): RackDiscovery {
  * yet). Reads the coupler's product ID and PDO entry lists ONCE (position 0
  * — the whole rack is one slave) and caches them on om.discoveredRack; each
  * card's own entry/entries are then sliced out fresh via allocateRackEntries. */
-export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warnings: string[] } {
-  const master = getMasterStatus();
+export async function verifyEthercatRack(om: OmronConfig): Promise<{ cards: IoRackCard[]; warnings: string[] }> {
+  const master = await getMasterStatus();
   if (!master.toolAvailable) {
     return {
       cards: om.cards.map(c => ({ ...c, actual: c.model, status: 'ok' as const })),
@@ -311,7 +303,7 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
     warnings.push(`EtherCAT master phase is "${master.phase}", not Operation: the I/O daemon was not running the bus when the rack was read`);
   }
 
-  const slaves = listSlaves();
+  const slaves = await listSlaves();
   const coupler = slaves.find(s => s.position === 0);
   if (!coupler) {
     warnings.push('No EtherCAT slaves detected on the bus');
@@ -322,12 +314,12 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
     warnings.push(`Coupler at position 0 reports "${coupler.name}", expected ${om.eccModel}`);
   }
 
-  const errCount = readCouplerErrorCount();
+  const errCount = await readCouplerErrorCount();
   if (errCount) warnings.push(`Coupler/NX units report ${errCount} current error(s) — remove the cause, then Clear EtherCAT Errors`);
 
-  const productId = getSlaveProductId(0);
+  const productId = await getSlaveProductId(0);
   // Read-only: one look at the master's list. No rescan and no daemon stop - the master scans the bus itself.
-  const rackEntries = getRackPdoEntries(0);
+  const rackEntries = await getRackPdoEntries(0);
   const inputEntries = rackEntries.filter(e => e.dir === 'input');
   const outputEntries = rackEntries.filter(e => e.dir === 'output');
   const allocations = allocateRackEntries(om.cards, inputEntries, outputEntries);
@@ -355,10 +347,11 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
   // category/width as the one expected — it has no notion of slot identity.
   // Cross-check against 0xF050 for every model we have a confirmed ident
   // for; a mismatch overrides an otherwise-"ok" allocation.
-  const identifiedCards = cards.map(card => {
+  const identifiedCards: IoRackCard[] = [];
+  const identify = async (card: (typeof cards)[number]) => {
     if (card.status !== 'ok') return card;
     const expectedIdent = NX_CARD_IDENTS[card.model];
-    const actualIdent = getSlotModuleIdent(card.slot);
+    const actualIdent = await getSlotModuleIdent(card.slot);
     if (expectedIdent === undefined) {
       // no confirmed ident for this model — can't verify beyond PDO-count allocation, but surface what the bus reports so it can be added
       const likely = actualIdent === null ? undefined : NX_IDENT_HINTS[actualIdent];
@@ -375,44 +368,10 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
       return { ...card, status: 'mismatch' as const };
     }
     return card;
-  });
+  };
+  for (const card of cards) identifiedCards.push(await identify(card));
 
   return { cards: identifiedCards, warnings };
-}
-
-/** Cheap, poll-safe rack presence check for the watchdog — same coupler-
- * presence + PDO-entry-count check as verifyEthercatRack() above, but never
- * touches om.discoveredRack or card.pdoEntries — only a full Read Rack
- * refreshes those.
- *
- * If the master itself can't be reached, that's treated as every card going
- * missing (can't verify == can't trust), not silently skipped — losing the
- * ability to check the rack at all is worse than a single wrong card, and the
- * watchdog must fail safe, not fail silent. */
-export function checkRackPresence(om: OmronConfig): { cards: IoRackCard[]; unreachable?: string } {
-  const master = getMasterStatus();
-  if (!master.toolAvailable) {
-    return {
-      cards: om.cards.map(c => ({ ...c, actual: undefined, status: 'missing' as const })),
-      unreachable: master.error ?? 'unknown reason',
-    };
-  }
-
-  const slaves = listSlaves();
-  const coupler = slaves.find(s => s.position === 0);
-  if (!coupler) return { cards: om.cards.map(c => ({ ...c, actual: undefined, status: 'missing' as const })) };
-  const expectedCoupler = om.eccModel.replace('NX-', '');
-  if (!coupler.name.toUpperCase().includes(expectedCoupler)) {
-    return { cards: om.cards.map(c => ({ ...c, actual: coupler.name, status: 'mismatch' as const })) };
-  }
-
-  const rackEntries = getRackPdoEntries(0);
-  const inputEntries = rackEntries.filter(e => e.dir === 'input');
-  const outputEntries = rackEntries.filter(e => e.dir === 'output');
-  const allocations = allocateRackEntries(om.cards, inputEntries, outputEntries);
-  return {
-    cards: om.cards.map(card => ({ ...card, actual: coupler.name, status: allocations.get(card.slot)!.status })),
-  };
 }
 
 // Analog (AI/AO) and load-cell (SCALE) channels need a per-model confirmed
@@ -548,9 +507,11 @@ export function syncIoConf(
         // refuses an unattended non-root caller with "Interactive authentication
         // required" -- install.sh's NOPASSWD sudoers grant is for exactly this
         // command, so it must actually be invoked via sudo to take effect.
-        execFileSync('sudo', ['-n', '/bin/systemctl', 'restart', 'feedmill-io-daemon.service'], { timeout: 3000 });
+        // Not waited for: the daemon's state file shows the result. An error means a dev machine, no daemon installed, or no
+        // permission to manage the service.
+        execFile('sudo', ['-n', '/bin/systemctl', 'restart', 'feedmill-io-daemon.service'], { timeout: 10000 }, () => {});
       } catch {
-        // dev machine, daemon not installed, or this process lacks permission to manage the service
+        // the command could not even be spawned
       }
     }
   } catch {
@@ -564,8 +525,7 @@ export function syncIoConf(
 // response SID, 0x600B response) aren't in the default PDO map, so they're
 // reached by SDO at the coupler's per-unit shifted index: base + (unit-1)*0x20.
 // UNVERIFIED on hardware (SDO access to these NX objects through the coupler,
-// and `ethercat download -t float`). Blocks the event loop while it runs
-// (same shortcut as runEthercat above) — an explicit operator action, ~<1s.
+// and `ethercat download -t float`).
 export type ScaleCalStep = { cmd: number; data?: number };
 
 const RS1201_CAL_ERRORS: Record<number, string> = {
@@ -575,34 +535,34 @@ const RS1201_CAL_ERRORS: Record<number, string> = {
   4: 'calibration failed (AD error, over/under range during calibration, or non-volatile write failed)',
 };
 
-const sleepMs = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const sleepMs = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
-export function runRs1201Calibration(unit: number, steps: ScaleCalStep[]): { ok: boolean; error?: string } {
+export async function runRs1201Calibration(unit: number, steps: ScaleCalStep[]): Promise<{ ok: boolean; error?: string }> {
   const at = (base: number) => '0x' + (base + (unit - 1) * 0x20).toString(16);
   const write = (type: 'uint16' | 'float', base: number, v: number) =>
     runEthercat(['download', '-p', '0', '-t', type, at(base), '1', String(v)]);
-  const waitSid = (sid: number): boolean => {
+  const waitSid = async (sid: number): Promise<boolean> => {
     const t0 = Date.now();
     while (Date.now() - t0 < 1000) {
-      const r = sdoUpload('uint16', at(0x600a), '1');
+      const r = await sdoUpload('uint16', at(0x600a), '1');
       if (r === sid) return true;
-      sleepMs(20);
+      await sleepMs(20);
     }
     return false;
   };
 
-  let w = write('uint16', 0x7001, 0); // reset SID to 0 first (W565: response SID must follow)
+  let w = await write('uint16', 0x7001, 0); // reset SID to 0 first (W565: response SID must follow)
   if (w.out === null) return { ok: false, error: w.error };
-  if (!waitSid(0)) return { ok: false, error: 'calibration SID did not reset (is the unit in message-enabled/operational state?)' };
+  if (!await waitSid(0)) return { ok: false, error: 'calibration SID did not reset (is the unit in message-enabled/operational state?)' };
 
   let sid = 0;
   for (const step of steps) {
     sid = sid % 255 + 1; // 1..255, wraps back to 1
-    if (step.data !== undefined) { w = write('float', 0x7003, step.data); if (w.out === null) return { ok: false, error: w.error }; }
-    w = write('uint16', 0x7002, step.cmd); if (w.out === null) return { ok: false, error: w.error };
-    w = write('uint16', 0x7001, sid); if (w.out === null) return { ok: false, error: w.error };
-    if (!waitSid(sid)) return { ok: false, error: `no response to calibration command 0x${step.cmd.toString(16)} within 1 s` };
-    const resp = sdoUpload('uint16', at(0x600b), '1');
+    if (step.data !== undefined) { w = await write('float', 0x7003, step.data); if (w.out === null) return { ok: false, error: w.error }; }
+    w = await write('uint16', 0x7002, step.cmd); if (w.out === null) return { ok: false, error: w.error };
+    w = await write('uint16', 0x7001, sid); if (w.out === null) return { ok: false, error: w.error };
+    if (!await waitSid(sid)) return { ok: false, error: `no response to calibration command 0x${step.cmd.toString(16)} within 1 s` };
+    const resp = await sdoUpload('uint16', at(0x600b), '1');
     if (resp !== 0) return { ok: false, error: `command 0x${step.cmd.toString(16)}: ${RS1201_CAL_ERRORS[resp ?? -1] ?? `response ${resp}`}` };
   }
   return { ok: true };

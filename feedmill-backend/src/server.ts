@@ -4,7 +4,7 @@ import cors from 'cors';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { Mill } from './mill.js';
-import type { Command, StateSnapshot } from './types.js';
+import type { Command, CommandResult, StateSnapshot } from './types.js';
 import { reconcileScaleReaders } from './scaleReader.js';
 import { registerUpdateRoutes } from './updateApi.js';
 import { registerBackupRoutes } from './backupApi.js';
@@ -61,8 +61,9 @@ wssHmi.on('connection', (ws) => {
       if (msg.type === 'command') {
         requestId = msg.data?.requestId;
         const result = mill.processCommand(msg.data as Command);
-        ws.send(JSON.stringify({ type: 'command_result', data: result }));
-        pushSoon();
+        const reply = (data: CommandResult) => { ws.send(JSON.stringify({ type: 'command_result', data })); pushSoon(); };
+        if (result.later) { pushSoon(); result.later.then(reply).catch(err => console.error('HMI reply failed:', err)); }
+        else reply(result);
       }
     } catch (err) {
       console.error('HMI command failed:', err);
@@ -108,14 +109,14 @@ app.get('/api/v1/state', (_req, res) => {
   res.json(mill.getSnapshot());
 });
 
-app.post('/api/v1/commands', (req, res) => {
+app.post('/api/v1/commands', async (req, res) => {
   const cmd = req.body as Command;
   if (!cmd.requestId || !cmd.action) {
     res.status(400).json({ error: 'Missing requestId or action' });
     return;
   }
   const result = mill.processCommand(cmd);
-  res.json(result);
+  res.json(await (result.later ?? result));
 });
 
 app.get('/api/v1/trend/:id', (req, res) => {

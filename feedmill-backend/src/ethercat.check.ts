@@ -1,6 +1,6 @@
 // Rack allocation check (no hardware needed): RS1201 must be recognised wherever it sits in the rack.
 import assert from 'node:assert/strict';
-import { allocateRackEntries, cardsFromRack, discoverRack, generateIoConf, verifyEthercatRack } from './ethercat.js';
+import { allocateRackEntries, cardsFromRack, discoverRack, generateIoConf, syncIoConf, verifyEthercatRack } from './ethercat.js';
 import type { IoRackCard } from './types.js';
 import { NX_CARD_CATALOG } from './types.js';
 
@@ -70,27 +70,39 @@ const cp = require('child_process'), fs = require('fs');
 const confPath = require('path').join(require('os').tmpdir(), `io-check-${process.pid}.conf`);
 process.env.FEEDMILL_IO_CONF_PATH = confPath; // never touch a real io.conf
 fs.writeFileSync(confPath, 'old conf\n');
-cp.execFileSync = (cmd: string, args: string[]) => {
+const answer = (cmd: string, args: string[]) => {
   if (cmd === 'sudo' || args[0] === 'rescan') { disturbed++; return ''; }
   if (args[0] === 'master') return 'Phase: Operation\nSlaves: 1\nLink: UP\n';
   if (args[0] === 'slaves') return args.includes('-v') ? 'Product code: 0x000000a7\n' : '0  0:0  OP  +  NX-ECC203\n';
-  if (args[0] !== 'pdos') return args.includes('0xf050') ? (args[args.length - 1] === '1' ? `0x00135256 ${0x00135256}\n` : `0x00115442 ${0x00115442}\n`) : '0x00 0\n';
+  if (args[0] !== 'pdos') {
+    if (!args.includes('0xf050')) return '0x00 0\n';
+    // W519 A-7: subindex 0 is the list's size (always 0x7D = 125), not the number of units; empty positions read 0
+    const v = [125, 0x00135256, 0x00115442][Number(args[args.length - 1])] ?? 0;
+    return `0x${v.toString(16)} ${v}\n`;
+  }
   pdoReads++;
   if (empty) return '';
   return 'RxPDO 0x1600\n PDO entry 0x7002:01, 16 bit\n' + (partial ? '' : 'TxPDO 0x1a00\n PDO entry 0x6022:01, 16 bit\n');
 };
+cp.execFile = (cmd: string, args: string[], _opts: unknown, done: (e: null, out: string, err: string) => void) => { setImmediate(() => done(null, answer(cmd, args), '')); };
 const rackOm: any = { couplerType: 'NX-ECC', eccModel: 'NX-ECC203', cards: [card(1, 'NX-OD5256'), card(2, 'NX-ID5442')] };
-const read = verifyEthercatRack(rackOm);
-assert.equal(pdoReads, 1); assert.ok(read.cards.every(c => c.status === 'ok'));
-assert.ok(discoverRack().cards.some(c => c.model === 'NX-ID5442'));
-for (const lose of [() => { partial = true; }, () => { empty = true; }]) {
-  lose();
-  const gone = verifyEthercatRack(rackOm);
-  assert.equal(gone.cards[1].status, 'missing', 'what the bus does not list is still reported');
-  assert.equal(rackOm.discoveredRack.inputEntries.length, 1, 'the good map is kept');
-  assert.ok(gone.warnings.some(w => w.includes('keeping the last good one')) && gone.warnings.some(w => w.includes('inputs: none')));
-}
-assert.equal(disturbed, 0, 'no rescan and no daemon restart from reading');
-assert.equal(fs.readFileSync(confPath, 'utf8'), 'old conf\n');
-fs.rmSync(confPath, { force: true });
-console.log('ethercat checks passed');
+(async () => {
+  const read = await verifyEthercatRack(rackOm);
+  assert.equal(pdoReads, 1); assert.ok(read.cards.every(c => c.status === 'ok'));
+  assert.equal((await discoverRack()).cards.map(c => c.model).join(), 'NX-OD5256,NX-ID5442', 'only the installed units, no phantom cards');
+  for (const lose of [() => { partial = true; }, () => { empty = true; }]) {
+    lose();
+    const gone = await verifyEthercatRack(rackOm);
+    assert.equal(gone.cards[1].status, 'missing', 'what the bus does not list is still reported');
+    assert.equal(rackOm.discoveredRack.inputEntries.length, 1, 'the good map is kept');
+    assert.ok(gone.warnings.some(w => w.includes('keeping the last good one')) && gone.warnings.some(w => w.includes('inputs: none')));
+  }
+  assert.equal(disturbed, 0, 'no rescan and no daemon restart from reading');
+  assert.equal(fs.readFileSync(confPath, 'utf8'), 'old conf\n');
+  // a changed config restarts the daemon once, an unchanged one not at all
+  for (let i = 0; i < 2; i++) syncIoConf(rackOm, [], [], []);
+  await new Promise(r => setImmediate(r));
+  assert.equal(disturbed, 1);
+  fs.rmSync(confPath, { force: true });
+  console.log('ethercat checks passed');
+})().catch(e => { console.error(e); process.exit(1); });

@@ -112,4 +112,22 @@ reset(); (m as any).raiseFault('A1', 'WARNING', 'keep', 'W-KEEP');
 for (let i = 0; i < 300; i++) { (m as any).raiseFault('A1', 'WARNING', 'x', `W-X-${i}`); (m as any).clearFault(`W-X-${i}`); }
 assert.equal(m.getSnapshot().faults.length, 200); assert.ok(active('W-KEEP'));
 
-console.log('fault checks passed');
+// ── entries the daemon could not register: one fault naming them, inputs read off, cleared once they are back ──
+reset(); Object.assign(m.omronConfig, { couplerType: 'NX-ECC', rackVerified: true }); m.dtMs = 20; m.lastDaemonStartUs = null;
+m.signals.push({ id: 'I:02.00', direction: 'DI', label: 'x' }); m.ioInputs['I:02.00'] = true;
+const daemon = (missing: string[]) => ({ healthy: true, daemonStartUs: 1, atUs: 0, inputs: {}, rotation: {}, missing });
+m.updateBusHealth(daemon(['I:02.00'])); m.readRealInputs(daemon(['I:02.00']));
+assert.ok(active('E-OM-03')); assert.match(m.faults.find((f: any) => f.code === 'E-OM-03').message, /I:02\.00/);
+assert.equal(m.ioInputs['I:02.00'], false, 'a missing input is not held at its old value');
+m.updateBusHealth(null); assert.ok(active('E-OM-03'), 'no daemon data: nothing proves they are back');
+m.updateBusHealth(daemon([])); assert.ok(!active('E-OM-03'));
+
+// ── a bus read answers later; nothing else may use the coupler or edit the config until it has ──
+reset(); m.omronConfig.couplerType = 'none';
+const probe = () => cmd('ReadOmronRack', undefined, { probe: true });
+const first: any = probe(); assert.ok(first.later);
+assert.match((probe() as any).reason, /rack is being read/i);
+first.later.then(() => {
+  assert.equal(m.guardConfigEdit(), null, 'free again once it has answered');
+  console.log('fault checks passed');
+}).catch((e: unknown) => { console.error(e); process.exit(1); });

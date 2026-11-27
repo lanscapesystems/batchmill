@@ -7,7 +7,7 @@ import {
   NX_CARD_CATALOG, NX_BUS_POWER_BUDGET_W, NX_MAX_UNITS, ECC_MODEL_MIN_CYCLE_US,
   EQUIPMENT_DEFS,
 } from './types.js';
-import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresence, clearCouplerErrors, runRs1201Calibration, SCALE_ID_RE, type ScaleCalStep } from './ethercat.js';
+import { verifyEthercatRack, discoverRack, syncIoConf, clearCouplerErrors, runRs1201Calibration, SCALE_ID_RE, type ScaleCalStep } from './ethercat.js';
 import { MovingAverage, OnDelay, LoadPid, RelayTuner, scaleLinear } from './loadControl.js';
 import { Debounce } from './monitors.js';
 import { scaleLines, freefallAdjust, toleranceFor, feedsOnlyHammermill, flowPath, round1 } from './batchLogic.js';
@@ -23,14 +23,9 @@ import {
 // FIXED_DT_MS (env SCAN_MS) replaces the measurement with a constant - for the behaviour checks, which call scan() in a tight loop.
 const SCAN_MS = 20;
 const FIXED_DT_MS = Number(process.env.SCAN_MS) || 0;
-// A scan that comes after a stall (the synchronous ethercat CLI calls, a long GC) integrates at most this much: the inputs were
+// A scan that comes after a stall (a slow disk write, a long GC) integrates at most this much: the inputs were
 // not being read during the stall, so timers must not leap on stale data and the PI loops must not take one huge step.
 const MAX_DT_MS = 500;
-// How often the rack watchdog polls `ethercat slaves` for a card going missing/
-// mismatched after commissioning. Deliberately NOT inside scan() — it shells out
-// to the ethercat CLI (blocking, up to its 3s timeout), which the control
-// loop can't afford.
-const RACK_WATCHDOG_MS = 3000;
 // Bus health filter: one bad sample must not trip a fault. Bad time builds up and drains at a quarter of the rate, so lone
 // glitches die away but a chattering bus still trips; once tripped, only this long fully healthy clears it.
 const BUS_TRIP_MS = 200;
@@ -153,7 +148,7 @@ export class Mill {
   private hornInPrev = false;
   private hornOn = false;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
-  private rackWatchdogHandle: ReturnType<typeof setInterval> | null = null;
+  private rackBusy = false; // a bus read or calibration is running in the background (see busJob)
   private onChange?: () => void;
 
   constructor() {
@@ -208,35 +203,11 @@ export class Mill {
   start(onChange: () => void) {
     this.onChange = onChange;
     this.intervalHandle = setInterval(() => this.scan(), SCAN_MS);
-    this.rackWatchdogHandle = setInterval(() => this.rackWatchdogCheck(), RACK_WATCHDOG_MS);
   }
 
   stop() {
     if (this.intervalHandle) clearInterval(this.intervalHandle);
-    if (this.rackWatchdogHandle) clearInterval(this.rackWatchdogHandle);
     closeDb();
-  }
-
-  // Confirmed-good rack, left running: re-checks presence/identity against
-  // the bus every RACK_WATCHDOG_MS and faults (E-OM-01, via verifyRack) if a
-  // card goes missing or changes — same check Read Rack does, minus the
-  // per-card PDO discovery, so it's cheap enough to poll continuously.
-  // Doesn't run until the operator has confirmed the rack once (rackVerified).
-  private rackWatchdogCheck() {
-    const om = this.omronConfig;
-    if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return;
-    // The CLI calls below block the whole backend (HMI included). While the daemon's cyclic exchange is complete and no card
-    // is flagged, the coupler is there and there is nothing to clear: poll only when one of those isn't true.
-    if (this.busState === 'ok' && om.cards.every(c => c.status === 'ok')) return;
-    const result = checkRackPresence(om);
-    om.cards = result.cards;
-    if (result.unreachable) {
-      // Can't verify at all — fail safe with the same shutdown response as a
-      // genuine mismatch, not a bare fault with no protective action.
-      this.rackFaultShutdown([`cannot verify rack: ${result.unreachable}`]);
-      return;
-    }
-    this.verifyRack();
   }
 
   private applyConfig(cfg: MillConfig): void {
@@ -694,24 +665,24 @@ export class Mill {
         if (guardErr) return reject(guardErr);
         // probe: read the rack off the bus while the coupler is still being set up (nothing saved, no cards needed)
         if (cmd.parameters?.probe === true) {
-          const r = discoverRack();
-          return r.ok ? { ...ok(`${r.cards.length} unit(s) detected`), data: r } : reject(r.error ?? 'Rack read failed');
+          return this.busJob(cmd, async () => {
+            const r = await discoverRack();
+            return r.ok ? { accepted: true, reason: `${r.cards.length} unit(s) detected`, data: r } : { accepted: false, reason: r.error ?? 'Rack read failed' };
+          });
         }
         if (this.omronConfig.couplerType === 'none') return reject('No coupler configured');
-        this.readOmronRack();
-        this.persistConfig(); // discoveredRack must survive a restart, or every reboot would need a fresh Read Rack
-        return ok();
+        return this.busJob(cmd, () => this.readAndSaveRack());
       }
 
       case 'ClearEthercatErrors': {
         if (this.omronConfig.couplerType !== 'NX-ECC') return reject('Only supported for NX-ECC couplers');
         const guardErr = this.guardConfigEdit(); // the re-read can rewrite io.conf and restart the daemon: not while running
         if (guardErr) return reject(guardErr);
-        const r = clearCouplerErrors();
-        if (!r.ok) return reject(`Could not clear coupler errors: ${r.error ?? 'unknown'}`);
-        this.readOmronRack(); // re-read so the rack status/warnings reflect what's still wrong
-        this.persistConfig();
-        return ok();
+        return this.busJob(cmd, async () => {
+          const r = await clearCouplerErrors();
+          if (!r.ok) return { accepted: false, reason: `Could not clear coupler errors: ${r.error ?? 'unknown'}` };
+          return this.readAndSaveRack(); // re-read so the rack status/warnings reflect what's still wrong
+        });
       }
 
       case 'CalibrateScale': {
@@ -740,11 +711,13 @@ export class Mill {
           if (!(w > 0)) return reject('Enter the standard weight');
           steps.push({ cmd: 0x93, data: w }, { cmd: 0x30 });
         } else return reject('Unknown calibration mode');
-        const r = runRs1201Calibration(sc.rackSlot, steps);
-        if (!r.ok) return reject(`Calibration failed: ${r.error}`);
-        sc.calibration = { mode, at: new Date().toISOString(), ...(mode === 'span' ? { standardWeight: Number(cmd.parameters?.standardWeight) } : {}) };
-        this.persistConfig();
-        return ok();
+        return this.busJob(cmd, async () => {
+          const r = await runRs1201Calibration(sc.rackSlot, steps);
+          if (!r.ok) return { accepted: false, reason: `Calibration failed: ${r.error}` };
+          sc.calibration = { mode, at: new Date().toISOString(), ...(mode === 'span' ? { standardWeight: Number(cmd.parameters?.standardWeight) } : {}) };
+          this.persistConfig();
+          return { accepted: true };
+        });
       }
 
       case 'SetEquipmentPositions': {
@@ -794,8 +767,20 @@ export class Mill {
     }
   }
 
+  // Anything that talks to the coupler runs in the background, so the scan and the screens never wait on the bus. The real
+  // answer is `later`; until it resolves no other config edit or bus command is accepted.
+  private busJob(cmd: Command, job: () => Promise<Pick<CommandResult, 'accepted' | 'reason' | 'data'>>): CommandResult {
+    const answer = (r: Pick<CommandResult, 'accepted' | 'reason' | 'data'>) => ({ requestId: cmd.requestId, revision: this.revision, ...r });
+    this.rackBusy = true;
+    const later = job()
+      .catch(e => { console.error(`${cmd.action} failed:`, e); return { accepted: false, reason: 'Internal error' }; })
+      .then(r => { this.rackBusy = false; return answer(r); });
+    return { ...answer({ accepted: true }), later };
+  }
+
   // Config edits, scale calibration and software updates need: batch paused (or none), hammermills disabled, motors not running.
   guardConfigEdit(): string | null {
+    if (this.rackBusy) return 'The rack is being read - try again in a moment';
     if (this.activeBatch && !['PAUSED', 'COMPLETED', 'FAULTED', 'IDLE'].includes(this.activeBatch.state)) {
       return 'Pause the batch first';
     }
@@ -1123,8 +1108,8 @@ export class Mill {
         // NX-ECC: the rack read below writes io.conf once, after reading the rack - no extra restart here
         this.buildSignals(this.omronConfig.couplerType !== 'NX-ECC');
         // every save verifies the rack against the bus (a mismatch raises the rack fault, as the old Verify Rack did)
-        if (this.omronConfig.couplerType !== 'none') this.readOmronRack();
-        return ok();
+        if (this.omronConfig.couplerType === 'none') return ok();
+        return this.busJob(cmd, () => this.readAndSaveRack());
       }
 
       default:
@@ -1180,6 +1165,8 @@ export class Mill {
     for (const sig of this.signals) {
       if (sig.direction !== 'DI' && sig.direction !== 'AI') continue;
       if (sig.id in this.ioOverrides) continue;
+      // not on the bus: read as off / zero (a normally-closed contact then trips), never hold what it read before
+      if (state.missing?.includes(sig.id)) { this.ioInputs[sig.id] = sig.direction === 'DI' ? false : 0; continue; }
       let v = state.inputs[sig.id];
       if (v !== undefined && sig.direction === 'AI' && typeof v === 'number') {
         // 32767 = wire break (W522 §6-2): hold nothing, fault it, never present it as a reading
@@ -1244,6 +1231,10 @@ export class Mill {
     } else if (!unhealthy) {
       this.clearFault('E-OM-02');
     }
+    const missing = state?.missing;
+    if (missing?.length) {
+      this.ioFaultShutdown('E-OM-03', `I/O not on the bus: ${missing.slice(0, 6).join(', ')}${missing.length > 6 ? ` and ${missing.length - 6} more` : ''}`);
+    } else if (state) this.clearFault('E-OM-03');
   }
 
   private updateEquipmentStates() {
@@ -2696,11 +2687,17 @@ export class Mill {
     for (let i = this.faults.length - 1; i >= 0 && this.faults.length > MAX_FAULTS; i--) if (!this.faults[i].active) this.faults.splice(i, 1);
   }
 
-  private readOmronRack() {
+  private async readAndSaveRack() {
+    await this.readOmronRack();
+    this.persistConfig(); // discoveredRack must survive a restart, or every reboot would need a fresh Read Rack
+    return { accepted: true };
+  }
+
+  private async readOmronRack() {
     const om = this.omronConfig;
     let driverWarnings: string[] = [];
     if (om.couplerType === 'NX-ECC') {
-      const result = verifyEthercatRack(om);
+      const result = await verifyEthercatRack(om);
       om.cards = result.cards;
       driverWarnings = result.warnings;
     } else {
@@ -2787,7 +2784,7 @@ export class Mill {
     if (mismatched.length > 0) {
       this.rackFaultShutdown(mismatched);
     } else {
-      this.clearRackFault(); // rack matches again (e.g. a reseated card) — the watchdog resolves this on its own
+      this.clearRackFault(); // the latest rack read matches again (e.g. a reseated card)
     }
   }
 
@@ -2818,7 +2815,7 @@ export class Mill {
     if (idx >= 0) {
       this.faults[idx].active = false;
       this.faults[idx].clearedAt = new Date().toISOString();
-      persistFault(this.faults[idx]); // now runs from the watchdog too, not just on reconfigure — keep fault_log in sync
+      persistFault(this.faults[idx]); // keep fault_log in sync
     }
   }
 

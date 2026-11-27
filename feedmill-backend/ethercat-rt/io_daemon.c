@@ -120,6 +120,7 @@ typedef struct {
     uint16_t   pdo_index;
     uint8_t    pdo_subindex;
     chan_dir_t dir;
+    bool       missing;        /* its PDO entry failed to register: never read or written, listed as "missing" in the state file */
     unsigned   cfg_bit;        /* from config: DI/DO point's bit position within the registered word; 0 and unused for AI/AO/SCALE */
     bool       counted;        /* DI only: also edge-count (rotation sensors) */
     unsigned   offset;         /* final byte offset into the domain process image, computed at setup time */
@@ -272,7 +273,7 @@ static void *writer_thread(void *arg) {
             bool first = true;
             for (int i = 0; i < n_channels; i++) {
                 channel_t *c = &channels[i];
-                if (c->dir != DIR_DI && c->dir != DIR_AI && c->dir != DIR_SCALE) continue;
+                if (c->missing || (c->dir != DIR_DI && c->dir != DIR_AI && c->dir != DIR_SCALE)) continue; /* absent, not "false" */
                 int32_t v = __atomic_load_n(&c->value, __ATOMIC_RELAXED);
                 fprintf(f, "%s\"%s\":", first ? "" : ",", c->signal_id);
                 if (c->dir == DIR_DI) fprintf(f, "%s", v ? "true" : "false");
@@ -283,7 +284,7 @@ static void *writer_thread(void *arg) {
             first = true;
             for (int i = 0; i < n_channels; i++) {
                 channel_t *c = &channels[i];
-                if (!(c->dir == DIR_DI && c->counted)) continue;
+                if (c->missing || !(c->dir == DIR_DI && c->counted)) continue;
                 uint64_t cnt = __atomic_load_n(&c->count, __ATOMIC_RELAXED);
                 uint64_t edge = __atomic_load_n(&c->last_edge_us, __ATOMIC_RELAXED);
                 uint64_t interval = __atomic_load_n(&c->edge_interval_us, __ATOMIC_RELAXED);
@@ -292,7 +293,14 @@ static void *writer_thread(void *arg) {
                         (unsigned long long)cnt, (unsigned long long)edge, (unsigned long long)interval);
                 first = false;
             }
-            fprintf(f, "}}\n");
+            fprintf(f, "},\"missing\":[");
+            first = true;
+            for (int i = 0; i < n_channels; i++) {
+                if (!channels[i].missing) continue;
+                fprintf(f, "%s\"%s\"", first ? "" : ",", channels[i].signal_id);
+                first = false;
+            }
+            fprintf(f, "]}\n");
             fclose(f);
             rename(tmp_path, state_path); /* atomic on the same filesystem — readers never see a half-written file */
         }
@@ -446,6 +454,7 @@ static void setup_ethercat(void) {
         }
     }
 
+    int n_missing = 0;
     for (int i = 0; i < n_channels; i++) {
         channel_t *c = &channels[i];
         ec_slave_config_t *sc = slaves[c->slave_idx].sc;
@@ -455,12 +464,15 @@ static void setup_ethercat(void) {
             unsigned bitpos = 0;
             int off = ecrt_slave_config_reg_pdo_entry(sc, c->pdo_index, c->pdo_subindex, domain, &bitpos);
             if (off < 0) {
+                /* Skip just this channel and report it: exiting would take every other channel down with it. */
                 fprintf(stderr,
-                    "io_daemon: failed to register PDO entry %04x:%02x for %s (slave pos %u) — "
+                    "io_daemon: failed to register PDO entry %04x:%02x for %s (slave pos %u) — channel skipped; "
                     "check it's in the slave's active PDO mapping (`ethercat pdos -p %u`)\n",
                     c->pdo_index, c->pdo_subindex, c->signal_id,
                     slaves[c->slave_idx].position, slaves[c->slave_idx].position);
-                exit(1);
+                c->missing = true;
+                n_missing++;
+                continue;
             }
             base_off = (unsigned)off;
             base_bit = bitpos;
@@ -483,7 +495,8 @@ static void setup_ethercat(void) {
         }
     }
 
-    if (ecrt_domain_size(domain) <= 0) { fprintf(stderr, "io_daemon: empty domain\n"); exit(1); }
+    /* nothing at all registered (coupler absent or not scanned yet): exit so systemd retries */
+    if (n_missing == n_channels || ecrt_domain_size(domain) <= 0) { fprintf(stderr, "io_daemon: empty domain\n"); exit(1); }
     /* Matches the known-working bench tool's setup -- tells the master the
      * actual cyclic rate so its internal timing isn't left at a default
      * that may not match this cycle_us. */
@@ -540,6 +553,7 @@ static void run_cycle(void) {
     uint64_t t = now_us();
     for (int i = 0; i < n_channels; i++) {
         channel_t *c = &channels[i];
+        if (c->missing) continue; /* has no place in the process image */
         switch (c->dir) {
         case DIR_DI: {
             if (!healthy) break;

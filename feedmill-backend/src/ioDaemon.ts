@@ -35,6 +35,7 @@ interface IoStateFile {
   healthy: boolean; // per-cycle bus validity (link up + complete working counter) -- false means inputs/rotation below are frozen at last-good, not live
   inputs: Record<string, SignalValue>;
   rotation: Record<string, RotationChannelState>;
+  missing?: string[]; // configured signals whose PDO entry the daemon couldn't register (absent from a daemon older than 0.1.28)
 }
 
 /**
