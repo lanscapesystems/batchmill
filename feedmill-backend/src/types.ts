@@ -423,7 +423,6 @@ export interface DiscoveredRack {
   productId: number;
   inputEntries: PdoEntry[];  // in physical rack order among DI/AI/scale cards
   outputEntries: PdoEntry[]; // in physical rack order among DO/AO cards
-  analogProblems?: Record<string, string>; // signal id -> why that analog point must not be used (unit settings read at the last Read Rack)
 }
 
 export interface IoRackCard {

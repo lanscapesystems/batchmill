@@ -1,5 +1,4 @@
-import { execFile, execFileSync } from 'child_process';
-import { promisify } from 'util';
+import { execFileSync } from 'child_process';
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import type { OmronConfig, IoRackCard, EquipmentRuntime, SignalDef, ScaleConfig, PdoEntry } from './types.js';
 import { NX_CARD_CATALOG, OMRON_VENDOR_ID } from './types.js';
@@ -31,10 +30,9 @@ export interface EthercatSlave {
 // finding) demands it — would need runEthercat and every caller async
 // (execFile, not execFileSync), which ripples into mill.ts's command
 // dispatch; not done here. See ethercat-io-audit.md's P1 timing finding.
-function runEthercat(args: string[], encoding: 'utf8' | 'latin1' = 'utf8'): { out: string | null; error?: string } {
-  const t0 = Date.now();
+function runEthercat(args: string[]): { out: string | null; error?: string } {
   try {
-    return { out: execFileSync('ethercat', args, { encoding, timeout: 3000 }) };
+    return { out: execFileSync('ethercat', args, { encoding: 'utf8', timeout: 3000 }) };
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { stderr?: Buffer | string };
     if (e.code === 'ENOENT') return { out: null, error: 'ethercat CLI not found on PATH' };
@@ -43,32 +41,14 @@ function runEthercat(args: string[], encoding: 'utf8' | 'latin1' = 'utf8'): { ou
     // unprivileged user, and /dev/EtherCAT0 is root-owned until a udev rule grants
     // group access (see install.sh) — that shows up here as an EACCES in stderr/message.
     return { out: null, error: stderr || e.message || 'ethercat command failed' };
-  } finally {
-    // each of these freezes the whole backend (HMI commands, scan) while it runs: make the slow ones visible in the journal
-    const ms = Date.now() - t0;
-    if (ms > 300) console.warn(`[ethercat] blocked the backend ${ms} ms: ethercat ${args.join(' ')}`);
-  }
-}
-
-const execFileAsync = promisify(execFile);
-/** Non-blocking twin of runEthercat for the periodic polls (rack watchdog, coupler error read): the sync one freezes the whole
- * event loop, and 2 s without a command write makes the io_daemon zero every output. */
-async function runEthercatAsync(args: string[], encoding: 'utf8' | 'latin1' = 'utf8'): Promise<{ out: string | null; error?: string }> {
-  try {
-    const { stdout } = await execFileAsync('ethercat', args, { encoding, timeout: 3000 });
-    return { out: stdout };
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException & { stderr?: string };
-    if (e.code === 'ENOENT') return { out: null, error: 'ethercat CLI not found on PATH' };
-    return { out: null, error: (e.stderr ? String(e.stderr).trim() : '') || e.message || 'ethercat command failed' };
   }
 }
 
 // shortcut: parses the default IgH `ethercat` CLI text format (tested against documented
 // `ethercat master`/`ethercat slaves` samples, not live hardware). If the installed IgH
 // version's column layout differs, update these regexes against `ethercat --version`.
-export function getMasterStatus(): EthercatMasterStatus { return parseMaster(runEthercat(['master'])); }
-function parseMaster({ out, error }: { out: string | null; error?: string }): EthercatMasterStatus {
+export function getMasterStatus(): EthercatMasterStatus {
+  const { out, error } = runEthercat(['master']);
   if (out === null) return { toolAvailable: false, error };
   const phase = /Phase:\s*(.+)/.exec(out)?.[1]?.trim();
   const slaveCountStr = /Slaves:\s*(\d+)/.exec(out)?.[1];
@@ -81,8 +61,8 @@ function parseMaster({ out, error }: { out: string | null; error?: string }): Et
   };
 }
 
-export function listSlaves(): EthercatSlave[] { return parseSlaves(runEthercat(['slaves']).out); }
-function parseSlaves(out: string | null): EthercatSlave[] {
+export function listSlaves(): EthercatSlave[] {
+  const { out } = runEthercat(['slaves']);
   if (out === null) return [];
   const slaves: EthercatSlave[] = [];
   for (const line of out.split('\n')) {
@@ -114,8 +94,8 @@ function getSlaveProductId(position: number): number | null {
 // diagnostics/padding, not a card's data. Called ONCE for the whole rack
 // (position 0, the coupler) — see allocateRackEntries for how individual
 // cards' entries get sliced out of the result.
-function getRackPdoEntries(position: number): PdoEntry[] { return parsePdoEntries(runEthercat(['pdos', '-p', String(position)]).out); }
-function parsePdoEntries(out: string | null): PdoEntry[] {
+function getRackPdoEntries(position: number): PdoEntry[] {
+  const { out } = runEthercat(['pdos', '-p', String(position)]);
   if (out === null) return [];
   const entries: PdoEntry[] = [];
   let dir: PdoEntry['dir'] | null = null;
@@ -144,12 +124,6 @@ const NX_CARD_IDENTS: Record<string, number> = {
   'NX-ID5442': 0x00115442,
   'NX-RS1201': 0x00251201,
   'NX-AD3203': 0x00213203,
-  // NOT confirmed on hardware: derived from the pattern of the confirmed codes above (0x00 + category byte + model digits;
-  // DI 0x11, DO 0x13, AI 0x21, load cell 0x25, so analog output = 0x23). A wrong guess shows as a "wrong card" mismatch
-  // on Read Rack with the real code in the warning: replace the value then.
-  'NX-DA3203': 0x00233203,
-  'NX-DA3205': 0x00233205,
-  'NX-DA3603': 0x00233603,
 };
 
 // shortcut: `ethercat upload`'s exact output format for a uint32 SDO
@@ -176,46 +150,6 @@ function getSlotModuleIdent(slot: number): number | null {
 export function readCouplerErrorCount(): number | null {
   const n = sdoUpload('uint8', '0x3809', '0');
   return n === null ? null : Math.max(0, n - 1);
-}
-
-// W519 13-7-3 emergency error codes (the ones that mean something to an operator)
-const COUPLER_ERROR_NAMES: Record<number, string> = {
-  0x5530: 'hardware error', 0x7040: 'unit configuration / control parameter error', 0x7041: 'NX unit communications error',
-};
-
-/** Text for one 23-byte CoE 0x10F3 diagnosis message (ETG.1020 layout: DiagCode u32 LE, flags u16, text id u16, timestamp).
- * shortcut: the layout is the standard one and the code is looked up as either 16-bit half; not checked against a real Omron
- * log - the raw bytes stay in the text so a wrong guess is still readable. Replace with the exact mapping once seen. */
-export function describeDiagnosisMessage(b: number[]): string {
-  if (b.length < 4) return 'no details';
-  const code = (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
-  const name = COUPLER_ERROR_NAMES[code & 0xffff] ?? COUPLER_ERROR_NAMES[code >>> 16];
-  return `${name ?? 'unknown error'} (code 0x${code.toString(16).padStart(8, '0')}, log ${b.map(x => x.toString(16).padStart(2, '0')).join(' ')})`;
-}
-
-/** The active error record (CoE 0x3809:02 Current Error 1, 50 bytes, W519 A-5-2), as text; null = could not read.
- * `ethercat upload -t octet_string` prints the RAW bytes, not hex, so read them as latin1 (1 char = 1 byte; utf8 would corrupt
- * every byte >= 0x80). shortcut: the record's layout isn't decoded - the first 4 bytes are shown as an event code (look it up in
- * W519 13-3-2) with the whole record in hex; map event codes to names once seen on real faults. */
-export function readCouplerErrorDetail(): string | null {
-  const { out } = runEthercat(['upload', '-p', '0', '-t', 'octet_string', '0x3809', '2'], 'latin1');
-  return out === null ? null : formatCouplerErrorDetail(out);
-}
-/** Async twins of the two coupler-error reads, for the periodic poll in mill.ts. */
-export async function readCouplerErrorCountAsync(): Promise<number | null> {
-  const { out } = await runEthercatAsync(['upload', '-p', '0', '-t', 'uint8', '0x3809', '0']);
-  const n = out === null ? NaN : Number(out.trim().split(/\s+/)[0]);
-  return Number.isFinite(n) ? Math.max(0, n - 1) : null;
-}
-export async function readCouplerErrorDetailAsync(): Promise<string | null> {
-  const { out } = await runEthercatAsync(['upload', '-p', '0', '-t', 'octet_string', '0x3809', '2'], 'latin1');
-  return out === null ? null : formatCouplerErrorDetail(out);
-}
-function formatCouplerErrorDetail(out: string): string | null {
-  if (out.length < 4) return null;
-  const b = Array.from(out.slice(0, 50), c => c.charCodeAt(0) & 0xff);
-  const code = (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
-  return `event code 0x${code.toString(16).padStart(8, '0')} (record ${b.map(x => x.toString(16).padStart(2, '0')).join(' ')})`;
 }
 
 /** Clears the coupler's + NX units' current errors by writing 01 to CoE
@@ -353,13 +287,7 @@ export function discoverRack(): RackDiscovery {
  * — the whole rack is one slave) and caches them on om.discoveredRack; each
  * card's own entry/entries are then sliced out fresh via allocateRackEntries. */
 export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warnings: string[] } {
-  let master = getMasterStatus();
-  // Right after an io_daemon (re)start the master is still Idle/Safe-Op for a moment, and SDO reads fail meanwhile: give it up to 4 s
-  // to reach Operation rather than reporting a phase/ident warning that is gone by the time anyone reads it.
-  for (let i = 0; i < 8 && master.toolAvailable && master.phase && !/^op/i.test(master.phase); i++) {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
-    master = getMasterStatus();
-  }
+  const master = getMasterStatus();
   if (!master.toolAvailable) {
     return {
       cards: om.cards.map(c => ({ ...c, actual: c.model, status: 'ok' as const })),
@@ -387,17 +315,13 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
   }
 
   const errCount = readCouplerErrorCount();
-  if (errCount) warnings.push(`Coupler/NX units report ${errCount} current error(s): ${readCouplerErrorDetail() ?? 'details unreadable'} - remove the cause, then clear the EtherCAT fault`);
+  if (errCount) warnings.push(`Coupler/NX units report ${errCount} current error(s) — remove the cause, then Clear EtherCAT Errors`);
 
   const productId = getSlaveProductId(0);
-  let rackEntries = getRackPdoEntries(0);
-  if (!rackEntries.length) rackEntries = getRackPdoEntries(0); // one retry: a single CLI timeout must not look like an empty rack
+  const rackEntries = getRackPdoEntries(0);
   const inputEntries = rackEntries.filter(e => e.dir === 'input');
   const outputEntries = rackEntries.filter(e => e.dir === 'output');
-  // Never replace a good cached discovery with an empty read (CLI timeout / permission error): that would regenerate io.conf
-  // with no channels, restart the daemon idle and persist the loss.
-  if (productId !== null && rackEntries.length) om.discoveredRack = { productId, inputEntries, outputEntries };
-  else if (om.discoveredRack) warnings.push('Could not read the PDO map from the coupler - keeping the last good one');
+  if (productId !== null) om.discoveredRack = { productId, inputEntries, outputEntries };
 
   const allocations = allocateRackEntries(om.cards, inputEntries, outputEntries);
   const cards = om.cards.map(card => {
@@ -415,7 +339,7 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
   const identifiedCards = cards.map(card => {
     if (card.status !== 'ok') return card;
     const expectedIdent = NX_CARD_IDENTS[card.model];
-    const actualIdent = getSlotModuleIdent(card.slot) ?? getSlotModuleIdent(card.slot); // one retry: a single SDO read can time out
+    const actualIdent = getSlotModuleIdent(card.slot);
     if (expectedIdent === undefined) {
       // no confirmed ident for this model — can't verify beyond PDO-count allocation, but surface what the bus reports so it can be added
       if (actualIdent !== null) warnings.push(`${card.model} in slot ${card.slot}: identity not in the verified table (bus reports 0x${actualIdent.toString(16).padStart(8, '0')}) — add to NX_CARD_IDENTS once confirmed`);
@@ -432,49 +356,7 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
     return card;
   });
 
-  // unit settings the analog points depend on (W522): a disabled channel or the wrong load-rejection output is not visible in the PDOs
-  if (om.discoveredRack) {
-    const problems: Record<string, string> = {};
-    for (const card of identifiedCards) {
-      if (card.status !== 'ok') continue;
-      const def = NX_CARD_CATALOG.find(d => d.model === card.model);
-      if (def?.category !== 'AI' && def?.category !== 'AO') continue;
-      const r = checkAnalogSettings(card, def, sdoUpload);
-      Object.assign(problems, r.problems);
-      for (const p of Object.values(r.problems)) warnings.push(p);
-      if (r.unreadable) warnings.push(`${card.model} in slot ${card.slot}: could not read its unit settings over SDO - channel enable and load-rejection settings are unverified`);
-    }
-    om.discoveredRack.analogProblems = problems;
-  }
-
   return { cards: identifiedCards, warnings };
-}
-
-/** W522 unit operation settings, read at 0x5000 + (unit - 1) * 0x20 (W519 A-7-10). Checks every channel of one analog card:
- * - AI 0x5002:n / AO 0x5010:n Ch Enable/Disable must be TRUE (a disabled channel reads or drives nothing, with no other sign);
- * - AO 0x5012:(2n-1) Load Rejection Hold Value must be 4 = Zero Count (0 V / 4 mA), so a lost host or bus drops the output to
- *   zero instead of holding the last speed. The input and output ranges of the xx03 / xx603 models are fixed by the model (W522
- *   range tables), so nothing else can differ from the catalog's full scale.
- * A positive mismatch lands in `problems` (the point is left out of io.conf); an unreadable object only sets `unreadable`
- * (same policy as the module identity check: warn, don't block on a read that may not be possible). */
-export function checkAnalogSettings(
-  card: { slot: number; model: string }, def: { category: string; points: number },
-  read: (type: 'uint8', index: string, sub: string) => number | null,
-): { problems: Record<string, string>; unreadable: boolean } {
-  const problems: Record<string, string> = {};
-  let unreadable = false;
-  const at = (base: number) => '0x' + (base + (card.slot - 1) * 0x20).toString(16);
-  for (let ch = 1; ch <= def.points; ch++) {
-    const id = `${def.category}:${card.slot}.${ch - 1}`;
-    const enabled = read('uint8', at(def.category === 'AI' ? 0x5002 : 0x5010), String(ch));
-    if (enabled === null) { unreadable = true; continue; }
-    if (enabled === 0) { problems[id] = `${id}: channel ${ch} is disabled in the ${card.model} (Ch Enable/Disable) - enable it before using this point`; continue; }
-    if (def.category !== 'AO') continue;
-    const hold = read('uint8', at(0x5012), String(2 * ch - 1));
-    if (hold === null) unreadable = true;
-    else if (hold !== 4) problems[id] = `${id}: ${card.model} channel ${ch} load-rejection output is not Zero Count (setting ${hold}) - the output would not drop to zero when the host or bus is lost`;
-  }
-  return { problems, unreadable };
 }
 
 /** Cheap, poll-safe rack presence check for the watchdog — same coupler-
@@ -510,20 +392,6 @@ export function checkRackPresence(om: OmronConfig): { cards: IoRackCard[]; unrea
   return {
     cards: om.cards.map(card => ({ ...card, actual: coupler.name, status: allocations.get(card.slot)!.status })),
   };
-}
-
-/** checkRackPresence without blocking the event loop (used by the periodic watchdog). */
-export async function checkRackPresenceAsync(om: OmronConfig): Promise<{ cards: IoRackCard[]; unreachable?: string }> {
-  const master = parseMaster(await runEthercatAsync(['master']));
-  if (!master.toolAvailable) return { cards: om.cards.map(c => ({ ...c, actual: undefined, status: 'missing' as const })), unreachable: master.error ?? 'unknown reason' };
-  const coupler = parseSlaves((await runEthercatAsync(['slaves'])).out).find(s => s.position === 0);
-  if (!coupler) return { cards: om.cards.map(c => ({ ...c, actual: undefined, status: 'missing' as const })) };
-  if (!coupler.name.toUpperCase().includes(om.eccModel.replace('NX-', ''))) {
-    return { cards: om.cards.map(c => ({ ...c, actual: coupler.name, status: 'mismatch' as const })) };
-  }
-  const rackEntries = parsePdoEntries((await runEthercatAsync(['pdos', '-p', '0'])).out);
-  const allocations = allocateRackEntries(om.cards, rackEntries.filter(e => e.dir === 'input'), rackEntries.filter(e => e.dir === 'output'));
-  return { cards: om.cards.map(card => ({ ...card, actual: coupler.name, status: allocations.get(card.slot)!.status })) };
 }
 
 // Analog (AI/AO) and load-cell (SCALE) channels need a per-model confirmed
@@ -606,8 +474,6 @@ export function generateIoConf(
     }
     const alloc = allocations.get(slot);
     if (!alloc || alloc.status !== 'ok' || !alloc.pdoEntries) { warnings.push(`${sig.id}: ${card.model} in slot ${slot} — not enough PDO entries discovered; re-run Read Rack`); continue; }
-    const analogProblem = (sig.direction === 'AI' || sig.direction === 'AO') ? om.discoveredRack.analogProblems?.[sig.id] : undefined;
-    if (analogProblem) { warnings.push(`${analogProblem} - excluded from io.conf`); continue; }
 
     // Digital cards pack every point into the ONE entry they were allocated,
     // addressed as a bit within it; analog cards get one entry PER point.
@@ -622,8 +488,6 @@ export function generateIoConf(
       }
     } else entry = alloc.pdoEntries[point];
     if (!entry) { warnings.push(`${sig.id}: ${card.model}'s allocated PDO entries have nothing for point ${point}`); continue; }
-    // the daemon reads and writes analog points as 16-bit words: anything else mapped there would give wrong values
-    if (!isDigital && entry.bits !== 16) { warnings.push(`${sig.id}: ${card.model}'s PDO entry is ${entry.bits} bits wide, expected 16 - excluded from io.conf`); continue; }
 
     const index = entry.index.toString(16).padStart(4, '0');
     const subindex = entry.subindex.toString(16).padStart(2, '0');
@@ -653,12 +517,6 @@ export function syncIoConf(
   const { conf, warnings } = generateIoConf(om, signals, equipment, scaleConfigs);
   try {
     const current = existsSync(IO_CONF_PATH) ? readFileSync(IO_CONF_PATH, 'utf8') : null;
-    // A rack that is not fully verified must not strip a working config down (and restart the daemon with fewer channels).
-    const channelCount = (t: string | null) => (t?.match(/^channel /gm) ?? []).length;
-    if (current !== conf && channelCount(conf) < channelCount(current) && om.cards.some(c => c.status !== 'ok')) {
-      warnings.push('Keeping the existing io.conf: some cards are not verified OK, so the new config would drop channels. Fix the rack, then save again');
-      return warnings;
-    }
     if (current !== conf) {
       const tmp = `${IO_CONF_PATH}.tmp`;
       writeFileSync(tmp, conf, 'utf8');

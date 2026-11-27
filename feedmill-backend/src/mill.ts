@@ -7,7 +7,7 @@ import {
   NX_CARD_CATALOG, NX_BUS_POWER_BUDGET_W, NX_MAX_UNITS, ECC_MODEL_MIN_CYCLE_US,
   EQUIPMENT_DEFS,
 } from './types.js';
-import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresenceAsync, clearCouplerErrors, readCouplerErrorCount, readCouplerErrorDetail, readCouplerErrorCountAsync, readCouplerErrorDetailAsync, runRs1201Calibration, type ScaleCalStep } from './ethercat.js';
+import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresence, clearCouplerErrors, runRs1201Calibration, type ScaleCalStep } from './ethercat.js';
 import { MovingAverage, OnDelay, LoadPid, RelayTuner, scaleLinear } from './loadControl.js';
 import { Debounce } from './monitors.js';
 import { scaleLines, freefallAdjust, toleranceFor, feedsOnlyHammermill, flowPath, round1 } from './batchLogic.js';
@@ -108,7 +108,6 @@ export class Mill {
   private handRun = new Set<string>(); // motors whose current run was started in Hand (no start/stop delays)
   private rotationState = new Map<string, { runningMs: number; rpm?: number }>();
   private busState: 'idle' | 'ok' | 'fault' | 'offline' = 'idle'; // live EtherCAT state for the HMI indicator (set every scan)
-  private ioFault = false; // commissioned rack but bus invalid / daemon silent: the daemon has zeroed the outputs
   private lastDaemonStartUs: number | null = null; // detects an io_daemon restart (see updateBusHealth)
   ioOverrides: Record<string, SignalValue> = {};
   // Gates forcing an output via SetOverride; never persisted, so a restart
@@ -145,8 +144,6 @@ export class Mill {
   private hornInPrev = false;
   private hornOn = false;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
-  private lastWatchHealthy = false;
-  private rackCheckedStart: number | null = null; // daemonStartUs the rack identity was last confirmed for
   private rackWatchdogHandle: ReturnType<typeof setInterval> | null = null;
   private onChange?: () => void;
 
@@ -215,27 +212,10 @@ export class Mill {
   // card goes missing or changes — same check Read Rack does, minus the
   // per-card PDO discovery, so it's cheap enough to poll continuously.
   // Doesn't run until the operator has confirmed the rack once (rackVerified).
-  private watchBusy = false; // the CLI polls below are async and must not overlap
-  private async rackWatchdogCheck() {
-    if (this.watchBusy) return;
-    this.watchBusy = true;
-    try { await this.rackWatchdogCheckInner(); } catch (e) { console.warn('[rack watchdog]', e); } finally { this.watchBusy = false; }
-  }
-  private async rackWatchdogCheckInner() {
+  private rackWatchdogCheck() {
     const om = this.omronConfig;
     if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return;
-    await this.couplerErrorCheck();
-    // The CLI check is synchronous and stalls the mill scan. A card that drops or faults breaks the working counter, which
-    // the daemon reports as unhealthy every cycle, so identity (is it still the same cards?) only needs checking when the
-    // bus comes up healthy: first time for this daemon run, and after any unhealthy stretch. While unhealthy, keep polling.
-    const st = readIoState();
-    const healthy = !!st?.healthy;
-    const settled = healthy && this.lastWatchHealthy && this.rackCheckedStart === st!.daemonStartUs;
-    this.lastWatchHealthy = healthy;
-    if (settled) return;
-    const result = await checkRackPresenceAsync(om);
-    if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return; // reconfigured while the CLI was running: the result is for the old rack
-    if (healthy && !result.unreachable) this.rackCheckedStart = st!.daemonStartUs;
+    const result = checkRackPresence(om);
     om.cards = result.cards;
     if (result.unreachable) {
       // Can't verify at all — fail safe with the same shutdown response as a
@@ -244,23 +224,6 @@ export class Mill {
       return;
     }
     this.verifyRack();
-  }
-
-  // The coupler's own current errors (CoE 0x3809) are a fault with the newest error-log entry as its text; clearing that fault
-  // clears them at the coupler (ClearFault). A cause that is still there raises it again on the next poll.
-  // Async CLI read, throttled to every 10 s. `force` (the clear-fault handler) stays synchronous so its result is in the same command.
-  private lastCouplerErrorCheck = 0;
-  private async couplerErrorCheck(force = false) {
-    if (!force && Date.now() - this.lastCouplerErrorCheck < 10_000) return;
-    this.lastCouplerErrorCheck = Date.now();
-    const n = force ? readCouplerErrorCount() : await readCouplerErrorCountAsync();
-    if (n === null) return; // unreadable: leave the fault as it is
-    if (n === 0) { this.clearFault('E-EC-01'); return; }
-    const message = `EtherCAT coupler reports ${n} error(s): ${(force ? readCouplerErrorDetail() : await readCouplerErrorDetailAsync()) ?? 'details unreadable'}`;
-    const old = this.faults.find(f => f.code === 'E-EC-01' && f.active);
-    if (old && old.message === message) return;
-    if (old) this.clearFault('E-EC-01'); // a different error than the one shown
-    this.raiseFault('OMRON', 'CRITICAL', message, 'E-EC-01');
   }
 
   private applyConfig(cfg: MillConfig): void {
@@ -657,10 +620,6 @@ export class Mill {
       case 'ClearFault': {
         const f = this.faults.find(f => f.id === cmd.targetId && f.active);
         if (!f) return reject('Fault not found');
-        if (f.code === 'E-EC-01') {
-          const r = clearCouplerErrors();
-          if (!r.ok) return reject(`Could not clear coupler errors: ${r.error ?? 'unknown'}`);
-        }
         f.active = false;
         f.clearedAt = new Date().toISOString();
         persistFault(f);
@@ -744,7 +703,6 @@ export class Mill {
         const r = clearCouplerErrors();
         if (!r.ok) return reject(`Could not clear coupler errors: ${r.error ?? 'unknown'}`);
         this.readOmronRack(); // re-read so the rack status/warnings reflect what's still wrong
-        this.couplerErrorCheck(true);
         this.persistConfig();
         return ok();
       }
@@ -1246,7 +1204,6 @@ export class Mill {
   private updateBusHealth(state: ReturnType<typeof readIoState>) {
     const om = this.omronConfig;
     this.busState = om.couplerType !== 'NX-ECC' ? 'idle' : !state ? 'offline' : state.healthy === false ? 'fault' : 'ok';
-    this.ioFault = om.couplerType === 'NX-ECC' && om.rackVerified && this.busState !== 'ok';
     if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return; // not commissioned yet — nothing to enforce
 
     if (state && this.lastDaemonStartUs !== null && state.daemonStartUs !== this.lastDaemonStartUs) {
@@ -1402,9 +1359,8 @@ export class Mill {
     // Like the PLC's FaultIntlTmp: a trip cancels Hand, so the operator's reset can't restart the motor on its own.
     if (eq.status === 'fault' && eq.mode === 'Hand') eq.mode = 'Off';
 
-    // E-stop, or an I/O fault (the daemon has already zeroed the outputs): nothing runs, Hand is cancelled so the
-    // motor cannot restart by itself when the bus recovers (Auto selection survives), and the start timers re-arm.
-    if (!this.estopOk() || this.ioFault) {
+    // E-stop: nothing runs, Hand is cancelled (Auto selection survives), and the start timers re-arm on release.
+    if (!this.estopOk()) {
       if (eq.mode === 'Hand') eq.mode = 'Off';
       eq.runCmd = false;
       eq.startTimerMs = 0;
@@ -1611,7 +1567,7 @@ export class Mill {
     let cleared = 0, kept = 0;
     for (const f of this.faults) {
       if (!f.active) continue;
-      if (LEVEL_FAULT.test(f.code) || (f.code === 'E-EC-01' && !clearCouplerErrors().ok)) { kept++; continue; }
+      if (LEVEL_FAULT.test(f.code)) { kept++; continue; }
       f.active = false; f.clearedAt = now; f.acknowledgedAt ??= now;
       persistFault(f);
       cleared++;
