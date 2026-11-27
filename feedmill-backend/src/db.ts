@@ -71,8 +71,7 @@ CREATE TABLE IF NOT EXISTS fault_log (
   message TEXT NOT NULL,
   code TEXT NOT NULL,
   raised_at TEXT NOT NULL,
-  cleared_at TEXT,
-  acknowledged_at TEXT
+  cleared_at TEXT
 );
 `;
 
@@ -167,8 +166,8 @@ export function postInventoryEvent(
 
 const upsertFault = () => db.prepare(`
   INSERT OR REPLACE INTO fault_log
-    (id, severity, equipment, message, code, raised_at, cleared_at, acknowledged_at)
-  VALUES (?,?,?,?,?,?,?,?)
+    (id, severity, equipment, message, code, raised_at, cleared_at)
+  VALUES (?,?,?,?,?,?,?)
 `);
 
 // Faults survive a power cycle: everything still active, plus recent history, newest first (the order Mill keeps them in).
@@ -177,7 +176,7 @@ export function loadFaults(limit = 500): Fault[] {
   return rows.map(r => ({
     id: r.id as string, severity: r.severity as Fault['severity'], equipment: r.equipment as string,
     message: r.message as string, code: r.code as string, raisedAt: r.raised_at as string,
-    clearedAt: (r.cleared_at as string | null) ?? null, acknowledgedAt: (r.acknowledged_at as string | null) ?? null,
+    clearedAt: (r.cleared_at as string | null) ?? null,
     active: r.cleared_at == null,
   })).sort((a, b) => (a.raisedAt < b.raisedAt ? 1 : a.raisedAt > b.raisedAt ? -1 : 0));
 }
@@ -185,7 +184,7 @@ export function loadFaults(limit = 500): Fault[] {
 export function persistFault(f: Fault): void {
   upsertFault().run(
     f.id, f.severity, f.equipment, f.message, f.code,
-    f.raisedAt, f.clearedAt, f.acknowledgedAt,
+    f.raisedAt, f.clearedAt,
   );
 }
 

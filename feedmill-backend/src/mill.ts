@@ -602,14 +602,6 @@ export class Mill {
         return ok();
       }
 
-      case 'AcknowledgeFault': {
-        const f = this.faults.find(f => f.id === cmd.targetId && f.active);
-        if (!f) return reject('Fault not found');
-        f.acknowledgedAt = new Date().toISOString();
-        persistFault(f);
-        return ok();
-      }
-
       // The PLC's FaultReset: clears every latched fault and the trip latches. It never resumes a batch (Resume stays the operator's
       // call) and leaves level faults to their cause, so a cause that is still there raises a fresh fault on the next scan.
       case 'ResetFaults': {
@@ -1568,7 +1560,7 @@ export class Mill {
     for (const f of this.faults) {
       if (!f.active) continue;
       if (LEVEL_FAULT.test(f.code)) { kept++; continue; }
-      f.active = false; f.clearedAt = now; f.acknowledgedAt ??= now;
+      f.active = false; f.clearedAt = now;
       persistFault(f);
       cleared++;
     }
@@ -2664,7 +2656,7 @@ export class Mill {
     const fault: Fault = {
       id: `F-${this.faultSeq++}`, severity, equipment: eqId,
       message, code, raisedAt: new Date().toISOString(),
-      clearedAt: null, acknowledgedAt: null, active: true,
+      clearedAt: null, active: true,
     };
     this.faults.unshift(fault);
     persistFault(fault);

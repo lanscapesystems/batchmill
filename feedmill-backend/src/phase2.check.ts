@@ -172,7 +172,6 @@ assert.equal(m.getSnapshot().equipment.find((e: any) => e.id === 'S-1').state, '
 m.raiseFault('PX', 'CRITICAL', 'keep me', 'T-KEEP');
 const kept = () => loadFaults().find((f: any) => f.code === 'T-KEEP');
 assert.ok(kept() && kept()!.active, 'raised fault is stored');
-cmd('AcknowledgeFault', m.faults.find((f: any) => f.code === 'T-KEEP').id); assert.ok(kept()!.acknowledgedAt, 'acknowledge stored');
 cmd('ClearFault', m.faults.find((f: any) => f.code === 'T-KEEP').id); assert.ok(!kept()!.active, 'cleared fault stored');
 const rq: any = mk('RQ', 'auger', { runOutput: 'RQ_OUT' }); rq.status = 'fault'; m.equipment.set('RQ', rq);
 m.raiseFault('RQ', 'CRITICAL', 'trip', 'E-MT-01'); cmd('ResetEquipmentFault', 'RQ');

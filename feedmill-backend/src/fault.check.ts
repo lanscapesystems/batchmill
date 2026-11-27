@@ -47,7 +47,7 @@ assert.ok(active('E-ES-01'));
 const r: any = cmd('ResetFaults');
 assert.equal(r.accepted, true); assert.match(r.reason, /1 cleared, 1 still present/);
 assert.equal(aug.status, 'not_running', 'trip latch released'); assert.ok(active('E-ES-01'), 'E-stop fault follows the circuit, not the reset');
-assert.ok(m.faults.filter((f: any) => !f.active).every((f: any) => f.acknowledgedAt && f.clearedAt), 'cleared faults are acknowledged');
+assert.ok(m.faults.filter((f: any) => !f.active).every((f: any) => f.clearedAt), 'cleared faults are stamped');
 m.ioInputs.ESB = true; scan(2); assert.ok(!active('E-ES-01'), 'E-stop fault clears itself when the circuit is back');
 cmd('SetEquipmentMode', 'A9', { mode: 'Off' });
 

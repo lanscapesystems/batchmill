@@ -23,12 +23,6 @@ export function FaultsTab() {
   const filtered = filter === 'active' ? faults.filter(f => f.active) : faults;
   const activeCount = faults.filter(f => f.active).length;
 
-  function acknowledge(id: string) {
-    if (backend?.connected) {
-      backend.sendCommand('AcknowledgeFault', id);
-    }
-  }
-
   function clearFault(id: string) {
     if (backend?.connected) {
       backend.sendCommand('ClearFault', id);
@@ -99,16 +93,7 @@ export function FaultsTab() {
                 <td className="py-2 px-3">{f.message}</td>
                 <td className="py-2 px-3" style={{ color: 'var(--fg-dim)' }}>{timeStr(f.raisedAt)}</td>
                 <td className="py-2 px-3 flex gap-1">
-                  {f.active && !f.acknowledgedAt && (
-                    <button
-                      onClick={() => acknowledge(f.id)}
-                      className="px-3 py-1 text-xs font-medium"
-                      style={{ background: 'var(--orange)', color: '#000', borderRadius: '3px', border: 'none', cursor: 'pointer' }}
-                    >
-                      ACK
-                    </button>
-                  )}
-                  {f.active && f.acknowledgedAt && backend?.connected && (
+                  {f.active && backend?.connected && (
                     <button
                       onClick={() => clearFault(f.id)}
                       className="px-3 py-1 text-xs font-medium"

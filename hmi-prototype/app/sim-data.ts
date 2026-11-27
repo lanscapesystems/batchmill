@@ -87,6 +87,5 @@ export interface Fault {
   code: string;
   raisedAt: string;
   clearedAt: string | null;
-  acknowledgedAt: string | null;
   active: boolean;
 }
