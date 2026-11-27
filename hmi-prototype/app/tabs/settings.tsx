@@ -1389,7 +1389,9 @@ function IOSection() {
               <div className="flex gap-2">
                 <div className="flex flex-col gap-1" style={{ width: '80px' }}>
                   <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>ID</span>
-                  <input value={scaleDraft.id} onChange={e => setScaleDraft({ ...scaleDraft, id: e.target.value })} style={inputStyle} />
+                  {/* the ID is the scale's key: editing it would create a second scale, so it is fixed once saved */}
+                  <input value={scaleDraft.id} disabled={!!editingScale.id} onChange={e => setScaleDraft({ ...scaleDraft, id: e.target.value })}
+                    style={{ ...inputStyle, color: editingScale.id ? 'var(--fg-dim)' : 'var(--fg-bright)' }} />
                 </div>
                 <div className="flex flex-col gap-1 flex-1">
                   <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Name</span>

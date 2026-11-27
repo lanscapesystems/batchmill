@@ -7,7 +7,7 @@ import {
   NX_CARD_CATALOG, NX_BUS_POWER_BUDGET_W, NX_MAX_UNITS, ECC_MODEL_MIN_CYCLE_US,
   EQUIPMENT_DEFS,
 } from './types.js';
-import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresence, clearCouplerErrors, runRs1201Calibration, type ScaleCalStep } from './ethercat.js';
+import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresence, clearCouplerErrors, runRs1201Calibration, SCALE_ID_RE, daemonRestartedAt, type ScaleCalStep } from './ethercat.js';
 import { MovingAverage, OnDelay, LoadPid, RelayTuner, scaleLinear } from './loadControl.js';
 import { Debounce } from './monitors.js';
 import { scaleLines, freefallAdjust, toleranceFor, feedsOnlyHammermill, flowPath, round1 } from './batchLogic.js';
@@ -215,6 +215,7 @@ export class Mill {
   private rackWatchdogCheck() {
     const om = this.omronConfig;
     if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return;
+    if (Date.now() - daemonRestartedAt < 5000) return; // our own restart: a rescan in progress would look like missing cards
     const result = checkRackPresence(om);
     om.cards = result.cards;
     if (result.unreachable) {
@@ -1008,6 +1009,7 @@ export class Mill {
       case 'ConfigureScale': {
         const p = cmd.parameters as Partial<ScaleConfig> | undefined;
         if (!p?.id || !p.name) return reject('Missing scale id or name');
+        if (p.connectionType === 'rs1201' && !SCALE_ID_RE.test(p.id)) return reject('Scale ID may use only letters, numbers, - and _ (24 at most)');
         const sc: ScaleConfig = {
           id: p.id, name: p.name,
           connectionType: p.connectionType ?? 'serial',
@@ -1104,7 +1106,9 @@ export class Mill {
         };
         this.validateRack();
         this.clearRackFault();
-        this.buildSignals();
+        // NX-ECC: io.conf is written (and the daemon restarted) only after the rack read below - a restart here would make
+        // the master rescan while we are reading it
+        this.buildSignals(this.omronConfig.couplerType !== 'NX-ECC');
         // every save verifies the rack against the bus (a mismatch raises the rack fault, as the old Verify Rack did)
         if (this.omronConfig.couplerType !== 'none') this.readOmronRack();
         return ok();
@@ -3004,7 +3008,7 @@ export class Mill {
     this.buildSignals();
   }
 
-  private buildSignals() {
+  private buildSignals(syncDaemon = true) {
     this.signals = [];
     this.ioInputs = {};
     this.ioOutputs = {};
@@ -3065,6 +3069,6 @@ export class Mill {
     // Mapping-gap warnings surface via readOmronRack() instead of here,
     // since that's where om.warnings gets freshly rebuilt; this call's
     // warnings would otherwise pile up unbounded.
-    syncIoConf(om, this.signals, this.equipment.values(), this.scaleConfigs);
+    if (syncDaemon) syncIoConf(om, this.signals, this.equipment.values(), this.scaleConfigs);
   }
 }

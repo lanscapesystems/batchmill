@@ -125,6 +125,11 @@ const NX_CARD_IDENTS: Record<string, number> = {
   'NX-RS1201': 0x00251201,
   'NX-AD3203': 0x00213203,
 };
+// NOT confirmed on hardware (same 0x00 + category + model digits pattern as above). Only used to pre-select the model on
+// Read from Coupler and to warn about a likely wrong model - never to reject a card.
+const NX_IDENT_HINTS: Record<number, string> = { 0x00233203: 'NX-DA3203', 0x00233205: 'NX-DA3205', 0x00233603: 'NX-DA3603' };
+// a scale ID becomes part of an io.conf channel name: the daemon splits lines on spaces, exits on a bad one, and keeps 31 chars
+export const SCALE_ID_RE = /^[A-Za-z0-9_-]{1,24}$/;
 
 // shortcut: `ethercat upload`'s exact output format for a uint32 SDO
 // wasn't re-verified against a live box in this pass (only the 0xF050
@@ -255,7 +260,10 @@ export function cardsFromRack(entries: PdoEntry[], idents: (number | null)[], un
     if (!candidates.length) {
       warnings.push(`Unit ${u}: process data layout not recognised — pick its model by hand`);
       cards.push({ slot: u, model: 'NX-ID5342', ident, confidence: 'assumed' });
-    } else cards.push({ slot: u, model: candidates[0].model, ident, confidence: candidates.length === 1 ? 'inferred' : 'ambiguous' });
+    } else {
+      const hinted = candidates.find(d => ident !== undefined && NX_IDENT_HINTS[ident] === d.model);
+      cards.push({ slot: u, model: (hinted ?? candidates[0]).model, ident, confidence: candidates.length === 1 ? 'inferred' : 'ambiguous' });
+    }
   }
   return { cards, warnings };
 }
@@ -318,12 +326,25 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
   if (errCount) warnings.push(`Coupler/NX units report ${errCount} current error(s) — remove the cause, then Clear EtherCAT Errors`);
 
   const productId = getSlaveProductId(0);
-  const rackEntries = getRackPdoEntries(0);
-  const inputEntries = rackEntries.filter(e => e.dir === 'input');
-  const outputEntries = rackEntries.filter(e => e.dir === 'output');
-  if (productId !== null) om.discoveredRack = { productId, inputEntries, outputEntries };
+  // While the master (re)scans the bus, e.g. just after an io_daemon restart, `ethercat pdos` can list nothing or only some of
+  // the entries: read again until every configured card is covered (5 s at most).
+  let rackEntries: PdoEntry[], inputEntries: PdoEntry[], outputEntries: PdoEntry[], allocations: Map<number, SlotAllocation>;
+  for (let attempt = 0; ; attempt++) {
+    rackEntries = getRackPdoEntries(0);
+    inputEntries = rackEntries.filter(e => e.dir === 'input');
+    outputEntries = rackEntries.filter(e => e.dir === 'output');
+    allocations = allocateRackEntries(om.cards, inputEntries, outputEntries);
+    if (attempt >= 10 || ![...allocations.values()].some(a => a.status === 'missing')) break;
+    sleepMs(500);
+  }
+  // an empty read never replaces a good map: that would generate an io.conf with no channels
+  if (productId !== null && rackEntries.length) om.discoveredRack = { productId, inputEntries, outputEntries };
+  else if (om.discoveredRack) warnings.push('Could not read the PDO map from the coupler - keeping the last good one');
+  if ([...allocations.values()].some(a => a.status === 'missing')) {
+    const list = (es: PdoEntry[]) => es.map(e => `0x${e.index.toString(16)}:${e.subindex.toString(16).padStart(2, '0')} ${e.bits}-bit`).join(', ') || 'none';
+    warnings.push(`The coupler lists these entries - inputs: ${list(inputEntries)}; outputs: ${list(outputEntries)}`);
+  }
 
-  const allocations = allocateRackEntries(om.cards, inputEntries, outputEntries);
   const cards = om.cards.map(card => {
     const alloc = allocations.get(card.slot)!;
     if (alloc.status === 'missing') {
@@ -342,7 +363,9 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
     const actualIdent = getSlotModuleIdent(card.slot);
     if (expectedIdent === undefined) {
       // no confirmed ident for this model — can't verify beyond PDO-count allocation, but surface what the bus reports so it can be added
-      if (actualIdent !== null) warnings.push(`${card.model} in slot ${card.slot}: identity not in the verified table (bus reports 0x${actualIdent.toString(16).padStart(8, '0')}) — add to NX_CARD_IDENTS once confirmed`);
+      const likely = actualIdent === null ? undefined : NX_IDENT_HINTS[actualIdent];
+      if (likely && likely !== card.model) warnings.push(`${card.model} in slot ${card.slot}: the bus identity looks like ${likely} — check the card model (analog scaling differs between models)`);
+      else if (actualIdent !== null) warnings.push(`${card.model} in slot ${card.slot}: identity not in the verified table (bus reports 0x${actualIdent.toString(16).padStart(8, '0')}) — add to NX_CARD_IDENTS once confirmed`);
       return card;
     }
     if (actualIdent === null) {
@@ -441,6 +464,7 @@ export function generateIoConf(
 
   for (const sc of scaleConfigs) {
     if (sc.connectionType !== 'rs1201') continue;
+    if (!SCALE_ID_RE.test(sc.id)) { warnings.push(`${sc.name}: scale ID "${sc.id}" has spaces or other characters - delete it and add it again; excluded from io.conf`); continue; }
     const card = om.cards.find(c => c.slot === sc.rackSlot);
     if (!card) { warnings.push(`${sc.name}: no card in slot ${sc.rackSlot}`); continue; }
     const def = NX_CARD_CATALOG.find(d => d.model === card.model);
@@ -504,6 +528,9 @@ export function generateIoConf(
   return { conf: lines.join('\n') + '\n', warnings };
 }
 
+/** When syncIoConf last restarted the daemon: the master may rescan for a few seconds afterwards (see mill.ts's rack watchdog). */
+export let daemonRestartedAt = 0;
+
 /** Writes the generated conf (if it changed) and restarts the daemon so it
  * picks up the new channel list — ecrt can't add PDO registrations to an
  * already-activated master, so a restart is required, not just a reload.
@@ -526,6 +553,7 @@ export function syncIoConf(
         // refuses an unattended non-root caller with "Interactive authentication
         // required" -- install.sh's NOPASSWD sudoers grant is for exactly this
         // command, so it must actually be invoked via sudo to take effect.
+        daemonRestartedAt = Date.now();
         execFileSync('sudo', ['-n', '/bin/systemctl', 'restart', 'feedmill-io-daemon.service'], { timeout: 3000 });
       } catch {
         // dev machine, daemon not installed, or this process lacks permission to manage the service

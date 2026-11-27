@@ -1,6 +1,6 @@
 // Rack allocation check (no hardware needed): RS1201 must be recognised wherever it sits in the rack.
 import assert from 'node:assert/strict';
-import { allocateRackEntries, cardsFromRack } from './ethercat.js';
+import { allocateRackEntries, cardsFromRack, generateIoConf, verifyEthercatRack } from './ethercat.js';
 import type { IoRackCard } from './types.js';
 import { NX_CARD_CATALOG } from './types.js';
 
@@ -56,4 +56,30 @@ assert.equal(cardsFromRack([inE(u(3), 16)], [null], 3).cards.map(c => c.slot).jo
 // NX-DA3205: 4-ch current output with 1/30000 resolution, so its full scale is 30000 (not the 1/8000 models' 8000)
 assert.equal(NX_CARD_CATALOG.find(d => d.model === 'NX-DA3205')?.fullScale, 30000);
 assert.equal(allocateRackEntries([card(1, 'NX-DA3205')], [], [1, 2, 3, 4].map(i => outE(uo(1), 16, i))).get(1)!.status, 'ok');
+// an unconfirmed ident only pre-selects the likely model
+assert.equal(cardsFromRack([1, 2, 3, 4].map(i => outE(uo(1), 16, i)), [null, 0x00233205], 1).cards[0].model, 'NX-DA3205');
+
+// a scale ID with a space would make the daemon reject io.conf and exit: the scale is left out instead
+const om: any = { couplerType: 'NX-ECC', eccModel: 'NX-ECC203', cycleTimeUs: 5000, cards: [card(1, 'NX-RS1201')], discoveredRack: { productId: 1, inputEntries: rs(1), outputEntries: [] } };
+const badId = generateIoConf(om, [], [], [{ id: 'SC 2', name: 'S', connectionType: 'rs1201', rackSlot: 1 } as any]);
+assert.ok(!badId.conf.includes('channel') && badId.warnings.length === 1);
+
+// rack read against a fake `ethercat` CLI: a read that is partial at first is retried; an empty one keeps the last good map
+let pdoReads = 0, partialReads = 2, empty = false;
+const cp = require('child_process');
+cp.execFileSync = (_cmd: string, args: string[]) => {
+  if (args[0] === 'master') return 'Phase: Operation\nSlaves: 1\nLink: UP\n';
+  if (args[0] === 'slaves') return args.includes('-v') ? 'Product code: 0x000000a7\n' : '0  0:0  OP  +  NX-ECC203\n';
+  if (args[0] !== 'pdos') return args.includes('0xf050') ? (args[args.length - 1] === '1' ? `0x00135256 ${0x00135256}\n` : `0x00115442 ${0x00115442}\n`) : '0x00 0\n';
+  pdoReads++;
+  if (empty) return '';
+  return 'RxPDO 0x1600\n PDO entry 0x7002:01, 16 bit\n' + (pdoReads > partialReads ? 'TxPDO 0x1a00\n PDO entry 0x6022:01, 16 bit\n' : '');
+};
+const rackOm: any = { couplerType: 'NX-ECC', eccModel: 'NX-ECC203', cards: [card(1, 'NX-OD5256'), card(2, 'NX-ID5442')] };
+const read = verifyEthercatRack(rackOm);
+assert.equal(pdoReads, 3); assert.ok(read.cards.every(c => c.status === 'ok'), 'partial read retried');
+empty = true;
+const gone = verifyEthercatRack(rackOm);
+assert.equal(rackOm.discoveredRack.inputEntries.length, 1, 'empty read keeps the last good map');
+assert.ok(gone.warnings.some(w => w.includes('keeping the last good one')) && gone.warnings.some(w => w.includes('inputs: none')));
 console.log('ethercat checks passed');
