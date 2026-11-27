@@ -179,7 +179,9 @@ export function readCouplerErrorDetail(): string | null {
   if (!newest) return null;
   const { out } = runEthercat(['upload', '-p', '0', '-t', 'octet_string', '0x10f3', String(newest)]);
   if (out === null) return null;
-  return describeDiagnosisMessage(out.trim().split(/\s+/).filter(x => /^[0-9a-f]{2}$/i.test(x)).map(x => parseInt(x, 16)));
+  const bytes = out.trim().split(/\s+/).filter(x => /^[0-9a-f]{2}$/i.test(x)).map(x => parseInt(x, 16));
+  // unparseable: show what the CLI printed (and which log entry) instead of a bare "no details"
+  return bytes.length >= 4 ? describeDiagnosisMessage(bytes) : `no details (0x10F3:${newest} read back: ${JSON.stringify(out.trim().slice(0, 80))})`;
 }
 
 /** Clears the coupler's + NX units' current errors by writing 01 to CoE

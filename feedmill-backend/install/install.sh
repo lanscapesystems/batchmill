@@ -494,7 +494,9 @@ Environment=NODE_ENV=production
 Environment=PORT=3000
 Environment=NEXT_TELEMETRY_DISABLED=1
 ExecStart=$NODE_BIN node_modules/.bin/next start
-Restart=on-failure
+# next exits 143 on SIGTERM; that's a normal stop, not a failure, and it should come back if killed.
+SuccessExitStatus=143
+Restart=always
 RestartSec=2
 
 [Install]
