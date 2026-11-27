@@ -216,6 +216,9 @@ export class Mill {
     const om = this.omronConfig;
     if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return;
     if (Date.now() - daemonRestartedAt < 5000) return; // our own restart: a rescan in progress would look like missing cards
+    // The CLI calls below block the whole backend (HMI included). While the daemon's cyclic exchange is complete and no card
+    // is flagged, the coupler is there and there is nothing to clear: poll only when one of those isn't true.
+    if (this.busState === 'ok' && om.cards.every(c => c.status === 'ok')) return;
     const result = checkRackPresence(om);
     om.cards = result.cards;
     if (result.unreachable) {
@@ -693,6 +696,8 @@ export class Mill {
 
       case 'ClearEthercatErrors': {
         if (this.omronConfig.couplerType !== 'NX-ECC') return reject('Only supported for NX-ECC couplers');
+        const guardErr = this.guardConfigEdit(); // the re-read can stop the daemon to rescan the bus: not while running
+        if (guardErr) return reject(guardErr);
         const r = clearCouplerErrors();
         if (!r.ok) return reject(`Could not clear coupler errors: ${r.error ?? 'unknown'}`);
         this.readOmronRack(); // re-read so the rack status/warnings reflect what's still wrong
@@ -1106,8 +1111,7 @@ export class Mill {
         };
         this.validateRack();
         this.clearRackFault();
-        // NX-ECC: io.conf is written (and the daemon restarted) only after the rack read below - a restart here would make
-        // the master rescan while we are reading it
+        // NX-ECC: the rack read below parks the daemon, rescans, and writes io.conf afterwards - no extra restart here
         this.buildSignals(this.omronConfig.couplerType !== 'NX-ECC');
         // every save verifies the rack against the bus (a mismatch raises the rack fault, as the old Verify Rack did)
         if (this.omronConfig.couplerType !== 'none') this.readOmronRack();

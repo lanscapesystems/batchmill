@@ -62,6 +62,7 @@ wssHmi.on('connection', (ws) => {
         requestId = msg.data?.requestId;
         const result = mill.processCommand(msg.data as Command);
         ws.send(JSON.stringify({ type: 'command_result', data: result }));
+        pushSoon();
       }
     } catch (err) {
       console.error('HMI command failed:', err);
@@ -80,6 +81,13 @@ function broadcastToHmi(data: StateSnapshot) {
       try { ws.send(snapshot); } catch { hmiClients.delete(ws); }
     }
   }
+}
+
+// Show a command's effect at once instead of at the next 200 ms broadcast. The short wait lets a scan (20 ms) apply it to
+// outputs and motor states first; commands arriving together share one push.
+let pushTimer: ReturnType<typeof setTimeout> | undefined;
+function pushSoon() {
+  pushTimer ??= setTimeout(() => { pushTimer = undefined; broadcastToHmi(mill.getSnapshot()); }, 30);
 }
 
 // ── Scale readers: start at boot, restart whenever ConfigureScale/RemoveScale changes the list ──

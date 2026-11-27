@@ -310,7 +310,7 @@ export function BackendProvider({ children }: { children: ReactNode }) {
       const timeout = setTimeout(() => {
         cmdCallbacks.current.delete(requestId);
         resolve({ accepted: false, reason: 'Timeout' });
-      }, action === 'ReadOmronRack' || action === 'ConfigureOmron' ? 60000 : 5000); // these shell out to the ethercat CLI many times
+      }, ['ReadOmronRack', 'ConfigureOmron', 'ClearEthercatErrors'].includes(action) ? 60000 : 5000); // these shell out to the ethercat CLI many times
 
       cmdCallbacks.current.set(requestId, (r) => {
         clearTimeout(timeout);

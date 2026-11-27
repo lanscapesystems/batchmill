@@ -1639,7 +1639,7 @@ function IOSection() {
             <div style={{ color: 'var(--fg-bright)', fontSize: '13px', fontWeight: 600, marginBottom: '8px' }}>Read Rack from Coupler</div>
             <div style={{ color: 'var(--fg)', fontSize: '12px', marginBottom: '14px' }}>
               {omEditing
-                ? 'Reads the rack off the coupler and fills in the card list. Nothing is saved until you press Save, and it works before any card is added. Units are identified from the coupler where possible; check each model.'
+                ? 'Reads the rack off the coupler and fills in the card list. Nothing is saved until you press Save, and it works before any card is added. Units are identified from the coupler where possible; check each model. The I/O stops for a few seconds while the bus is rescanned: outputs drop and forces are cleared.'
                 : 'This will query the coupler for its current card layout. Any mismatch between configured and detected cards will raise a fatal fault.'}
             </div>
             <div className="flex gap-2 justify-end">

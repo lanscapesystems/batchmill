@@ -3,7 +3,7 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import type { OmronConfig, IoRackCard, EquipmentRuntime, SignalDef, ScaleConfig, PdoEntry } from './types.js';
 import { NX_CARD_CATALOG, OMRON_VENDOR_ID } from './types.js';
 
-const IO_CONF_PATH = process.env.FEEDMILL_IO_CONF_PATH ?? '/etc/feedmill/io.conf';
+const ioConfPath = () => process.env.FEEDMILL_IO_CONF_PATH ?? '/etc/feedmill/io.conf';
 
 export interface EthercatMasterStatus {
   toolAvailable: boolean;
@@ -277,7 +277,14 @@ export function discoverRack(): RackDiscovery {
   const coupler = listSlaves().find(s => s.position === 0);
   if (!coupler) return { ok: false, error: 'No EtherCAT slaves detected on the bus', cards: [], warnings: [] };
   const eccMatch = /ECC20([23])/i.exec(coupler.name);
-  const entries = getRackPdoEntries(0);
+  const before = readIoConf();
+  parkAndRescan();
+  let entries: PdoEntry[] = [];
+  for (let i = 0; i < 10 && !entries.some(e => e.dir === 'input'); i++) { // a rack without inputs waits the full 5 s
+    sleepMs(500);
+    entries = getRackPdoEntries(0);
+  }
+  if (before !== null) writeIoConf(before); // a probe saves nothing: put the daemon back
   const identCount = sdoUpload('uint8', '0xf050', '0');
   const idents: (number | null)[] = [null];
   for (let i = 1; i <= (identCount ?? 0); i++) idents[i] = getSlotModuleIdent(i);
@@ -326,16 +333,17 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
   if (errCount) warnings.push(`Coupler/NX units report ${errCount} current error(s) — remove the cause, then Clear EtherCAT Errors`);
 
   const productId = getSlaveProductId(0);
-  // While the master (re)scans the bus, e.g. just after an io_daemon restart, `ethercat pdos` can list nothing or only some of
-  // the entries: read again until every configured card is covered (5 s at most).
+  // The master's cached list can be stale, so always rescan, then read until every configured card is covered (5 s at most).
+  // syncIoConf, run by the caller, brings the daemon back.
+  parkAndRescan();
   let rackEntries: PdoEntry[], inputEntries: PdoEntry[], outputEntries: PdoEntry[], allocations: Map<number, SlotAllocation>;
   for (let attempt = 0; ; attempt++) {
+    sleepMs(500);
     rackEntries = getRackPdoEntries(0);
     inputEntries = rackEntries.filter(e => e.dir === 'input');
     outputEntries = rackEntries.filter(e => e.dir === 'output');
     allocations = allocateRackEntries(om.cards, inputEntries, outputEntries);
     if (attempt >= 10 || ![...allocations.values()].some(a => a.status === 'missing')) break;
-    sleepMs(500);
   }
   // an empty read never replaces a good map: that would generate an io.conf with no channels
   if (productId !== null && rackEntries.length) om.discoveredRack = { productId, inputEntries, outputEntries };
@@ -542,27 +550,43 @@ export function syncIoConf(
   om: OmronConfig, signals: Iterable<SignalDef>, equipment: Iterable<EquipmentRuntime>, scaleConfigs: Iterable<ScaleConfig>,
 ): string[] {
   const { conf, warnings } = generateIoConf(om, signals, equipment, scaleConfigs);
+  writeIoConf(conf);
+  return warnings;
+}
+
+function readIoConf(): string | null {
+  try { return existsSync(ioConfPath()) ? readFileSync(ioConfPath(), 'utf8') : null; } catch { return null; }
+}
+
+function writeIoConf(conf: string): void {
   try {
-    const current = existsSync(IO_CONF_PATH) ? readFileSync(IO_CONF_PATH, 'utf8') : null;
-    if (current !== conf) {
-      const tmp = `${IO_CONF_PATH}.tmp`;
+    if (readIoConf() !== conf) {
+      const tmp = `${ioConfPath()}.tmp`;
       writeFileSync(tmp, conf, 'utf8');
-      renameSync(tmp, IO_CONF_PATH);
+      renameSync(tmp, ioConfPath());
       try {
         // Calling systemctl directly here goes through polkit (not sudo), which
         // refuses an unattended non-root caller with "Interactive authentication
         // required" -- install.sh's NOPASSWD sudoers grant is for exactly this
         // command, so it must actually be invoked via sudo to take effect.
-        daemonRestartedAt = Date.now();
-        execFileSync('sudo', ['-n', '/bin/systemctl', 'restart', 'feedmill-io-daemon.service'], { timeout: 3000 });
+        // blocks until the unit's ExecStartPre (rescan + 2 s) is done
+        execFileSync('sudo', ['-n', '/bin/systemctl', 'restart', 'feedmill-io-daemon.service'], { timeout: 10000 });
       } catch {
         // dev machine, daemon not installed, or this process lacks permission to manage the service
       }
+      daemonRestartedAt = Date.now();
     }
   } catch {
     // e.g. /etc/feedmill isn't writable here (dev machine) — nothing generated
   }
-  return warnings;
+}
+
+/** Seen on the mill: the master's PDO list had no inputs at all (SM3 empty) while the coupler's own 0x1C13 still listed six, and
+ * `ethercat rescan` with the io_daemon stopped brought them back. A config with no channels makes the daemon release the master.
+ * Outputs drop meanwhile: guarded operator actions only. The caller must write a real io.conf afterwards. */
+function parkAndRescan(): void {
+  writeIoConf('# parked while the bus is rescanned\n');
+  runEthercat(['rescan']);
 }
 
 // ── NX-RS1201 calibration over CoE SDO (W565 §6-2 / §7-4; W519 A-7-3) ──
