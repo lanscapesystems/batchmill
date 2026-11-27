@@ -7,7 +7,7 @@ import {
   NX_CARD_CATALOG, NX_BUS_POWER_BUDGET_W, NX_MAX_UNITS, ECC_MODEL_MIN_CYCLE_US,
   EQUIPMENT_DEFS,
 } from './types.js';
-import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresence, clearCouplerErrors, readCouplerErrorCount, readCouplerErrorDetail, runRs1201Calibration, type ScaleCalStep } from './ethercat.js';
+import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresenceAsync, clearCouplerErrors, readCouplerErrorCount, readCouplerErrorDetail, readCouplerErrorCountAsync, readCouplerErrorDetailAsync, runRs1201Calibration, type ScaleCalStep } from './ethercat.js';
 import { MovingAverage, OnDelay, LoadPid, RelayTuner, scaleLinear } from './loadControl.js';
 import { Debounce } from './monitors.js';
 import { scaleLines, freefallAdjust, toleranceFor, feedsOnlyHammermill, flowPath, round1 } from './batchLogic.js';
@@ -215,10 +215,16 @@ export class Mill {
   // card goes missing or changes — same check Read Rack does, minus the
   // per-card PDO discovery, so it's cheap enough to poll continuously.
   // Doesn't run until the operator has confirmed the rack once (rackVerified).
-  private rackWatchdogCheck() {
+  private watchBusy = false; // the CLI polls below are async and must not overlap
+  private async rackWatchdogCheck() {
+    if (this.watchBusy) return;
+    this.watchBusy = true;
+    try { await this.rackWatchdogCheckInner(); } catch (e) { console.warn('[rack watchdog]', e); } finally { this.watchBusy = false; }
+  }
+  private async rackWatchdogCheckInner() {
     const om = this.omronConfig;
     if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return;
-    this.couplerErrorCheck();
+    await this.couplerErrorCheck();
     // The CLI check is synchronous and stalls the mill scan. A card that drops or faults breaks the working counter, which
     // the daemon reports as unhealthy every cycle, so identity (is it still the same cards?) only needs checking when the
     // bus comes up healthy: first time for this daemon run, and after any unhealthy stretch. While unhealthy, keep polling.
@@ -227,7 +233,8 @@ export class Mill {
     const settled = healthy && this.lastWatchHealthy && this.rackCheckedStart === st!.daemonStartUs;
     this.lastWatchHealthy = healthy;
     if (settled) return;
-    const result = checkRackPresence(om);
+    const result = await checkRackPresenceAsync(om);
+    if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return; // reconfigured while the CLI was running: the result is for the old rack
     if (healthy && !result.unreachable) this.rackCheckedStart = st!.daemonStartUs;
     om.cards = result.cards;
     if (result.unreachable) {
@@ -241,15 +248,15 @@ export class Mill {
 
   // The coupler's own current errors (CoE 0x3809) are a fault with the newest error-log entry as its text; clearing that fault
   // clears them at the coupler (ClearFault). A cause that is still there raises it again on the next poll.
-  // shortcut: one extra synchronous CLI read, throttled to every 10 s; upgrade with the async-CLI note in ethercat.ts.
+  // Async CLI read, throttled to every 10 s. `force` (the clear-fault handler) stays synchronous so its result is in the same command.
   private lastCouplerErrorCheck = 0;
-  private couplerErrorCheck(force = false) {
+  private async couplerErrorCheck(force = false) {
     if (!force && Date.now() - this.lastCouplerErrorCheck < 10_000) return;
     this.lastCouplerErrorCheck = Date.now();
-    const n = readCouplerErrorCount();
+    const n = force ? readCouplerErrorCount() : await readCouplerErrorCountAsync();
     if (n === null) return; // unreadable: leave the fault as it is
     if (n === 0) { this.clearFault('E-EC-01'); return; }
-    const message = `EtherCAT coupler reports ${n} error(s): ${readCouplerErrorDetail() ?? 'details unreadable'}`;
+    const message = `EtherCAT coupler reports ${n} error(s): ${(force ? readCouplerErrorDetail() : await readCouplerErrorDetailAsync()) ?? 'details unreadable'}`;
     const old = this.faults.find(f => f.code === 'E-EC-01' && f.active);
     if (old && old.message === message) return;
     if (old) this.clearFault('E-EC-01'); // a different error than the one shown

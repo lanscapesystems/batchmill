@@ -1074,9 +1074,17 @@ function IOSection() {
 
   function renumberCards(cards: BackendIoRackCard[]) { return cards.map((c, i) => ({ ...c, slot: i + 1 })); }
   function startEditOmron() { setOmDraft({ ...om, cards: om.cards.map(c => ({ ...c })) }); setRackNotes(null); setOmEditing(true); }
-  function saveOmron() {
+  const [omSaving, setOmSaving] = useState(false);
+  // Save verifies the rack against the bus (many CLI calls, can take many seconds): stay in the editor until the backend answers,
+  // and keep it open with the reason if the save is refused (e.g. a motor is running or the batch isn't paused).
+  async function saveOmron() {
+    if (omSaving) return;
     const sorted = { ...omDraft, cards: renumberCards(omDraft.cards) };
-    backend?.sendCommand('ConfigureOmron', undefined, sorted as unknown as Record<string, unknown>);
+    setOmSaving(true);
+    setRackNotes([{ text: 'Saving and verifying the rack against the coupler...', warn: false }]);
+    const r = await backend?.sendCommand('ConfigureOmron', undefined, sorted as unknown as Record<string, unknown>);
+    setOmSaving(false);
+    if (!r?.accepted) { setRackNotes([{ text: `Not saved: ${r?.reason ?? 'no answer from the backend'}`, warn: true }]); return; }
     setOmEditing(false);
     setRackNotes(null);
   }

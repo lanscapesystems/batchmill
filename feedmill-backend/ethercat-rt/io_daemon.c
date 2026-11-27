@@ -121,6 +121,7 @@ typedef struct {
     uint8_t    pdo_subindex;
     chan_dir_t dir;
     unsigned   cfg_bit;        /* from config: DI/DO point's bit position within the registered word; 0 and unused for AI/AO/SCALE */
+    bool       dead;           /* PDO entry failed to register: channel is skipped (never read/written), the rest of the rack still runs */
     bool       counted;        /* DI only: also edge-count (rotation sensors) */
     unsigned   offset;         /* final byte offset into the domain process image, computed at setup time */
     unsigned   bit;            /* final bit position within that byte (DI/DO only) */
@@ -156,6 +157,8 @@ static volatile unsigned diag_slaves = 0;
 static volatile unsigned diag_wc = 0;
 static volatile unsigned diag_wc_state = 0;
 static volatile bool bus_healthy = false; /* false until the first fully-healthy cycle */
+static unsigned bad_limit = 25;           /* consecutive bad cycles before "unhealthy"; set from cycle_us in main() */
+#define UNHEALTHY_AFTER_US 100000UL
 
 static void on_signal(int sig) { (void)sig; running = false; }
 
@@ -290,7 +293,7 @@ static void *writer_thread(void *arg) {
             bool first = true;
             for (int i = 0; i < n_channels; i++) {
                 channel_t *c = &channels[i];
-                if (c->dir != DIR_DI && c->dir != DIR_AI && c->dir != DIR_SCALE) continue;
+                if (c->dead || (c->dir != DIR_DI && c->dir != DIR_AI && c->dir != DIR_SCALE)) continue; /* a dead channel is absent, not "false" */
                 int32_t v = __atomic_load_n(&c->value, __ATOMIC_RELAXED);
                 fprintf(f, "%s\"%s\":", first ? "" : ",", c->signal_id);
                 if (c->dir == DIR_DI) fprintf(f, "%s", v ? "true" : "false");
@@ -473,12 +476,14 @@ static void setup_ethercat(void) {
             unsigned bitpos = 0;
             int off = ecrt_slave_config_reg_pdo_entry(sc, c->pdo_index, c->pdo_subindex, domain, &bitpos);
             if (off < 0) {
+                /* Skip just this channel: exiting here would crash-loop the daemon and take every healthy channel down with it. */
                 fprintf(stderr,
-                    "io_daemon: failed to register PDO entry %04x:%02x for %s (slave pos %u) — "
+                    "io_daemon: failed to register PDO entry %04x:%02x for %s (slave pos %u) — channel skipped; "
                     "check it's in the slave's active PDO mapping (`ethercat pdos -p %u`)\n",
                     c->pdo_index, c->pdo_subindex, c->signal_id,
                     slaves[c->slave_idx].position, slaves[c->slave_idx].position);
-                exit(1);
+                c->dead = true;
+                continue;
             }
             base_off = (unsigned)off;
             base_bit = bitpos;
@@ -501,7 +506,7 @@ static void setup_ethercat(void) {
         }
     }
 
-    if (ecrt_domain_size(domain) <= 0) { fprintf(stderr, "io_daemon: empty domain\n"); exit(1); }
+    if (ecrt_domain_size(domain) <= 0) { fprintf(stderr, "io_daemon: empty domain (every channel failed to register)\n"); exit(1); }
     /* Matches the known-working bench tool's setup -- tells the master the
      * actual cyclic rate so its internal timing isn't left at a default
      * that may not match this cycle_us. */
@@ -548,7 +553,13 @@ static void run_cycle(void) {
     ec_domain_state_t ds;
     ecrt_master_state(master, &ms);
     ecrt_domain_state(domain, &ds);
-    bool healthy = ms.link_up && ds.wc_state == EC_WC_COMPLETE;
+    /* raw_ok = this cycle's exchange was complete (gates reading inputs). `healthy` is debounced: it only drops after
+     * bad_limit CONSECUTIVE bad cycles (~100 ms), so one lost or late frame no longer faults the mill or glitches the outputs
+     * to zero. It recovers on the first good cycle. bad_cycles starts at the limit, so the bus is unhealthy until proven. */
+    static unsigned bad_cycles = ~0u;
+    bool raw_ok = ms.link_up && ds.wc_state == EC_WC_COMPLETE;
+    if (raw_ok) bad_cycles = 0; else if (bad_cycles < ~0u - 1) bad_cycles++;
+    bool healthy = bad_cycles < bad_limit;
     __atomic_store_n(&bus_healthy, healthy, __ATOMIC_RELAXED);
     __atomic_store_n(&diag_link_up, ms.link_up, __ATOMIC_RELAXED);
     __atomic_store_n(&diag_slaves, ms.slaves_responding, __ATOMIC_RELAXED);
@@ -558,9 +569,10 @@ static void run_cycle(void) {
     uint64_t t = now_us();
     for (int i = 0; i < n_channels; i++) {
         channel_t *c = &channels[i];
+        if (c->dead) continue;
         switch (c->dir) {
         case DIR_DI: {
-            if (!healthy) break;
+            if (!raw_ok) break;
             bool state = read_bit(c->offset, c->bit);
             if (c->counted && state && !c->last_state) {
                 uint64_t prev_edge = __atomic_load_n(&c->last_edge_us, __ATOMIC_RELAXED);
@@ -573,10 +585,10 @@ static void run_cycle(void) {
             break;
         }
         case DIR_AI:
-            if (healthy) __atomic_store_n(&c->value, read_i16(c->offset), __ATOMIC_RELAXED);
+            if (raw_ok) __atomic_store_n(&c->value, read_i16(c->offset), __ATOMIC_RELAXED);
             break;
         case DIR_SCALE:
-            if (healthy) __atomic_store_n(&c->value, read_i32(c->offset), __ATOMIC_RELAXED);
+            if (raw_ok) __atomic_store_n(&c->value, read_i32(c->offset), __ATOMIC_RELAXED);
             break;
         case DIR_DO:
             write_bit(c->offset, c->bit, healthy && __atomic_load_n(&c->value, __ATOMIC_RELAXED) != 0);
@@ -619,6 +631,8 @@ int main(int argc, char **argv) {
     }
 
     setup_ethercat();
+    bad_limit = cycle_us > 0 ? (unsigned)(UNHEALTHY_AFTER_US / (unsigned long)cycle_us) : 25;
+    if (bad_limit < 3) bad_limit = 3;
 
     /* Lock memory and raise this thread's priority — standard practice for an
      * IgH realtime application. Needs root, or CAP_SYS_NICE + CAP_IPC_LOCK
