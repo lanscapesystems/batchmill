@@ -157,6 +157,14 @@ setInterval(() => {
   broadcastToHmi(mill.getSnapshot());
 }, BROADCAST_INTERVAL_MS);
 
+// Event-loop stall log: a timer that fires >250 ms late means something blocked the backend (HMI commands time out meanwhile).
+let lastLoopTick = Date.now();
+setInterval(() => {
+  const late = Date.now() - lastLoopTick - 100;
+  lastLoopTick = Date.now();
+  if (late > 250) console.warn(`[loop] backend stalled ${late} ms`);
+}, 100).unref();
+
 server.listen(PORT, HOST, () => {
   console.log(`Feed Mill Backend running on http://${HOST}:${PORT} (not reachable from the network — see nginx)`);
   console.log(`  HMI WebSocket:       ws://${HOST}:${PORT}/ws/hmi`);

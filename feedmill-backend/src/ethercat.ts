@@ -30,9 +30,10 @@ export interface EthercatSlave {
 // finding) demands it — would need runEthercat and every caller async
 // (execFile, not execFileSync), which ripples into mill.ts's command
 // dispatch; not done here. See ethercat-io-audit.md's P1 timing finding.
-function runEthercat(args: string[]): { out: string | null; error?: string } {
+function runEthercat(args: string[], encoding: 'utf8' | 'latin1' = 'utf8'): { out: string | null; error?: string } {
+  const t0 = Date.now();
   try {
-    return { out: execFileSync('ethercat', args, { encoding: 'utf8', timeout: 3000 }) };
+    return { out: execFileSync('ethercat', args, { encoding, timeout: 3000 }) };
   } catch (err) {
     const e = err as NodeJS.ErrnoException & { stderr?: Buffer | string };
     if (e.code === 'ENOENT') return { out: null, error: 'ethercat CLI not found on PATH' };
@@ -41,6 +42,10 @@ function runEthercat(args: string[]): { out: string | null; error?: string } {
     // unprivileged user, and /dev/EtherCAT0 is root-owned until a udev rule grants
     // group access (see install.sh) — that shows up here as an EACCES in stderr/message.
     return { out: null, error: stderr || e.message || 'ethercat command failed' };
+  } finally {
+    // each of these freezes the whole backend (HMI commands, scan) while it runs: make the slow ones visible in the journal
+    const ms = Date.now() - t0;
+    if (ms > 300) console.warn(`[ethercat] blocked the backend ${ms} ms: ethercat ${args.join(' ')}`);
   }
 }
 
@@ -173,15 +178,16 @@ export function describeDiagnosisMessage(b: number[]): string {
   return `${name ?? 'unknown error'} (code 0x${code.toString(16).padStart(8, '0')}, log ${b.map(x => x.toString(16).padStart(2, '0')).join(' ')})`;
 }
 
-/** Newest entry of the coupler's error log (CoE 0x10F3, W519 A-7-5), as text; null = could not read. */
+/** The active error record (CoE 0x3809:02 Current Error 1, 50 bytes, W519 A-5-2), as text; null = could not read.
+ * `ethercat upload -t octet_string` prints the RAW bytes, not hex, so read them as latin1 (1 char = 1 byte; utf8 would corrupt
+ * every byte >= 0x80). shortcut: the record's layout isn't decoded - the first 4 bytes are shown as an event code (look it up in
+ * W519 13-3-2) with the whole record in hex; map event codes to names once seen on real faults. */
 export function readCouplerErrorDetail(): string | null {
-  const newest = sdoUpload('uint8', '0x10f3', '2');
-  if (!newest) return null;
-  const { out } = runEthercat(['upload', '-p', '0', '-t', 'octet_string', '0x10f3', String(newest)]);
-  if (out === null) return null;
-  const bytes = out.trim().split(/\s+/).filter(x => /^[0-9a-f]{2}$/i.test(x)).map(x => parseInt(x, 16));
-  // unparseable: show what the CLI printed (and which log entry) instead of a bare "no details"
-  return bytes.length >= 4 ? describeDiagnosisMessage(bytes) : `no details (0x10F3:${newest} read back: ${JSON.stringify(out.trim().slice(0, 80))})`;
+  const { out } = runEthercat(['upload', '-p', '0', '-t', 'octet_string', '0x3809', '2'], 'latin1');
+  if (out === null || out.length < 4) return null;
+  const b = Array.from(out.slice(0, 50), c => c.charCodeAt(0) & 0xff);
+  const code = (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
+  return `event code 0x${code.toString(16).padStart(8, '0')} (record ${b.map(x => x.toString(16).padStart(2, '0')).join(' ')})`;
 }
 
 /** Clears the coupler's + NX units' current errors by writing 01 to CoE
@@ -319,7 +325,13 @@ export function discoverRack(): RackDiscovery {
  * — the whole rack is one slave) and caches them on om.discoveredRack; each
  * card's own entry/entries are then sliced out fresh via allocateRackEntries. */
 export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warnings: string[] } {
-  const master = getMasterStatus();
+  let master = getMasterStatus();
+  // Right after an io_daemon (re)start the master is still Idle/Safe-Op for a moment, and SDO reads fail meanwhile: give it up to 4 s
+  // to reach Operation rather than reporting a phase/ident warning that is gone by the time anyone reads it.
+  for (let i = 0; i < 8 && master.toolAvailable && master.phase && !/^op/i.test(master.phase); i++) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+    master = getMasterStatus();
+  }
   if (!master.toolAvailable) {
     return {
       cards: om.cards.map(c => ({ ...c, actual: c.model, status: 'ok' as const })),
@@ -371,7 +383,7 @@ export function verifyEthercatRack(om: OmronConfig): { cards: IoRackCard[]; warn
   const identifiedCards = cards.map(card => {
     if (card.status !== 'ok') return card;
     const expectedIdent = NX_CARD_IDENTS[card.model];
-    const actualIdent = getSlotModuleIdent(card.slot);
+    const actualIdent = getSlotModuleIdent(card.slot) ?? getSlotModuleIdent(card.slot); // one retry: a single SDO read can time out
     if (expectedIdent === undefined) {
       // no confirmed ident for this model — can't verify beyond PDO-count allocation, but surface what the bus reports so it can be added
       if (actualIdent !== null) warnings.push(`${card.model} in slot ${card.slot}: identity not in the verified table (bus reports 0x${actualIdent.toString(16).padStart(8, '0')}) — add to NX_CARD_IDENTS once confirmed`);
