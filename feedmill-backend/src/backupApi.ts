@@ -1,17 +1,20 @@
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
-import express from 'express';
-import type { Express } from 'express';
+import type { Express, Response } from 'express';
+import { pipeline } from 'stream/promises';
 import Database from 'better-sqlite3';
 import type { Mill } from './mill.js';
-import { backupDb, dbFilePath } from './db.js';
+import { backupDb, dbFilePath, lastBatchNumber, keepBatchNumber } from './db.js';
 
 const DATA_DIR = process.env.MILL_DATA_DIR ?? path.join(process.cwd(), 'data');
 const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 const STATE_DIR = process.env.FEEDMILL_STATE_DIR ?? '/var/lib/feedmill';
 const FOLDER = path.join(STATE_DIR, 'backups');
-const MAX_BYTES = 256 * 1024 * 1024;
+const MAX_BYTES = 2 * 1024 ** 3; // matches client_max_body_size in install.sh
+const UPLOAD_PREFIX = path.join(DATA_DIR, 'restore-');
+// reading an uploaded database leaves -wal / -shm files beside it
+const removeUpload = (file: string) => ['', '-wal', '-shm'].forEach(s => fs.rmSync(file + s, { force: true }));
 
 type Kind = 'db' | 'config';
 const EXT: Record<Kind, string> = { db: 'db', config: 'json' };
@@ -110,7 +113,7 @@ export function registerBackupRoutes(app: Express, mill: Mill) {
   });
 
   // Replace the live file, then have systemd restart the backend on it.
-  function applyRestore(kind: Kind, src: string, res: express.Response) {
+  function applyRestore(kind: Kind, src: string, res: Response) {
     const guard = mill.guardConfigEdit();
     if (guard) { res.status(409).json({ error: guard }); return; }
     const bad = validate(kind, src);
@@ -118,6 +121,7 @@ export function registerBackupRoutes(app: Express, mill: Mill) {
     res.status(202).json({ accepted: true });
     setTimeout(() => {
       try {
+        const issued = lastBatchNumber(); // read before the db closes
         mill.stop(); // stops scans and closes the db so nothing rewrites what we restore
         if (kind === 'config') {
           fs.copyFileSync(src, `${CONFIG_PATH}.tmp`);
@@ -126,8 +130,10 @@ export function registerBackupRoutes(app: Express, mill: Mill) {
           for (const s of ['-wal', '-shm']) fs.rmSync(dbFilePath + s, { force: true });
           fs.copyFileSync(src, `${dbFilePath}.tmp`);
           fs.renameSync(`${dbFilePath}.tmp`, dbFilePath);
+          keepBatchNumber(dbFilePath, issued);
         }
       } catch (e) { console.error('restore failed:', e); }
+      if (src.startsWith(UPLOAD_PREFIX)) removeUpload(src); // now: the process exits before any later cleanup could
       // sudoers allows exactly this line (install.sh); if it fails (dev run), just exit non-zero
       execFile('sudo', ['-n', '/bin/systemctl', 'restart', '--no-block', 'feedmill-backend.service'], () => process.exit(1));
     }, 300);
@@ -144,13 +150,19 @@ export function registerBackupRoutes(app: Express, mill: Mill) {
   });
 
   // browser target: the client uploads the file body
-  app.post('/api/v1/backup/restore-upload', express.raw({ type: '*/*', limit: MAX_BYTES }), (req, res) => {
+  app.post('/api/v1/backup/restore-upload', async (req, res) => {
     const kind = kindOf(req.query.kind);
-    if (!kind || !Buffer.isBuffer(req.body) || req.body.length === 0) { res.status(400).json({ error: 'Bad restore request' }); return; }
-    const tmp = path.join(DATA_DIR, `restore-${Date.now()}.tmp`);
-    fs.writeFileSync(tmp, req.body);
-    // on success the process exits before this matters; on failure the temp file is removed
-    res.on('finish', () => setTimeout(() => fs.rmSync(tmp, { force: true }), 1000));
+    if (!kind) { res.status(400).json({ error: 'Bad restore request' }); return; }
+    if (Number(req.headers['content-length']) > MAX_BYTES) { res.status(413).json({ error: 'Backup file is too large' }); return; }
+    const tmp = `${UPLOAD_PREFIX}${Date.now()}.tmp`;
+    try {
+      await pipeline(req, fs.createWriteStream(tmp)); // straight to disk: a database backup can be large
+    } catch (e) {
+      removeUpload(tmp);
+      if (!res.destroyed) res.status(500).json({ error: `Upload failed: ${(e as Error).message}` });
+      return;
+    }
     applyRestore(kind, tmp, res);
+    if (res.statusCode !== 202) removeUpload(tmp); // refused (an accepted one is removed by applyRestore)
   });
 }

@@ -146,6 +146,7 @@ type CommandResult = { accepted: boolean; reason?: string; data?: unknown };
 interface BackendState {
   connected: boolean;
   ready: boolean;
+  staleSeconds: number; // how long since the last update, once that is too long to act on (0 = current)
   commandError: string | null;
   clearCommandError: () => void;
   equipment: BackendEquipment[];
@@ -171,7 +172,17 @@ interface BackendState {
   sendCommand: (action: string, targetId?: string, parameters?: Record<string, unknown>) => Promise<CommandResult>;
 }
 
-type SnapshotData = Omit<BackendState, 'connected' | 'ready' | 'commandError' | 'clearCommandError' | 'sendCommand'>;
+type SnapshotData = Omit<BackendState, 'connected' | 'ready' | 'staleSeconds' | 'commandError' | 'clearCommandError' | 'sendCommand'>;
+
+const STALE_MS = 3000;      // no update for this long: the screen is out of date
+const RECONNECT_MS = 10000; // and after this long the connection is given up and made again
+
+// Sent even from an out-of-date screen, because they can only stop things.
+const isStopCommand = (action: string, p?: Record<string, unknown>) =>
+  action === 'PauseBatch'
+  || (action === 'SetQueueHold' && p?.held === true)
+  || (action === 'SetEquipmentMode' && p?.mode === 'Off')
+  || (action === 'SetHammermillEnabled' && p?.enabled === false);
 
 const EMPTY_OMRON: BackendOmronConfig = { couplerType: 'none', ipAddress: '', nodeAddress: 1, eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
 
@@ -241,25 +252,30 @@ export function BackendProvider({ children }: { children: ReactNode }) {
   const errorTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const lastJson = useRef<Partial<Record<keyof SnapshotData, string>>>({});
   const latest = useRef<SnapshotData>(EMPTY_DATA);
+  const lastRx = useRef(0);
+  const [staleSeconds, setStaleSeconds] = useState(0);
 
   useEffect(() => {
     let ws: WebSocket;
     let reconnectTimer: ReturnType<typeof setTimeout>;
     let disposed = false;
 
+    function lost() {
+      if (disposed) return;
+      setConnected(false);
+      setReady(false);
+      wsRef.current = null;
+      reconnectTimer = setTimeout(connect, 2000);
+    }
+
     function connect() {
-      ws = new WebSocket(BACKEND_WS);
+      // paced=1: the backend sends the next update only after this screen confirms the last one
+      ws = new WebSocket(`${BACKEND_WS}?paced=1`);
       wsRef.current = ws;
 
       // A disposed effect's socket must not touch shared state: in dev, StrictMode's second mount shares wsRef.
-      ws.onopen = () => { if (!disposed) setConnected(true); };
-      ws.onclose = () => {
-        if (disposed) return;
-        setConnected(false);
-        setReady(false);
-        wsRef.current = null;
-        reconnectTimer = setTimeout(connect, 2000);
-      };
+      ws.onopen = () => { if (!disposed) { lastRx.current = Date.now(); setConnected(true); } };
+      ws.onclose = lost;
       ws.onerror = () => {};
 
       ws.onmessage = (e) => {
@@ -267,6 +283,9 @@ export function BackendProvider({ children }: { children: ReactNode }) {
         try {
           const msg = JSON.parse(e.data);
           if (msg.type === 'snapshot' && msg.data) {
+            ws.send(JSON.stringify({ type: 'ack' }));
+            lastRx.current = Date.now();
+            setStaleSeconds(0);
             const next = parseSnapshot(msg.data);
             setReady(true);
             // Keep the previous reference for unchanged slices so consumers and effects only re-run on real changes.
@@ -291,8 +310,18 @@ export function BackendProvider({ children }: { children: ReactNode }) {
     }
 
     connect();
+    const watchdog = setInterval(() => {
+      const age = ws.readyState === WebSocket.OPEN ? Date.now() - lastRx.current : 0;
+      setStaleSeconds(age > STALE_MS ? Math.floor(age / 1000) : 0);
+      if (age > RECONNECT_MS) { // a dead link may never report itself closed
+        ws.onclose = null; ws.onmessage = null;
+        ws.close();
+        lost();
+      }
+    }, 500);
     return () => {
       disposed = true;
+      clearInterval(watchdog);
       clearTimeout(reconnectTimer);
       clearTimeout(errorTimer.current);
       if (ws) ws.close();
@@ -309,7 +338,7 @@ export function BackendProvider({ children }: { children: ReactNode }) {
     const result = await new Promise<CommandResult>((resolve) => {
       const timeout = setTimeout(() => {
         cmdCallbacks.current.delete(requestId);
-        resolve({ accepted: false, reason: 'Timeout' });
+        resolve({ accepted: false, reason: 'No reply from the mill - it may still have done this. Check before pressing again' });
       }, ['ReadOmronRack', 'ConfigureOmron', 'ClearEthercatErrors'].includes(action) ? 60000 : 5000); // these shell out to the ethercat CLI many times
 
       cmdCallbacks.current.set(requestId, (r) => {
@@ -318,12 +347,14 @@ export function BackendProvider({ children }: { children: ReactNode }) {
       });
 
       const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'command', data: { requestId, action, targetId, parameters } }));
+      const open = ws?.readyState === WebSocket.OPEN;
+      const stale = Date.now() - lastRx.current > STALE_MS && !isStopCommand(action, parameters);
+      if (open && !stale) {
+        ws!.send(JSON.stringify({ type: 'command', data: { requestId, action, targetId, parameters } }));
       } else {
         clearTimeout(timeout);
         cmdCallbacks.current.delete(requestId);
-        resolve({ accepted: false, reason: 'Not connected' });
+        resolve({ accepted: false, reason: open ? 'This screen is out of date - command not sent' : 'Not connected' });
       }
     });
     if (!result.accepted && result.data === undefined) { // a rejection that carries data is a question for the operator (warnings, scale mismatch), not an error
@@ -335,7 +366,7 @@ export function BackendProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return (
-    <BackendCtx.Provider value={{ ...data, connected, ready, commandError, clearCommandError, sendCommand }}>
+    <BackendCtx.Provider value={{ ...data, connected, ready, staleSeconds, commandError, clearCommandError, sendCommand }}>
       {children}
     </BackendCtx.Provider>
   );

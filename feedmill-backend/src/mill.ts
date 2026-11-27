@@ -16,6 +16,7 @@ import { loadConfig, saveConfig, type MillConfig } from './config.js';
 import {
   openDb, closeDb, persistBatch, clearActiveBatch, loadActiveBatch, loadBatchesJson,
   archiveBatch, postInventoryEvent, persistFault, loadFaults,
+  peekBatchNumber, claimBatchNumber, batchInHistory, lastFaultNumber,
 } from './db.js';
 
 // Logic scan period (how often the loop is woken). Timers do NOT count scans: each scan measures the real time since the
@@ -123,7 +124,6 @@ export class Mill {
   omronConfig: OmronConfig = { couplerType: 'none', ipAddress: '', nodeAddress: 1, eccModel: 'NX-ECC203', cycleTimeUs: 5000, ringTopology: false, cards: [], rackVerified: false, warnings: [] };
   globalConfig: Record<string, string | number> = { motorStarterFaultDelay: 0.5, siteName: 'FEED MILL CONTROLLER' };
   private faultSeq = 300;
-  private batchSeq = 2000;
   private batchPersistCounter = 0;
   private dtMs = SCAN_MS; // real time since the previous scan
   private lastScanAt = performance.now();
@@ -154,7 +154,7 @@ export class Mill {
   constructor() {
     openDb();
     this.faults = loadFaults(); // the fault list stays through a power cycle
-    this.faultSeq = Math.max(this.faultSeq, ...this.faults.map(f => (parseInt(f.id.replace(/\D/g, ''), 10) || 0) + 1));
+    this.faultSeq = Math.max(this.faultSeq, lastFaultNumber() + 1);
     this.trimFaults();
     const cfg = loadConfig();
     if (cfg) {
@@ -180,6 +180,16 @@ export class Mill {
     }
     for (const b of saved) {
       if (['COMPLETED', 'FAULTED', 'ABORTED'].includes(b.state)) continue;
+      // older versions reused numbers after a restart: a batch carrying a finished batch's number gets a new one
+      if (batchInHistory(b.id)) {
+        const old = b.id;
+        b.order ??= Number(old);
+        clearActiveBatch(old);
+        b.id = String(peekBatchNumber());
+        claimBatchNumber(Number(b.id));
+        persistBatch(b);
+        console.warn(`Batch ${old} had the number of a finished batch: it is now batch ${b.id}`);
+      }
       if (b.state !== 'IDLE') {
         if (!['PAUSED', 'ABORTED_HOLD'].includes(b.state)) {
           b.previousState = b.state;
@@ -190,11 +200,6 @@ export class Mill {
         this.activeBatch = b;
       }
       this.queue.push(b);
-    }
-    // avoid ID collisions after restart
-    for (const b of this.queue) {
-      const n = parseInt(b.id, 10);
-      if (!isNaN(n) && n >= this.batchSeq) this.batchSeq = n + 1;
     }
   }
 
@@ -304,13 +309,13 @@ export class Mill {
         if (!this.bins.some(b => b.id === p.destination && b.type === 'finished')) return reject('Destination must be a finished bin');
         if (p.targetMass !== undefined && !(p.targetMass > 0)) return reject('Batch size must be above zero');
         if (p.scheduledAt && Number.isNaN(Date.parse(p.scheduledAt))) return reject('Bad scheduled time');
-        const batch = this.buildBatch(String(this.batchSeq), recipe, p.destination, p.targetMass, p.scheduledAt);
+        const batch = this.buildBatch(String(peekBatchNumber()), recipe, p.destination, p.targetMass, p.scheduledAt);
         // inventory / mixer-capacity warnings are raised here (not at start) so the live queue never stalls on a question
         const warnings = this.batchWarnings(batch);
         if (warnings.length && !p.acknowledged) return { ...reject('Warnings'), data: { warnings } };
-        this.batchSeq++;
+        claimBatchNumber(Number(batch.id));
         batch.warnings = warnings;
-        batch.order = Number(batch.id);
+        batch.order = 1 + Math.max(0, ...this.queue.map(q => q.order ?? Number(q.id))); // joins at the back, whatever its number
         this.queue.push(batch);
         persistBatch(batch);
         return ok('Queued as batch ' + batch.id);
@@ -988,7 +993,7 @@ export class Mill {
         if (!id) return reject('Missing targetId');
         if (!this.recipes.some(r => r.id === id)) return reject('Unknown recipe');
         if (this.activeBatch?.recipeId === id) return reject('Recipe in active batch');
-        if (this.queue.some(b => b.recipeId === id && !['COMPLETED', 'FAULTED'].includes(b.state))) return reject('Recipe in queued batch');
+        if (this.queue.some(b => b.recipeId === id && !['COMPLETED', 'FAULTED', 'ABORTED'].includes(b.state))) return reject('Recipe in queued batch');
         this.recipes = this.recipes.filter(r => r.id !== id);
         return ok();
       }
@@ -2308,11 +2313,12 @@ export class Mill {
   private postConsumption(b: BatchRuntime) {
     if (b.consumptionPosted) return;
     b.consumptionPosted = true;
-    for (const step of b.dosingSteps) {
+    for (const [i, step] of b.dosingSteps.entries()) {
       if (step.actual <= 0) continue;
       const bin = this.bins.find(bn => bn.id === step.sourceBinId);
       if (bin) bin.balance = Math.max(0, bin.balance - step.actual);
-      postInventoryEvent(`${b.id}-${step.ingredientId}-consume`, 'consumption', step.sourceBinId, step.ingredientId, -step.actual, step.unit, b.id);
+      // the step number keeps two lines of the same ingredient apart
+      postInventoryEvent(`${b.id}-${i}-${step.ingredientId}-consume`, 'consumption', step.sourceBinId, step.ingredientId, -step.actual, step.unit, b.id);
     }
     this.persistConfig();
   }
@@ -2647,9 +2653,10 @@ export class Mill {
       revision: this.revision,
       timestamp: new Date().toISOString(),
       equipment: eqList,
-      queue: this.queue.map(batchToQueue),
+      // only what is live goes to the screens (finished batches and cleared faults are read from the history on request)
+      queue: this.queue.filter(b => !['COMPLETED', 'FAULTED', 'ABORTED'].includes(b.state)).map(batchToQueue),
       activeBatch: this.activeBatch ? batchToQueue(this.activeBatch) : null,
-      faults: this.faults,
+      faults: this.faults.filter(f => f.active),
       // a bin is a micro bin when its auger discharges onto a micros conveyor (no separate bin type to configure)
       bins: this.bins.map(b => ({ ...b, type: b.type === 'ingredient' && this.isMicroBin(b.id) ? 'micro_hopper' as const : b.type, hidden: this.isHidden(b.id) || undefined, levelSwitchState: this.levelState(b.id) })),
       recipes: this.recipes,

@@ -106,6 +106,11 @@ function PageInner() {
           Backend disconnected — reconnecting…
         </div>
       )}
+      {backend?.connected && backend.staleSeconds > 0 && (
+        <div role="alert" className="px-5 py-2" style={{ background: 'var(--orange)', color: '#000', fontSize: '12px', fontWeight: 600 }}>
+          No update from the mill for {backend.staleSeconds} s — this screen is out of date. Only stop commands are sent.
+        </div>
+      )}
       {backend?.connected && activeFaults > 0 && (
         <div role="alert" className="flex items-center justify-between px-5 py-2" style={{ background: 'var(--bg-row)', borderBottom: '1px solid var(--border)', color: 'var(--red)', fontSize: '12px', fontWeight: 600 }}>
           <span>{activeFaults} active fault{activeFaults === 1 ? '' : 's'}: {faults.find(f => f.active)?.message}</span>

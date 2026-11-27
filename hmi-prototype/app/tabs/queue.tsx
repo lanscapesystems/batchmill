@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import { type QueueEntry, type Recipe, type Bin, type ToleranceHold, type DosingError } from '../sim-data';
 import { useBackend, type BackendBatch } from '../backend';
 import { useMillStore, type FlowConnection } from '../store';
+import { ALL_DATES, DateRangeInputs, Pager, dateTime, useHistory } from './history';
 
 const stateColor: Record<string, string> = {
   IDLE: 'var(--gray)',
@@ -28,7 +29,13 @@ const stateLabel = (s: string) => (s === 'IDLE' ? 'QUEUED' : s.replace(/_/g, ' '
 
 const btnBase = { padding: '6px 14px', borderRadius: '3px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 600 } as const;
 
-function backendToQueueEntry(b: BackendBatch): QueueEntry {
+// a finished batch as the history returns it: no progress, and only the dosing figures
+type HistoryBatch = Omit<BackendBatch, 'progress' | 'dosingSteps'> & {
+  progress?: number;
+  dosingSteps?: Pick<NonNullable<BackendBatch['dosingSteps']>[number], 'ingredientId' | 'ingredientName' | 'sourceBinId' | 'target' | 'actual' | 'unit'>[];
+};
+
+function backendToQueueEntry(b: HistoryBatch): QueueEntry {
   return {
     id: b.id, recipeId: b.recipeId, recipeName: b.recipeName,
     targetMass: b.targetMass, destination: b.destination,
@@ -112,9 +119,9 @@ export function QueueTab() {
   const hasActiveBatch = !!activeBatchEntry;
   const queueHeld = backend?.queueControl.held ?? true;
   const queueWaiting = backend?.queueControl.waiting;
-  const TERMINAL = new Set(['COMPLETED', 'FAULTED', 'ABORTED']);
-  const active = queueData.filter(q => !TERMINAL.has(q.state));
-  const history = queueData.filter(q => TERMINAL.has(q.state));
+  const [historyRange, setHistoryRange] = useState(ALL_DATES);
+  // re-read when a batch leaves the live queue (it has just been added to the history)
+  const history = useHistory<HistoryBatch>('batches', historyRange, `${backend?.connected} ${queueData.map(q => q.id).join()}`);
 
   // Hammermills
   const hammermills = equipment.filter(e => e.equipmentType === 'hammermill');
@@ -326,15 +333,15 @@ export function QueueTab() {
             </tr>
           </thead>
           <tbody>
-            {active.map((q, i) => (
-              <BatchRow key={`${q.id}-${i}`} entry={q} expanded={expanded === q.id}
+            {queueData.map(q => (
+              <BatchRow key={q.id} entry={q} expanded={expanded === q.id}
                 onToggle={() => setExpanded(expanded === q.id ? null : q.id)}
                 onEdit={EDITABLE_STATES.has(q.state) ? () => setEditBatchId(q.id) : undefined}
                 onDelete={EDITABLE_STATES.has(q.state) && backend?.connected ? () => backend.sendCommand('DeleteBatch', q.id) : undefined}
                 onMove={EDITABLE_STATES.has(q.state) && backend?.connected ? (dir) => backend.sendCommand('MoveBatch', q.id, { direction: dir }) : undefined}
                 ingredients={ingredients} />
             ))}
-            {active.length === 0 && (
+            {queueData.length === 0 && (
               <tr><td colSpan={6} className="py-3 text-center" style={{ color: 'var(--fg-dim)' }}>No batches queued</td></tr>
             )}
           </tbody>
@@ -342,7 +349,7 @@ export function QueueTab() {
       </Panel>
 
       {/* History */}
-      <Panel title="HISTORY">
+      <Panel title="HISTORY" action={<DateRangeInputs range={historyRange} onChange={setHistoryRange} />}>
         <table className="w-full" style={{ borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ borderBottom: '1px solid var(--border)', color: 'var(--fg-dim)', fontSize: '12px' }}>
@@ -351,16 +358,22 @@ export function QueueTab() {
               <th className="text-right py-2 px-3">Target</th>
               <th className="text-left py-2 px-3">Dest</th>
               <th className="text-left py-2 px-3">State</th>
+              <th className="text-right py-2 px-3">Finished</th>
             </tr>
           </thead>
           <tbody>
-            {history.map((q, i) => (
-              <BatchRow key={`${q.id}-${i}`} entry={q} expanded={expanded === q.id}
-                onToggle={() => setExpanded(expanded === q.id ? null : q.id)}
-                ingredients={ingredients} />
+            {history.rows.map(b => (
+              <BatchRow key={b.id} entry={backendToQueueEntry(b)} finished expanded={expanded === b.id}
+                onToggle={() => setExpanded(expanded === b.id ? null : b.id)}
+                // names as recorded with the batch, so a deleted ingredient still reads correctly
+                ingredients={(b.dosingSteps ?? []).map(s => ({ id: s.ingredientId, name: s.ingredientName }))} />
             ))}
+            {history.message && (
+              <tr><td colSpan={6} className="py-3 text-center" style={{ color: 'var(--fg-dim)', fontSize: '12px' }}>{history.message}</td></tr>
+            )}
           </tbody>
         </table>
+        <Pager history={history} />
       </Panel>
 
       {/* Cancel batch: acknowledged here; nothing is discharged */}
@@ -468,8 +481,8 @@ export function QueueTab() {
   );
 }
 
-function BatchRow({ entry: q, expanded, onToggle, onEdit, onDelete, onMove, ingredients }: {
-  entry: QueueEntry; expanded: boolean; onToggle: () => void; onEdit?: () => void; onDelete?: () => void; onMove?: (dir: 'up' | 'down') => void; ingredients: { id: string; name: string }[];
+function BatchRow({ entry: q, finished, expanded, onToggle, onEdit, onDelete, onMove, ingredients }: {
+  entry: QueueEntry; finished?: boolean; expanded: boolean; onToggle: () => void; onEdit?: () => void; onDelete?: () => void; onMove?: (dir: 'up' | 'down') => void; ingredients: { id: string; name: string }[];
 }) {
   return (
     <>
@@ -487,13 +500,11 @@ function BatchRow({ entry: q, expanded, onToggle, onEdit, onDelete, onMove, ingr
             {q.late && <span style={{ color: 'var(--orange)', fontSize: '11px' }}>late</span>}
           </span>
         </td>
-        {q.state !== 'COMPLETED' && (
-          <td className="py-2 px-3 text-right">{q.progress != null ? `${q.progress.toFixed(1)}%` : '—'}</td>
-        )}
+        <td className="py-2 px-3 text-right">{finished ? dateTime(q.completedAt) : q.progress != null ? `${q.progress.toFixed(1)}%` : '—'}</td>
       </tr>
       {expanded && (
         <tr style={{ background: 'var(--bg-row)' }}>
-          <td colSpan={7} className="px-6 py-2">
+          <td colSpan={6} className="px-6 py-2">
             {q.warnings && q.warnings.length > 0 && (
               <ul style={{ color: 'var(--orange)', fontSize: '11px', margin: '0 0 6px 16px', listStyle: 'disc' }}>
                 {q.warnings.map((w, i) => <li key={i}>{w}</li>)}

@@ -526,6 +526,18 @@ install -m 0644 -o root -g root /dev/stdin /etc/nginx/conf.d/feedmill.conf <<EOF
 server {
     listen 80 default_server;
 
+    gzip on;
+    gzip_types application/json; # history pages, over a VPN
+
+    # restoring a database backup from the browser: the default limit is 1 MB
+    location = /api/v1/backup/restore-upload {
+        client_max_body_size 2g;
+        proxy_request_buffering off;
+        proxy_read_timeout 600s;
+        proxy_pass http://127.0.0.1:3001/api/v1/backup/restore-upload;
+        proxy_set_header Host \$host;
+    }
+
     location /ws/hmi {
         proxy_pass http://127.0.0.1:3001/ws/hmi;
         proxy_http_version 1.1;

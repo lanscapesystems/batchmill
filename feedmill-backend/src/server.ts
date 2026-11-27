@@ -4,7 +4,9 @@ import cors from 'cors';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { Mill } from './mill.js';
-import type { Command, CommandResult, StateSnapshot } from './types.js';
+import type { Command, CommandResult } from './types.js';
+import { screenFeed } from './hmiFeed.js';
+import { batchHistory, faultHistory, historyQuery, pruneFaults } from './db.js';
 import { reconcileScaleReaders } from './scaleReader.js';
 import { registerUpdateRoutes } from './updateApi.js';
 import { registerBackupRoutes } from './backupApi.js';
@@ -29,7 +31,7 @@ const mill = new Mill();
 
 // ── WebSocket servers on separate paths ──
 
-const wssHmi = new WebSocketServer({ noServer: true });
+const wssHmi = new WebSocketServer({ noServer: true, perMessageDeflate: true }); // snapshots compress to a fraction
 
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
@@ -42,14 +44,16 @@ server.on('upgrade', (req, socket, head) => {
 
 // ── HMI WebSocket: broadcast state snapshots ──
 
-const hmiClients = new Set<WebSocket>();
+const hmiClients = new Map<WebSocket, ReturnType<typeof screenFeed>>();
+const snapshotMessage = () => JSON.stringify({ type: 'snapshot', data: mill.getSnapshot() });
 
-wssHmi.on('connection', (ws) => {
-  hmiClients.add(ws);
+wssHmi.on('connection', (ws, req) => {
+  const feed = screenFeed(ws, new URL(req.url ?? '/', 'http://localhost').searchParams.has('paced'), snapshotMessage);
+  hmiClients.set(ws, feed);
   console.log(`HMI client connected (${hmiClients.size} total)`);
 
   // send initial snapshot immediately
-  try { ws.send(JSON.stringify({ type: 'snapshot', data: mill.getSnapshot() })); } catch {}
+  try { feed.send(snapshotMessage()); } catch {}
 
   ws.on('close', () => { hmiClients.delete(ws); });
   ws.on('error', () => { hmiClients.delete(ws); });
@@ -58,7 +62,8 @@ wssHmi.on('connection', (ws) => {
     let requestId: string | undefined;
     try {
       const msg = JSON.parse(raw.toString());
-      if (msg.type === 'command') {
+      if (msg.type === 'ack') feed.confirm();
+      else if (msg.type === 'command') {
         requestId = msg.data?.requestId;
         const result = mill.processCommand(msg.data as Command);
         const reply = (data: CommandResult) => { ws.send(JSON.stringify({ type: 'command_result', data })); pushSoon(); };
@@ -74,14 +79,11 @@ wssHmi.on('connection', (ws) => {
   });
 });
 
-function broadcastToHmi(data: StateSnapshot) {
+function broadcastToHmi() {
   if (hmiClients.size === 0) return;
-  const snapshot = JSON.stringify({ type: 'snapshot', data });
-  for (const ws of hmiClients) {
-    // a screen still receiving the last snapshot skips this one instead of queueing it and falling ever further behind
-    if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount === 0) {
-      try { ws.send(snapshot); } catch { hmiClients.delete(ws); }
-    }
+  const snapshot = snapshotMessage();
+  for (const [ws, feed] of hmiClients) {
+    try { feed.send(snapshot); } catch { hmiClients.delete(ws); }
   }
 }
 
@@ -89,7 +91,7 @@ function broadcastToHmi(data: StateSnapshot) {
 // outputs and motor states first; commands arriving together share one push.
 let pushTimer: ReturnType<typeof setTimeout> | undefined;
 function pushSoon() {
-  pushTimer ??= setTimeout(() => { pushTimer = undefined; broadcastToHmi(mill.getSnapshot()); }, 30);
+  pushTimer ??= setTimeout(() => { pushTimer = undefined; broadcastToHmi(); }, 30);
 }
 
 // ── Scale readers: start at boot, restart whenever ConfigureScale/RemoveScale changes the list ──
@@ -123,6 +125,14 @@ app.get('/api/v1/trend/:id', (req, res) => {
   res.json(mill.getTrend(req.params.id));
 });
 
+app.get('/api/v1/history/batches', (req, res) => {
+  res.json(batchHistory(historyQuery(req.query)));
+});
+
+app.get('/api/v1/history/faults', (req, res) => {
+  res.json(faultHistory(historyQuery(req.query)));
+});
+
 app.get('/api/v1/health', (_req, res) => {
   res.json({
     status: 'ok',
@@ -149,7 +159,7 @@ app.post('/api/v1/shutdown', (_req, res) => {
   res.json({ status: 'shutting_down' });
   setTimeout(() => {
     mill.stop();
-    for (const ws of hmiClients) ws.close();
+    for (const ws of hmiClients.keys()) ws.close();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(0), 3000);
   }, 200);
@@ -163,9 +173,10 @@ mill.start(() => {
 
 setInterval(() => {
   maybeReconcileScaleReaders();
-  if (hmiClients.size === 0) return;
-  broadcastToHmi(mill.getSnapshot());
+  broadcastToHmi();
 }, BROADCAST_INTERVAL_MS);
+
+setInterval(() => pruneFaults(), 86_400_000).unref();
 
 // Event-loop stall log: a timer that fires >250 ms late means something blocked the backend (HMI commands time out meanwhile).
 let lastLoopTick = Date.now();

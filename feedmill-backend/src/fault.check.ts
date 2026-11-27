@@ -110,7 +110,7 @@ bus(false, 9); assert.ok(!active('E-OM-02')); bus(false); assert.ok(active('E-OM
 // ── the fault list sent to the screens is limited; active faults are never dropped ──
 reset(); (m as any).raiseFault('A1', 'WARNING', 'keep', 'W-KEEP');
 for (let i = 0; i < 300; i++) { (m as any).raiseFault('A1', 'WARNING', 'x', `W-X-${i}`); (m as any).clearFault(`W-X-${i}`); }
-assert.equal(m.getSnapshot().faults.length, 200); assert.ok(active('W-KEEP'));
+assert.equal(m.faults.length, 200); assert.ok(active('W-KEEP'));
 
 // ── entries the daemon could not register: one fault naming them, inputs read off, cleared once they are back ──
 reset(); Object.assign(m.omronConfig, { couplerType: 'NX-ECC', rackVerified: true }); m.dtMs = 20; m.lastDaemonStartUs = null;

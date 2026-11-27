@@ -14,6 +14,7 @@ export function openDb(): void {
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = FULL');
   db.exec(SCHEMA);
+  pruneFaults();
 }
 
 export function closeDb(): void {
@@ -73,22 +74,61 @@ CREATE TABLE IF NOT EXISTS fault_log (
   raised_at TEXT NOT NULL,
   cleared_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS batch_json (id TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+
+CREATE INDEX IF NOT EXISTS batch_history_completed ON batch_history (completed_at);
+CREATE INDEX IF NOT EXISTS fault_log_raised ON fault_log (raised_at);
+CREATE INDEX IF NOT EXISTS inventory_events_batch ON inventory_events (batch_id);
 `;
+
+// ── batch numbers: count up from 1 and are never issued twice ──
+
+const lastBatchSql = "SELECT value FROM counters WHERE name = 'batch'";
+const raiseBatchSql = "INSERT INTO counters (name, value) VALUES ('batch', ?) ON CONFLICT(name) DO UPDATE SET value = MAX(value, excluded.value)";
+
+export function lastBatchNumber(): number {
+  return (db.prepare(lastBatchSql).get() as { value: number } | undefined)?.value ?? 0;
+}
+
+// The next number after the last one issued, passing over any that a record already carries (older versions started at 2000).
+export function peekBatchNumber(): number {
+  const onRecord = db.prepare(`SELECT 1 FROM batch_history WHERE id = @id UNION ALL SELECT 1 FROM batch_json WHERE id = @id
+    UNION ALL SELECT 1 FROM active_batch WHERE id = @id UNION ALL SELECT 1 FROM inventory_events WHERE batch_id = @id`);
+  let n = lastBatchNumber() + 1;
+  while (onRecord.get({ id: String(n) })) n++;
+  return n;
+}
+
+export function claimBatchNumber(n: number): void {
+  db.prepare(raiseBatchSql).run(n);
+}
+
+// A restored (older) database must not hand out numbers that were issued after its backup was made.
+export function keepBatchNumber(file: string, issued: number): void {
+  const restored = new Database(file);
+  try {
+    restored.exec('CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL)');
+    restored.prepare(raiseBatchSql).run(issued);
+  } finally { restored.close(); }
+}
+
+export function batchInHistory(id: string): boolean {
+  return !!db.prepare('SELECT 1 FROM batch_history WHERE id = ?').get(id);
+}
 
 // ── batch persistence: the whole batch as JSON, queued and active alike (queued batches survive a restart) ──
 
 export function persistBatchJson(b: BatchRuntime): void {
-  db.prepare('CREATE TABLE IF NOT EXISTS batch_json (id TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at TEXT NOT NULL)').run();
   db.prepare('INSERT OR REPLACE INTO batch_json (id, json, updated_at) VALUES (?,?,?)').run(b.id, JSON.stringify(b), new Date().toISOString());
 }
 
 export function removeBatchJson(id: string): void {
-  db.prepare('CREATE TABLE IF NOT EXISTS batch_json (id TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at TEXT NOT NULL)').run();
   db.prepare('DELETE FROM batch_json WHERE id = ?').run(id);
 }
 
 export function loadBatchesJson(): BatchRuntime[] {
-  db.prepare('CREATE TABLE IF NOT EXISTS batch_json (id TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at TEXT NOT NULL)').run();
   return (db.prepare('SELECT json FROM batch_json ORDER BY rowid').all() as { json: string }[]).map(r => JSON.parse(r.json) as BatchRuntime);
 }
 
@@ -137,10 +177,11 @@ const insertHistory = () => db.prepare(`
 `);
 
 export function archiveBatch(b: BatchRuntime): void {
-  insertHistory().run(
+  const { changes } = insertHistory().run(
     b.id, b.recipeId, b.recipeName, b.targetMass, b.destination, b.state,
     b.startedAt, b.completedAt ?? null, JSON.stringify(b.dosingSteps), b.mixTimeTotalMs,
   );
+  if (!changes) console.error(`Batch ${b.id} is already in the history: this record was NOT saved`);
 }
 
 // ── inventory events ──
@@ -186,6 +227,68 @@ export function persistFault(f: Fault): void {
     f.id, f.severity, f.equipment, f.message, f.code,
     f.raisedAt, f.clearedAt,
   );
+}
+
+export function lastFaultNumber(): number {
+  return (db.prepare('SELECT MAX(CAST(SUBSTR(id, 3) AS INTEGER)) AS n FROM fault_log').get() as { n: number | null }).n ?? 0;
+}
+
+const FAULT_KEEP_DAYS = 365;
+const FAULT_KEEP_NEWEST = 1000; // kept whatever their age, so a wrong system clock cannot empty the history
+
+export function pruneFaults(now = Date.now()): void {
+  db.prepare(`DELETE FROM fault_log WHERE cleared_at IS NOT NULL AND cleared_at < ?
+    AND id NOT IN (SELECT id FROM fault_log ORDER BY raised_at DESC LIMIT ${FAULT_KEEP_NEWEST})`)
+    .run(new Date(now - FAULT_KEEP_DAYS * 86_400_000).toISOString());
+}
+
+// ── history, read a page at a time when a screen asks ──
+
+export const HISTORY_PAGE = 50;
+export interface HistoryQuery { from?: string; to?: string; offset: number; code?: string; equipment?: string }
+
+export function historyQuery(q: Record<string, unknown>): HistoryQuery {
+  const when = (v: unknown) => (typeof v === 'string' && !Number.isNaN(Date.parse(v)) ? new Date(v).toISOString() : undefined);
+  const text = (v: unknown) => (typeof v === 'string' && v ? v : undefined);
+  return { from: when(q.from), to: when(q.to), offset: Math.max(0, Math.floor(Number(q.offset)) || 0), code: text(q.code), equipment: text(q.equipment) };
+}
+
+function page<T>(select: string, timeColumn: string, q: HistoryQuery, rest: string, where: [string, string][] = []): { rows: T[]; more: boolean } {
+  if (q.from) where.push([`${timeColumn} >= ?`, q.from]);
+  if (q.to) where.push([`${timeColumn} < ?`, q.to]);
+  const filter = where.length ? `WHERE ${where.map(w => w[0]).join(' AND ')}` : '';
+  const rows = db.prepare(`${select} ${filter} ${rest} LIMIT ${HISTORY_PAGE + 1} OFFSET ?`).all(...where.map(w => w[1]), q.offset) as T[];
+  return { rows: rows.slice(0, HISTORY_PAGE), more: rows.length > HISTORY_PAGE };
+}
+
+export function batchHistory(q: HistoryQuery) {
+  const { rows, more } = page<Record<string, string | number | null>>(
+    'SELECT * FROM batch_history', 'completed_at', q, 'ORDER BY completed_at DESC, rowid DESC');
+  return {
+    more,
+    rows: rows.map(r => ({
+      id: r.id as string, recipeId: r.recipe_id as string, recipeName: r.recipe_name as string,
+      targetMass: r.target_mass as number, destination: r.destination as string, state: r.final_state as string,
+      startedAt: r.started_at as string, completedAt: (r.completed_at as string | null) ?? undefined,
+      dosingSteps: (JSON.parse(r.dosing_steps as string) as DosingStep[]).map(s => ({
+        ingredientId: s.ingredientId, ingredientName: s.ingredientName, sourceBinId: s.sourceBinId,
+        target: s.target, actual: Math.round(s.actual * 10) / 10, unit: s.unit,
+      })),
+    })),
+  };
+}
+
+// Without a code: one row per fault (code + equipment) with how often it happened. With one: each occurrence.
+export function faultHistory(q: HistoryQuery) {
+  if (q.code && q.equipment) {
+    return page<{ id: string; raisedAt: string; clearedAt: string | null; message: string }>(
+      'SELECT id, raised_at AS raisedAt, cleared_at AS clearedAt, message FROM fault_log', 'raised_at', q,
+      'ORDER BY raised_at DESC, rowid DESC', [['code = ?', q.code], ['equipment = ?', q.equipment]]);
+  }
+  // SQLite takes the bare columns (severity, message) from the row that holds MAX(raised_at): the latest occurrence
+  return page<{ code: string; equipment: string; severity: string; message: string; count: number; lastAt: string }>(
+    'SELECT code, equipment, severity, message, COUNT(*) AS count, MAX(raised_at) AS lastAt FROM fault_log', 'raised_at', q,
+    'GROUP BY code, equipment ORDER BY lastAt DESC');
 }
 
 export const dbFilePath = DB_PATH;
