@@ -818,6 +818,7 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
         {v('rotationPulseInput') && <>
           {row('Pulses per Rev', numIn('pulsesPerRev', 1))}
           {row('Min RPM', numIn('minRpm', 0))}
+          {row('Warn RPM (0 = off)', numIn('warnRpm', 0))}
           {row('Rotation Startup Delay', numIn('rotationStartupDelay', 0, 's', 0.1))}
         </>}
       </>}
@@ -1719,7 +1720,7 @@ function GlobalSection() {
             : <span style={{ color: globalConfig.estopInput ? 'var(--fg-bright)' : 'var(--fg-dim)' }}>{(globalConfig.estopInput as string) || 'Not Assigned'}</span>}
         </div>
 
-        {([['hornOutput', 'Horn Output', 'DO'], ['hornSilenceInput', 'Horn Silence Input', 'DI']] as const).map(([key, label, dir]) => (
+        {([['hornOutput', 'Horn Output', 'DO'], ['hornSilenceInput', 'Horn Silence Input', 'DI'], ['faultResetInput', 'Fault Reset Input', 'DI']] as const).map(([key, label, dir]) => (
           <div key={key} className="flex items-center gap-2">
             <span style={{ color: 'var(--fg-dim)', width: '200px', flexShrink: 0 }}>{label}</span>
             {editing

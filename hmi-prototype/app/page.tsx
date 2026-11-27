@@ -106,6 +106,12 @@ function PageInner() {
           Backend disconnected — reconnecting…
         </div>
       )}
+      {backend?.connected && activeFaults > 0 && (
+        <div role="alert" className="flex items-center justify-between px-5 py-2" style={{ background: 'var(--bg-row)', borderBottom: '1px solid var(--border)', color: 'var(--red)', fontSize: '12px', fontWeight: 600 }}>
+          <span>{activeFaults} active fault{activeFaults === 1 ? '' : 's'}: {faults.find(f => f.active)?.message}</span>
+          <button onClick={() => setTab('Faults')} style={{ background: 'transparent', border: '1px solid var(--border)', borderRadius: '3px', color: 'var(--fg-dim)', cursor: 'pointer', padding: '2px 8px', fontSize: '11px', fontWeight: 600 }}>View</button>
+        </div>
+      )}
       {backend?.commandError && (
         <div role="alert" className="flex items-center justify-between px-5 py-2" style={{ background: 'var(--bg-row)', borderBottom: '1px solid var(--border)', color: 'var(--red)', fontSize: '12px', fontWeight: 600 }}>
           <span>Command rejected: {backend.commandError}</span>

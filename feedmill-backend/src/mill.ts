@@ -44,6 +44,9 @@ const BYPASSABLE = ['runConfirmAux', 'vfdAuxInput', 'motorAuxInput', 'analogLoad
   'highLevelInput', 'lowLevelInput'];
 // Faults that latch their equipment in 'fault' until reset (restored on boot if the equipment state was lost).
 const TRIP_CODES = ['E-MT-01', 'E-MT-02', 'E-MT-03', 'E-LD-01', 'E-LD-03', 'E-GT-01', 'E-GT-03', 'E-GT-04', 'W-GT-02'];
+// Level faults follow their own cause and clear themselves (E-stop, bus/rack, open sensor, level switches, low speed warning);
+// the operator's reset leaves them alone. Every other code is latched like the PLC's FaultReset list: it stays until reset.
+const LEVEL_FAULT = /^(E-ES-01|E-OM-|W-OM-|W-AI-|W-LV-|W-MT-02)/;
 type LoadMon = { avgSize: number; avg: MovingAverage; hiWarn: OnDelay; hiPause: OnDelay; pid: LoadPid; tuner?: RelayTuner; tuneBase?: number; tuneWasAuto?: boolean };
 
 // One hammermill refill cycle: all path equipment is requested at once and runs until the destination high switch.
@@ -65,7 +68,7 @@ const PORT_LABELS: Record<string, string> = {
 };
 
 // Hammermills have no rotation switch: drop its keys wherever a hammermill's config enters (load, add, update).
-const HM_NO_ROTATION = ['rotationPulseInput', 'pulsesPerRev', 'minRpm', 'rotationStartupDelay', 'bypass_rotationPulseInput'];
+const HM_NO_ROTATION = ['rotationPulseInput', 'pulsesPerRev', 'minRpm', 'warnRpm','rotationStartupDelay', 'bypass_rotationPulseInput'];
 function stripHammermillRotation(eq: EquipmentRuntime) {
   if (eq.equipmentType === 'hammermill') for (const k of HM_NO_ROTATION) delete eq.config[k];
 }
@@ -637,6 +640,13 @@ export class Mill {
         return ok();
       }
 
+      // The PLC's FaultReset: clears every latched fault and the trip latches. It never resumes a batch (Resume stays the operator's
+      // call) and leaves level faults to their cause, so a cause that is still there raises a fresh fault on the next scan.
+      case 'ResetFaults': {
+        const r = this.resetFaults();
+        return ok(`${r.cleared} cleared${r.kept ? `, ${r.kept} still present` : ''}`);
+      }
+
       case 'ClearFault': {
         const f = this.faults.find(f => f.id === cmd.targetId && f.active);
         if (!f) return reject('Fault not found');
@@ -1159,6 +1169,8 @@ export class Mill {
     const ioState = readIoState(); // read once; shared by readRealInputs and updateRotationSensors
     this.updateBusHealth(ioState);
     this.readRealInputs(ioState);
+    this.updateFaultResetInput();
+    this.checkScaleFaults();
     this.checkLevelSensors();
     this.updateRefills();
     this.updateEquipmentStates();
@@ -1265,7 +1277,7 @@ export class Mill {
       for (const eq of this.equipment.values()) {
         if (eq.equipmentType === 'hammermill' && eq.status !== 'fault' && eq.status !== 'disabled') this.pauseHammermill(eq);
       }
-    }
+    } else this.clearFault('E-ES-01'); // level fault: gone when the circuit is back (Resume / re-enable stay manual)
     const downstreamFirst = this.motorsDownstreamFirst();
     for (let i = downstreamFirst.length - 1; i >= 0; i--) this.motorRunLogic(downstreamFirst[i]);
     for (const eq of downstreamFirst) this.motorInterlock(eq);
@@ -1364,6 +1376,12 @@ export class Mill {
         this.raiseFault(eq.id, 'CRITICAL',
           `${eq.name}: rotation stall (${(st.rpm ?? 0).toFixed(0)} RPM < ${minRpm} min)`, 'E-MT-02');
       }
+      // PLC Rot.RpmWarn: below the warn speed is only a warning (horn + list) that clears when the speed recovers.
+      const warnRpm = eq.config.warnRpm as number | undefined;
+      if (typeof warnRpm === 'number' && warnRpm > 0 && eq.status === 'running' && st.runningMs >= startupDelay) {
+        if ((st.rpm ?? 0) < warnRpm) this.raiseFault(eq.id, 'WARNING', `${eq.name}: low rotation speed (${(st.rpm ?? 0).toFixed(0)} RPM < ${warnRpm} warn)`, 'W-MT-02');
+        else this.clearFault('W-MT-02', eq.id);
+      } else this.clearFault('W-MT-02', eq.id);
     }
   }
 
@@ -1580,6 +1598,61 @@ export class Mill {
   }
 
   getTrend(id: string) { return this.trends.get(id) ?? []; }
+
+  private resetFaults(): { cleared: number; kept: number } {
+    const now = new Date().toISOString();
+    let cleared = 0, kept = 0;
+    for (const f of this.faults) {
+      if (!f.active) continue;
+      if (LEVEL_FAULT.test(f.code) || (f.code === 'E-EC-01' && !clearCouplerErrors().ok)) { kept++; continue; }
+      f.active = false; f.clearedAt = now; f.acknowledgedAt ??= now;
+      persistFault(f);
+      cleared++;
+    }
+    for (const eq of this.equipment.values()) {
+      if (eq.status === 'fault') { eq.status = 'not_running'; eq.faultReason = undefined; eq.faultTimerMs = 0; }
+    }
+    return { cleared, kept };
+  }
+
+  // Optional physical Fault Reset pushbutton: a rising edge is the same as the HMI's Reset.
+  private faultResetPrev = false;
+  private updateFaultResetInput() {
+    const sig = this.globalConfig.faultResetInput as string | undefined;
+    const now = !!(sig && this.ioInputs[sig]);
+    if (now && !this.faultResetPrev) this.resetFaults();
+    this.faultResetPrev = now;
+  }
+
+  // Omron Scale Out-of-Range / Data Invalid / Comm faults: a scale a mixer or micros conveyor uses that stays invalid past the
+  // delay is a latched fault (no reading yet is not a fault: nothing has been wired). Batch steps already hold on an invalid scale.
+  private scaleBadMs = new Map<string, number>();
+  private checkScaleFaults() {
+    const delay = delayMs(this.globalConfig.scaleFaultDelay, 2);
+    for (const eq of this.equipment.values()) {
+      const id = eq.config.scaleId as string | undefined;
+      if (!id || (eq.equipmentType !== 'mixer' && eq.equipmentType !== 'micro_drag')) continue;
+      const s = this.scales[id];
+      if (!s || s.valid) { this.scaleBadMs.set(id, 0); continue; }
+      const t = (this.scaleBadMs.get(id) ?? 0) + this.dtMs;
+      this.scaleBadMs.set(id, t);
+      if (t >= delay) this.raiseFault(id, 'CRITICAL', `Scale ${id}: data invalid, out of range or no communication`, 'E-SC-01');
+    }
+  }
+
+  // Omron Mixer/Micros Zero Tolerance fault: a stable scale off zero (either side) when the next batch is due. The batch keeps
+  // waiting (it starts by itself once the scale is back); the fault is the horn and the log entry.
+  private zeroToleranceFault(b: BatchRuntime) {
+    const check = (eq: EquipmentRuntime | undefined, limit: number, code: string) => {
+      const s = eq?.config.scaleId ? this.scales[eq.config.scaleId as string] : undefined;
+      if (eq && s?.valid && s.stable && Math.abs(s.weight) >= limit) {
+        this.raiseFault(eq.id, 'CRITICAL', `${eq.name}: scale reads ${round1(s.weight)} lb at batch start - verify it is empty and zero the scale`, code);
+      }
+    };
+    check(this.findEquipmentByType('mixer'), this.emptyLbs(), 'E-BA-05');
+    const conv = this.microConveyor(b);
+    if (conv) check(conv, this.microZeroLbs(conv), 'E-BA-06');
+  }
 
   private hornRearm() { this.hornSilenced = false; this.hornAutoMs = 0; this.hornPhaseOn = true; this.hornPhaseMs = 0; }
   private toggleHornSilence() { if (this.hornSilenced) this.hornRearm(); else this.hornSilenced = true; }
@@ -1830,7 +1903,7 @@ export class Mill {
       case 'VALIDATING': {
         // the same checks that released it, re-run: nothing starts moving until they all hold
         const blocker = this.releaseBlocker(b);
-        if (blocker) { b.faultReason = `Waiting: ${blocker}`; break; }
+        if (blocker) { this.zeroToleranceFault(b); b.faultReason = `Waiting: ${blocker}`; break; }
         b.faultReason = undefined;
         b.state = 'READY';
         break;
@@ -1987,7 +2060,7 @@ export class Mill {
     const scale = this.getMixerScale();
     if (!scale || !scale.valid) return 'mixer scale invalid';
     if (!scale.stable) return 'mixer scale not stable';
-    if (scale.weight >= this.emptyLbs()) return `mixer not empty (${round1(scale.weight)} lb)`;
+    if (Math.abs(scale.weight) >= this.emptyLbs()) return scale.weight < 0 ? `mixer scale reads ${round1(scale.weight)} lb - zero it` : `mixer not empty (${round1(scale.weight)} lb)`;
     for (const st of b.dosingSteps) {
       if (!st.sourceBinId || !this.equipment.has(st.sourceBinId)) return `no source bin for ${st.ingredientName}`;
       const a = st.augerId ? this.equipment.get(st.augerId) : undefined;
@@ -2008,7 +2081,7 @@ export class Mill {
       if (!mconv.config.scaleId) return `${mconv.id} has no scale assigned`;
       if (!ms || !ms.valid) return 'micros scale invalid';
       if (!ms.stable) return 'micros scale not stable';
-      if (ms.weight >= this.microZeroLbs(mconv)) return `micros conveyor not empty (${round1(ms.weight)} lb)`;
+      if (Math.abs(ms.weight) >= this.microZeroLbs(mconv)) return ms.weight < 0 ? `micros scale reads ${round1(ms.weight)} lb - zero it` : `micros conveyor not empty (${round1(ms.weight)} lb)`;
     }
     if (!this.bins.some(x => x.id === b.destination && x.type === 'finished')) return `destination ${b.destination} not found`;
     const lvl = this.levelState(b.destination);
@@ -2034,7 +2107,7 @@ export class Mill {
     const batch = this.queue.find(b => b.state === 'IDLE' && (!b.scheduledAt || Date.parse(b.scheduledAt) <= now));
     if (!batch) return;
     const blocker = this.releaseBlocker(batch);
-    if (blocker) { this.queueWait = `batch ${batch.id} - ${blocker}`; return; }
+    if (blocker) { this.zeroToleranceFault(batch); this.queueWait = `batch ${batch.id} - ${blocker}`; return; }
     if (batch.scheduledAt && now - Date.parse(batch.scheduledAt) > 60_000) batch.late = true;
     batch.state = 'VALIDATING';
     batch.startedAt = new Date().toISOString();
@@ -2138,6 +2211,7 @@ export class Mill {
           return;
         }
         if (step.micro && !this.checkMicroCapacity(b, step, scale!.weight)) return;
+        if (!step.micro && !this.checkMixerCapacity(b, step, scale!.weight)) return;
         if (auger) { auger.owner = b.id; auger.request = true; }
         step.actual = Math.max(0, scale!.weight - step.baselineWeight);
         const remaining = step.target - step.actual;
@@ -2566,7 +2640,7 @@ export class Mill {
     for (const v of this.sharedVfds) {
       for (const [sig, label] of [[v.runOutput, 'VFD Run'], [v.auxInput, 'VFD Aux'], [v.analogSpeedOutput, 'VFD Speed']] as const) if (sig) tags.set(sig, `${v.name} ${label}`);
     }
-    for (const [key, label] of [['estopInput', 'E-Stop'], ['hornOutput', 'Horn'], ['hornSilenceInput', 'Horn Silence']] as const) {
+    for (const [key, label] of [['estopInput', 'E-Stop'], ['hornOutput', 'Horn'], ['hornSilenceInput', 'Horn Silence'], ['faultResetInput', 'Fault Reset']] as const) {
       if (this.globalConfig[key]) tags.set(String(this.globalConfig[key]), label);
     }
 
@@ -2751,8 +2825,8 @@ export class Mill {
 
   private clearRackFault() { this.clearFault('E-OM-01'); }
 
-  private clearFault(code: string) {
-    const idx = this.faults.findIndex(f => f.code === code && f.active);
+  private clearFault(code: string, eqId?: string) {
+    const idx = this.faults.findIndex(f => f.code === code && f.active && (!eqId || f.equipment === eqId));
     if (idx >= 0) {
       this.faults[idx].active = false;
       this.faults[idx].clearedAt = new Date().toISOString();
@@ -2927,6 +3001,20 @@ export class Mill {
     this.raiseFault(conv.id, 'CRITICAL', `${conv.name}: micros scale over capacity (${round1(weight)} lb)`, 'E-BA-02');
     this.pauseActiveBatch();
     b.faultReason = `Micros scale over capacity (${round1(weight)} of ${cap} lb) - clear the belt, then Resume`;
+    return false;
+  }
+
+  // PLC Mixer Capacity: more gross weight in the mixer than it holds stops the feeder and pauses the batch (same default as the queue warning).
+  private checkMixerCapacity(b: BatchRuntime, step: DosingStep, weight: number): boolean {
+    const mixer = this.findEquipmentByType('mixer');
+    const cap = Number(mixer?.config.capacity ?? 4000);
+    if (!mixer || !(cap > 0) || weight <= cap) return true;
+    step.clean = false;
+    const auger = step.augerId ? this.equipment.get(step.augerId) : undefined;
+    if (auger) auger.request = false;
+    this.raiseFault(mixer.id, 'CRITICAL', `${mixer.name}: mixer scale over capacity (${round1(weight)} lb)`, 'E-BA-04');
+    this.pauseActiveBatch();
+    b.faultReason = `Mixer scale over capacity (${round1(weight)} of ${cap} lb) - empty the mixer, then Resume`;
     return false;
   }
 

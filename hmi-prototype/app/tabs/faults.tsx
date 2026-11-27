@@ -21,6 +21,7 @@ export function FaultsTab() {
 
   const faults: Fault[] = backend?.connected ? backend.faults : [];
   const filtered = filter === 'active' ? faults.filter(f => f.active) : faults;
+  const activeCount = faults.filter(f => f.active).length;
 
   function acknowledge(id: string) {
     if (backend?.connected) {
@@ -57,6 +58,24 @@ export function FaultsTab() {
         <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>
           {faults.filter(f => f.active).length} active
         </span>
+        {backend?.connected && activeCount > 0 && (
+          <div className="flex gap-2 ml-auto">
+            <button
+              onClick={() => backend.sendCommand('SilenceHorn')}
+              className="px-3 py-1.5 text-xs font-semibold"
+              style={{ background: 'transparent', color: 'var(--fg-dim)', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer' }}
+            >
+              {backend.horn.silenced ? 'Re-arm Horn' : 'Silence Horn'}
+            </button>
+            <button
+              onClick={() => backend.sendCommand('ResetFaults')}
+              className="px-3 py-1.5 text-xs font-semibold"
+              style={{ background: 'var(--accent)', color: '#000', border: 'none', borderRadius: '3px', cursor: 'pointer' }}
+            >
+              Reset All Faults
+            </button>
+          </div>
+        )}
       </div>
 
       <div style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', borderRadius: '3px' }}>
