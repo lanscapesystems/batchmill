@@ -5,10 +5,6 @@ Requires=ethercat.service
 
 [Service]
 Type=simple
-# Start from a fresh bus read: the master copies its cached PDO list into the daemon's configuration, and that list has been
-# seen on the mill without any inputs until a rescan. "-": a failed rescan must not keep the I/O down.
-ExecStartPre=-/usr/local/bin/ethercat rescan
-ExecStartPre=/bin/sleep 2
 ExecStart=/opt/feedmill/current/ethercat-rt/io-daemon /etc/feedmill/io.conf
 Restart=on-failure
 RestartSec=2

@@ -64,36 +64,33 @@ const om: any = { couplerType: 'NX-ECC', eccModel: 'NX-ECC203', cycleTimeUs: 500
 const badId = generateIoConf(om, [], [], [{ id: 'SC 2', name: 'S', connectionType: 'rs1201', rackSlot: 1 } as any]);
 assert.ok(!badId.conf.includes('channel') && badId.warnings.length === 1);
 
-// rack read against a fake `ethercat` CLI: a read that is partial at first is retried; an empty one keeps the last good map
-let pdoReads = 0, partialReads = 2, empty = false, rescans = 0, parkedAtRescan = false;
+// rack read against a fake `ethercat` CLI: reading never disturbs the bus, and a partial or empty read keeps the good map
+let pdoReads = 0, partial = false, empty = false, disturbed = 0;
 const cp = require('child_process'), fs = require('fs');
 const confPath = require('path').join(require('os').tmpdir(), `io-check-${process.pid}.conf`);
 process.env.FEEDMILL_IO_CONF_PATH = confPath; // never touch a real io.conf
 fs.writeFileSync(confPath, 'old conf\n');
 cp.execFileSync = (cmd: string, args: string[]) => {
-  if (cmd === 'sudo') return '';
-  if (args[0] === 'rescan') { rescans++; parkedAtRescan = fs.readFileSync(confPath, 'utf8').startsWith('# parked'); return ''; }
+  if (cmd === 'sudo' || args[0] === 'rescan') { disturbed++; return ''; }
   if (args[0] === 'master') return 'Phase: Operation\nSlaves: 1\nLink: UP\n';
   if (args[0] === 'slaves') return args.includes('-v') ? 'Product code: 0x000000a7\n' : '0  0:0  OP  +  NX-ECC203\n';
   if (args[0] !== 'pdos') return args.includes('0xf050') ? (args[args.length - 1] === '1' ? `0x00135256 ${0x00135256}\n` : `0x00115442 ${0x00115442}\n`) : '0x00 0\n';
   pdoReads++;
   if (empty) return '';
-  return 'RxPDO 0x1600\n PDO entry 0x7002:01, 16 bit\n' + (pdoReads > partialReads ? 'TxPDO 0x1a00\n PDO entry 0x6022:01, 16 bit\n' : '');
+  return 'RxPDO 0x1600\n PDO entry 0x7002:01, 16 bit\n' + (partial ? '' : 'TxPDO 0x1a00\n PDO entry 0x6022:01, 16 bit\n');
 };
 const rackOm: any = { couplerType: 'NX-ECC', eccModel: 'NX-ECC203', cards: [card(1, 'NX-OD5256'), card(2, 'NX-ID5442')] };
 const read = verifyEthercatRack(rackOm);
-assert.equal(pdoReads, 3); assert.ok(read.cards.every(c => c.status === 'ok'), 'partial read retried');
-assert.ok(rescans === 1 && parkedAtRescan, 'one rescan per read, with the daemon parked');
-verifyEthercatRack(rackOm);
-assert.equal(Number(rescans), 2, 'every save read rescans, even a complete one');
-// Read from Coupler rescans too, waits for the inputs, and puts the previous io.conf back
-fs.writeFileSync(confPath, 'old conf\n'); pdoReads = 0; partialReads = 1;
-const probe = discoverRack();
-assert.equal(Number(rescans), 3); assert.ok(probe.cards.some(c => c.model === 'NX-ID5442'));
+assert.equal(pdoReads, 1); assert.ok(read.cards.every(c => c.status === 'ok'));
+assert.ok(discoverRack().cards.some(c => c.model === 'NX-ID5442'));
+for (const lose of [() => { partial = true; }, () => { empty = true; }]) {
+  lose();
+  const gone = verifyEthercatRack(rackOm);
+  assert.equal(gone.cards[1].status, 'missing', 'what the bus does not list is still reported');
+  assert.equal(rackOm.discoveredRack.inputEntries.length, 1, 'the good map is kept');
+  assert.ok(gone.warnings.some(w => w.includes('keeping the last good one')) && gone.warnings.some(w => w.includes('inputs: none')));
+}
+assert.equal(disturbed, 0, 'no rescan and no daemon restart from reading');
 assert.equal(fs.readFileSync(confPath, 'utf8'), 'old conf\n');
-empty = true;
-const gone = verifyEthercatRack(rackOm);
-assert.equal(rackOm.discoveredRack.inputEntries.length, 1, 'empty read keeps the last good map');
-assert.ok(gone.warnings.some(w => w.includes('keeping the last good one')) && gone.warnings.some(w => w.includes('inputs: none')));
 fs.rmSync(confPath, { force: true });
 console.log('ethercat checks passed');

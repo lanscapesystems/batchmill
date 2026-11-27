@@ -7,7 +7,7 @@ import {
   NX_CARD_CATALOG, NX_BUS_POWER_BUDGET_W, NX_MAX_UNITS, ECC_MODEL_MIN_CYCLE_US,
   EQUIPMENT_DEFS,
 } from './types.js';
-import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresence, clearCouplerErrors, runRs1201Calibration, SCALE_ID_RE, daemonRestartedAt, type ScaleCalStep } from './ethercat.js';
+import { verifyEthercatRack, discoverRack, syncIoConf, checkRackPresence, clearCouplerErrors, runRs1201Calibration, SCALE_ID_RE, type ScaleCalStep } from './ethercat.js';
 import { MovingAverage, OnDelay, LoadPid, RelayTuner, scaleLinear } from './loadControl.js';
 import { Debounce } from './monitors.js';
 import { scaleLines, freefallAdjust, toleranceFor, feedsOnlyHammermill, flowPath, round1 } from './batchLogic.js';
@@ -31,6 +31,12 @@ const MAX_DT_MS = 500;
 // to the ethercat CLI (blocking, up to its 3s timeout), which the control
 // loop can't afford.
 const RACK_WATCHDOG_MS = 3000;
+// Bus health filter: one bad sample must not trip a fault. Bad time builds up and drains at a quarter of the rate, so lone
+// glitches die away but a chattering bus still trips; once tripped, only this long fully healthy clears it.
+const BUS_TRIP_MS = 200;
+const BUS_RECOVER_MS = 2000;
+// The whole fault list goes to every screen 5 times a second, so only this many are held; the database keeps all of them.
+const MAX_FAULTS = 200;
 const SETTLE_MS = 2000;
 const DISCHARGE_TIMEOUT_MS = 60000;
 // All delay settings are stored in seconds (0.1 s steps, like a 100 ms PLC timer); the scan runs in ms.
@@ -109,6 +115,9 @@ export class Mill {
   private rotationState = new Map<string, { runningMs: number; rpm?: number }>();
   private busState: 'idle' | 'ok' | 'fault' | 'offline' = 'idle'; // live EtherCAT state for the HMI indicator (set every scan)
   private lastDaemonStartUs: number | null = null; // detects an io_daemon restart (see updateBusHealth)
+  private busBadMs = 0;
+  private busGoodMs = 0;
+  private busTripped = false;
   ioOverrides: Record<string, SignalValue> = {};
   // Gates forcing an output via SetOverride; never persisted, so a restart
   // never comes back up with this on. Resets any forced outputs on exit.
@@ -151,6 +160,7 @@ export class Mill {
     openDb();
     this.faults = loadFaults(); // the fault list stays through a power cycle
     this.faultSeq = Math.max(this.faultSeq, ...this.faults.map(f => (parseInt(f.id.replace(/\D/g, ''), 10) || 0) + 1));
+    this.trimFaults();
     const cfg = loadConfig();
     if (cfg) {
       this.applyConfig(cfg);
@@ -215,7 +225,6 @@ export class Mill {
   private rackWatchdogCheck() {
     const om = this.omronConfig;
     if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return;
-    if (Date.now() - daemonRestartedAt < 5000) return; // our own restart: a rescan in progress would look like missing cards
     // The CLI calls below block the whole backend (HMI included). While the daemon's cyclic exchange is complete and no card
     // is flagged, the coupler is there and there is nothing to clear: poll only when one of those isn't true.
     if (this.busState === 'ok' && om.cards.every(c => c.status === 'ok')) return;
@@ -696,7 +705,7 @@ export class Mill {
 
       case 'ClearEthercatErrors': {
         if (this.omronConfig.couplerType !== 'NX-ECC') return reject('Only supported for NX-ECC couplers');
-        const guardErr = this.guardConfigEdit(); // the re-read can stop the daemon to rescan the bus: not while running
+        const guardErr = this.guardConfigEdit(); // the re-read can rewrite io.conf and restart the daemon: not while running
         if (guardErr) return reject(guardErr);
         const r = clearCouplerErrors();
         if (!r.ok) return reject(`Could not clear coupler errors: ${r.error ?? 'unknown'}`);
@@ -1111,7 +1120,7 @@ export class Mill {
         };
         this.validateRack();
         this.clearRackFault();
-        // NX-ECC: the rack read below parks the daemon, rescans, and writes io.conf afterwards - no extra restart here
+        // NX-ECC: the rack read below writes io.conf once, after reading the rack - no extra restart here
         this.buildSignals(this.omronConfig.couplerType !== 'NX-ECC');
         // every save verifies the rack against the bus (a mismatch raises the rack fault, as the old Verify Rack did)
         if (this.omronConfig.couplerType !== 'none') this.readOmronRack();
@@ -1203,8 +1212,19 @@ export class Mill {
   // silently resume commanding a value the daemon no longer agrees with.
   private updateBusHealth(state: ReturnType<typeof readIoState>) {
     const om = this.omronConfig;
-    this.busState = om.couplerType !== 'NX-ECC' ? 'idle' : !state ? 'offline' : state.healthy === false ? 'fault' : 'ok';
-    if (om.couplerType !== 'NX-ECC' || !om.rackVerified) return; // not commissioned yet — nothing to enforce
+    if (om.couplerType !== 'NX-ECC') {
+      this.busState = 'idle'; this.busBadMs = this.busGoodMs = 0; this.busTripped = false;
+      return;
+    }
+    const unhealthy = !state || state.healthy === false;
+    const dt = Math.min(this.dtMs, 100); // the one sample after a stall must not trip by itself
+    this.busBadMs = unhealthy ? Math.min(BUS_TRIP_MS, this.busBadMs + dt) : Math.max(0, this.busBadMs - dt / 4);
+    this.busGoodMs = unhealthy ? 0 : this.busGoodMs + dt;
+    if (this.busBadMs >= BUS_TRIP_MS) this.busTripped = true;
+    else if (this.busGoodMs >= BUS_RECOVER_MS) this.busTripped = false;
+    if (this.busTripped) this.busState = state ? 'fault' : 'offline';
+    else if (!unhealthy) this.busState = 'ok'; // a glitch still being filtered leaves the indicator as it was
+    if (!om.rackVerified) return; // not commissioned yet — nothing to enforce
 
     if (state && this.lastDaemonStartUs !== null && state.daemonStartUs !== this.lastDaemonStartUs) {
       const hadOverrides = Object.keys(this.ioOverrides).length > 0;
@@ -1217,12 +1237,11 @@ export class Mill {
     }
     if (state) this.lastDaemonStartUs = state.daemonStartUs;
 
-    const unhealthy = !state || state.healthy === false;
-    if (unhealthy) {
+    if (this.busTripped) {
       this.ioFaultShutdown('E-OM-02', state
         ? 'EtherCAT process data invalid (link down or incomplete working counter)'
         : 'io_daemon not reporting (not running, or state file stale)');
-    } else {
+    } else if (!unhealthy) {
       this.clearFault('E-OM-02');
     }
   }
@@ -2668,7 +2687,13 @@ export class Mill {
     };
     this.faults.unshift(fault);
     persistFault(fault);
+    this.trimFaults();
     this.hornRearm();
+  }
+
+  // drops the oldest cleared faults beyond the limit (newest are first); active ones always stay
+  private trimFaults() {
+    for (let i = this.faults.length - 1; i >= 0 && this.faults.length > MAX_FAULTS; i--) if (!this.faults[i].active) this.faults.splice(i, 1);
   }
 
   private readOmronRack() {

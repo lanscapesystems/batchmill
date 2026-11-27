@@ -96,4 +96,20 @@ scan(5); assert.equal(m.activeBatch.state, 'PAUSED');
 cmd('ResetFaults'); scan(5); assert.equal(m.activeBatch.state, 'PAUSED', 'reset does not resume the batch');
 assert.ok(!active('E-BA-04'));
 
+// ── bus health: a lone glitch is ignored, a chattering or dead bus trips once, only a steady bus clears it ──
+reset(); Object.assign(m.omronConfig, { couplerType: 'NX-ECC', rackVerified: true }); m.dtMs = 20; m.lastDaemonStartUs = null;
+const bus = (healthy: boolean, n = 1) => { for (let i = 0; i < n; i++) m.updateBusHealth({ healthy, daemonStartUs: 1, atUs: 0, inputs: {}, rotation: {} }); };
+const busFaults = () => m.faults.filter((f: any) => f.code === 'E-OM-02').length;
+bus(true, 5); bus(false); bus(true, 100); assert.equal(busFaults(), 0, 'one bad sample');
+for (let i = 0; i < 1000; i++) bus(i % 2 === 0);
+assert.ok(active('E-OM-02') && busFaults() === 1, 'chattering bus: one fault, not hundreds');
+bus(true, 50); assert.ok(active('E-OM-02'), '1 s healthy is not enough');
+bus(true, 60); assert.ok(!active('E-OM-02'), 'cleared after 2 s healthy');
+bus(false, 9); assert.ok(!active('E-OM-02')); bus(false); assert.ok(active('E-OM-02'), 'trips after 200 ms bad');
+
+// ── the fault list sent to the screens is limited; active faults are never dropped ──
+reset(); (m as any).raiseFault('A1', 'WARNING', 'keep', 'W-KEEP');
+for (let i = 0; i < 300; i++) { (m as any).raiseFault('A1', 'WARNING', 'x', `W-X-${i}`); (m as any).clearFault(`W-X-${i}`); }
+assert.equal(m.getSnapshot().faults.length, 200); assert.ok(active('W-KEEP'));
+
 console.log('fault checks passed');

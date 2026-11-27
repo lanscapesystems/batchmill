@@ -77,7 +77,8 @@ function broadcastToHmi(data: StateSnapshot) {
   if (hmiClients.size === 0) return;
   const snapshot = JSON.stringify({ type: 'snapshot', data });
   for (const ws of hmiClients) {
-    if (ws.readyState === WebSocket.OPEN) {
+    // a screen still receiving the last snapshot skips this one instead of queueing it and falling ever further behind
+    if (ws.readyState === WebSocket.OPEN && ws.bufferedAmount === 0) {
       try { ws.send(snapshot); } catch { hmiClients.delete(ws); }
     }
   }
