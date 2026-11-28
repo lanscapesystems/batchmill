@@ -285,5 +285,19 @@ assert.equal(cmd('ResumeBatch').accepted, true); assert.ok(until(() => m.equipme
 cmd('PauseBatch'); assert.equal(m.activeBatch.state, 'PAUSING'); ioFault();
 assert.equal(m.activeBatch.previousState, 'DOSING', 'a fault while pausing must not lose where to resume');
 
+// ── Mixer Timeout (the mixer's stop delay): a pause uses it, a finished discharge and Off do not ──
+reset(); m.equipment.set('A2', mk('A2', 'auger', { startDelay: 0, stopDelay: 0.5 }));
+m.connections = [link('B1', 'A1'), link('A1', 'MX'), link('MX', 'A2'), link('A2', 'FB')];
+const mx = m.equipment.get('MX'); mx.config.stopDelay = 3; queue(); run();
+const pause = () => { assert.equal(cmd('PauseBatch').accepted, true); assert.ok(until(() => m.activeBatch.state === 'PAUSED', 10), 'paused without waiting for the mixer'); assert.ok(mx.runCmd, 'mixer still timing out'); };
+assert.ok(until(() => m.activeBatch?.state === 'DISCHARGING' && m.equipment.get('A2').runCmd));
+pause(); assert.ok(!m.equipment.get('A2').runCmd, 'the conveyor after the mixer stops on its own delay');
+scan(10); assert.equal(cmd('ResumeBatch').accepted, true); scan(2); assert.ok(mx.runCmd && mx.request, 'resumed inside the timeout: never stopped');
+pause(); scan(35); assert.ok(!mx.runCmd, 'timed out');
+cmd('ResumeBatch'); assert.ok(until(() => mx.runCmd)); pause(); cmd('SetEquipmentMode', 'MX', { mode: 'Off' }); scan(); assert.ok(!mx.runCmd, 'Off stops it at once');
+cmd('SetEquipmentMode', 'MX', { mode: 'Auto' }); cmd('ResumeBatch'); assert.ok(until(() => mx.runCmd)); pause(); m.ioFaultShutdown('E-OM-02', 'test'); assert.ok(!mx.runCmd, 'an I/O fault drops a mixer that is timing out');
+cmd('ResumeBatch'); assert.ok(until(() => m.activeBatch?.state === 'CLEAROUT')); scan(2); assert.ok(!mx.runCmd, 'no timeout after the cleanout time');
+assert.ok(finished()); assert.equal(m.queue[0].state, 'COMPLETED');
+
 console.log('batch checks passed');
 process.exit(0);

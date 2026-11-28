@@ -955,6 +955,7 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
         {row('Capacity', numIn('capacity', 4000, 'lbs'))}
         {row('Cleanout Time', numIn('cleanoutSec', 0, 's', 0.1))}
         {row('Discharge Timeout', numIn('dischargeTimeoutSec', 60, 's', 1))}
+        {row('Mixer Timeout', numIn('stopDelay', 0, 's', 0.1))}
         {row('MS Coil', ioSel(ioPools.do, 'runOutput'))}
         {row('MS Aux', ioSel(ioPools.di, 'runConfirmAux'))}
         {row('Analog Load Input', ioSel(ioPools.ai, 'analogLoadInput'))}

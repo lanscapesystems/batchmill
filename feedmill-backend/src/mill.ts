@@ -1427,7 +1427,11 @@ export class Mill {
       }
     } else {
       eq.startTimerMs = 0;
-      if (eq.runCmd && this.handRun.has(eq.id)) { eq.runCmd = false; eq.stopTimerMs = 0; } // a Hand run stops at once (to Off, or to Auto with no request): no stop delay
+      // The mixer's stop delay (Mixer Timeout) only rides out a pause, so a quick Resume does not restart it: Off and the
+      // end of a discharge (the cleanout time has already run) stop it at once.
+      const mixerDone = eq.equipmentType === 'mixer' && (eq.mode === 'Off' || this.activeBatch?.state === 'CLEAROUT');
+      // a Hand run stops at once too (to Off, or to Auto with no request): no stop delay
+      if (eq.runCmd && (this.handRun.has(eq.id) || mixerDone)) { eq.runCmd = false; eq.stopTimerMs = 0; }
       else if (eq.runCmd && !this.upstreamStopping(eq)) {
         eq.stopTimerMs += this.dtMs;
         if (eq.stopTimerMs >= delayMs(eq.config.stopDelay)) { eq.runCmd = false; eq.stopTimerMs = 0; }
@@ -1456,7 +1460,8 @@ export class Mill {
     for (const c of this.connections) {
       if (c.to !== eq.id) continue;
       const prev = this.equipment.get(c.from);
-      if (prev && this.isMotor(prev) && prev.runCmd && !prev.request && eq.equipmentType !== 'micro_drag') return true;
+      // the mixer timing out holds nothing up: the conveyors after it stop on their own delays
+      if (prev && this.isMotor(prev) && prev.equipmentType !== 'mixer' && prev.runCmd && !prev.request && eq.equipmentType !== 'micro_drag') return true;
     }
     return false;
   }
@@ -2012,7 +2017,8 @@ export class Mill {
       }
 
       case 'PAUSING': {
-        if (this.allOwnedEquipmentStopped(b.id)) {
+        // PAUSED does not wait for the mixer: it times out there, and Resume picks it up still running
+        if (this.allOwnedEquipmentStopped(b.id, 'mixer')) {
           this.releaseEquipment(b.id);
           b.state = 'PAUSED';
         }
@@ -2423,9 +2429,9 @@ export class Mill {
     }
   }
 
-  private allOwnedEquipmentStopped(ownerId: string): boolean {
+  private allOwnedEquipmentStopped(ownerId: string, except?: string): boolean {
     for (const eq of this.equipment.values()) {
-      if (eq.owner === ownerId && eq.equipmentType !== 'gate' && eq.runCmd) return false;
+      if (eq.owner === ownerId && eq.equipmentType !== 'gate' && eq.equipmentType !== except && eq.runCmd) return false;
     }
     return true;
   }
@@ -2851,7 +2857,8 @@ export class Mill {
     this.raiseFault('OMRON', 'CRITICAL', message, code);
     // Motors a batch or refill is driving drop at once, as on e-stop: a stop delay would carry on commanding them after the bus is back.
     for (const eq of this.equipment.values()) {
-      if (eq.owner && this.isMotor(eq)) { eq.runCmd = false; eq.startTimerMs = 0; eq.stopTimerMs = 0; }
+      const timingOut = eq.equipmentType === 'mixer' && eq.mode === 'Auto'; // released by a pause but still running
+      if ((eq.owner || timingOut) && this.isMotor(eq)) { eq.runCmd = false; eq.startTimerMs = 0; eq.stopTimerMs = 0; }
     }
     this.abortRefills();
     for (const eq of this.equipment.values()) {
