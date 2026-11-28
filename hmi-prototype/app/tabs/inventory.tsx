@@ -4,6 +4,7 @@ import { useState, useMemo, useRef, useEffect } from 'react';
 import { useBackend } from '../backend';
 import { type Bin, type Ingredient, type InventoryEvent } from '../sim-data';
 import * as XLSX from 'xlsx';
+import { ALL_DATES, useHistory } from './history';
 
 type TopTab = 'BINS' | 'INGREDIENTS';
 type Timeframe = '24h' | '7d' | '30d' | '90d' | 'all';
@@ -25,6 +26,8 @@ const btnStyle: React.CSSProperties = {
 };
 
 const TF_MS: Record<Timeframe, number> = { '24h': 86400000, '7d': 604800000, '30d': 2592000000, '90d': 7776000000, 'all': Infinity };
+// start of the period as the history query takes it; read when the period is picked, so the request URL stays put
+const startOf = (tf: Timeframe) => TF_MS[tf] === Infinity ? '' : new Date(Date.now() - TF_MS[tf]).toISOString();
 
 export function InventoryTab() {
   const backend = useBackend();
@@ -131,7 +134,7 @@ function BinsTab({ bins, ingredients }: { bins: Bin[]; ingredients: Ingredient[]
     const amt = parseFloat(adjustAmt);
     if (!adjustBinId || isNaN(amt)) return;
     const bin = bins.find(b => b.id === adjustBinId);
-    const newBalance = Math.max(0, (bin?.balance ?? 0) + amt);
+    const newBalance = (bin?.balance ?? 0) + amt;
     backend?.sendCommand('UpdateBin', adjustBinId, { balance: newBalance });
     setAdjustAmt(''); setAdjustBinId(null);
   }
@@ -196,7 +199,7 @@ function BinsTab({ bins, ingredients }: { bins: Bin[]; ingredients: Ingredient[]
                   <td className="py-2 pl-5 pr-3">
                     <NoteInput binId={b.id} serverNote={b.note ?? ''} onSave={sendNote} />
                   </td>
-                  <td className="text-right py-2 px-3" style={{ color: 'var(--fg-bright)' }}>{b.balance.toLocaleString()} {b.unit}</td>
+                  <td className="text-right py-2 px-3" style={{ color: b.balance < 0 ? 'var(--red)' : 'var(--fg-bright)' }}>{b.balance.toLocaleString()} {b.unit}</td>
                   <td className="py-2 px-3">
                     <LevelCell tracked={tracked} hasSwitch={hasSwitch} switchState={b.levelSwitchState} pct={pct} barColor={barColor} />
                   </td>
@@ -270,8 +273,8 @@ function BinsTab({ bins, ingredients }: { bins: Bin[]; ingredients: Ingredient[]
                   <td className="py-2 pl-5 pr-3">
                     <NoteInput binId={b.id} serverNote={b.note ?? ''} onSave={sendNote} />
                   </td>
-                  <td className="text-right py-2 px-3" style={{ color: b.balance > 0 ? 'var(--fg-bright)' : 'var(--fg-dim)' }}>
-                    {b.balance > 0 ? `${b.balance.toLocaleString()} ${b.unit}` : 'Empty'}
+                  <td className="text-right py-2 px-3" style={{ color: b.balance < 0 ? 'var(--red)' : b.balance > 0 ? 'var(--fg-bright)' : 'var(--fg-dim)' }}>
+                    {b.balance !== 0 ? `${b.balance.toLocaleString()} ${b.unit}` : 'Empty'}
                   </td>
                   <td className="py-2 px-3 w-48">
                     <LevelCell tracked hasSwitch={b.levelSwitchState != null} switchState={b.levelSwitchState} pct={pct} barColor={pct > 90 ? 'var(--orange)' : 'var(--green)'} />
@@ -332,35 +335,29 @@ function IngredientsTab({ ingredients }: { ingredients: Ingredient[] }) {
   const [renameName, setRenameName] = useState('');
   const [newIngName, setNewIngName] = useState('');
   const [newIngCategory, setNewIngCategory] = useState<'MAIN' | 'MICRO'>('MAIN');
-  const [deleteConfirm, setDeleteConfirm] = useState<{ id: string; step: number } | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const [hideConfirm, setHideConfirm] = useState<string | null>(null);
 
-  // Inventory events are not yet streamed from the backend
-  const events: InventoryEvent[] = [];
-
-  const cutoff = TF_MS[timeframe] === Infinity ? 0 : Date.now() - TF_MS[timeframe];
-  const filteredEvents = useMemo(() =>
-    events.filter(e => new Date(e.date).getTime() >= cutoff).sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()),
-    [events, cutoff]
-  );
+  const [since, setSince] = useState(() => startOf('7d'));
+  // re-read when a balance changes: a batch or an adjustment has just been recorded
+  const history = useHistory<InventoryEvent>('inventory', ALL_DATES, `${backend?.connected} ${backend?.bins.map(x => x.balance).join()}`, since ? { from: since } : undefined);
+  const events = history.rows;
 
   const visibleIngredients = ingredients.filter(i => !i.hidden);
   const hiddenIngredients = ingredients.filter(i => i.hidden);
 
   const usageByIngredient = useMemo(() => {
     const m: Record<string, number> = {};
-    for (const e of filteredEvents) {
-      if (e.change < 0) m[e.ingredientId] = (m[e.ingredientId] ?? 0) + Math.abs(e.change);
+    for (const e of events) {
+      if (e.type === 'batch') m[e.ingredientId] = (m[e.ingredientId] ?? 0) - e.change;
     }
     return m;
-  }, [filteredEvents]);
+  }, [events]);
 
   const selectedEvents = useMemo(() =>
-    selectedId ? filteredEvents.filter(e => e.ingredientId === selectedId) : [],
-    [selectedId, filteredEvents]
+    selectedId ? events.filter(e => e.ingredientId === selectedId) : [],
+    [selectedId, events]
   );
-
-  function hasRecords(id: string) { return events.some(e => e.ingredientId === id); }
 
   function doDelete(id: string) {
     backend?.sendCommand('RemoveIngredient', id);
@@ -396,7 +393,7 @@ function IngredientsTab({ ingredients }: { ingredients: Ingredient[] }) {
       <div className="flex items-center gap-2">
         <div className="flex gap-1">
           {(['24h', '7d', '30d', '90d', 'all'] as const).map(tf => (
-            <button key={tf} onClick={() => setTimeframe(tf)} className="px-2 py-1.5 text-xs"
+            <button key={tf} onClick={() => { setTimeframe(tf); setSince(startOf(tf)); }} className="px-2 py-1.5 text-xs"
               style={{ background: timeframe === tf ? 'var(--bg-row)' : 'transparent', color: timeframe === tf ? 'var(--fg-bright)' : 'var(--fg-dim)', border: '1px solid var(--border)', borderRadius: '3px' }}>
               {tf}
             </button>
@@ -436,7 +433,7 @@ function IngredientsTab({ ingredients }: { ingredients: Ingredient[] }) {
                         <div className="flex gap-1">
                           <button onClick={() => { setRenameId(ing.id); setRenameName(ing.name); }} style={{ ...btnStyle, padding: '1px 5px', fontSize: '11px' }}>Ren</button>
                           <button onClick={() => setHideConfirm(ing.id)} style={{ ...btnStyle, padding: '1px 5px', fontSize: '11px' }}>Hide</button>
-                          <button onClick={() => setDeleteConfirm({ id: ing.id, step: hasRecords(ing.id) ? 1 : 0 })}
+                          <button onClick={() => setDeleteConfirm(ing.id)}
                             style={{ ...btnStyle, padding: '1px 5px', fontSize: '11px', color: 'var(--red)' }}>Del</button>
                         </div>
                       )}
@@ -488,7 +485,7 @@ function IngredientsTab({ ingredients }: { ingredients: Ingredient[] }) {
               </div>
               <div style={{ maxHeight: '450px', overflow: 'auto' }}>
                 {selectedEvents.length === 0 && (
-                  <div className="px-3 py-4 text-center" style={{ color: 'var(--fg-dim)', fontSize: '12px' }}>No events in this period</div>
+                  <div className="px-3 py-4 text-center" style={{ color: 'var(--fg-dim)', fontSize: '12px' }}>{history.message && history.message !== 'No records' ? history.message : 'No events in this period'}</div>
                 )}
                 {selectedEvents.map(ev => (
                   <div key={ev.id} style={{ borderBottom: '1px solid var(--border)' }}>
@@ -531,33 +528,20 @@ function IngredientsTab({ ingredients }: { ingredients: Ingredient[] }) {
       </div>
 
       {/* Report popup */}
-      {showReport && <ReportPopup ingredients={visibleIngredients} events={filteredEvents} timeframe={timeframe} onClose={() => setShowReport(false)} />}
+      {showReport && <ReportPopup ingredients={visibleIngredients} events={events} timeframe={timeframe} onClose={() => setShowReport(false)} />}
 
       {/* Delete confirmation overlay */}
       {deleteConfirm && (
         <Overlay>
           <div style={{ color: 'var(--fg-bright)', fontWeight: 600, fontSize: '13px', marginBottom: '8px' }}>
-            Delete {ingName(deleteConfirm.id, ingredients)}?
+            Delete {ingName(deleteConfirm, ingredients)}?
           </div>
-          {deleteConfirm.step === 0 ? (
-            <div style={{ fontSize: '12px', color: 'var(--fg-dim)', marginBottom: '12px' }}>No inventory records exist. Delete this ingredient?</div>
-          ) : deleteConfirm.step === 1 ? (
-            <div style={{ fontSize: '12px', color: 'var(--orange)', marginBottom: '12px' }}>
-              This ingredient has inventory records. Deleting will remove all history. Are you sure?
-            </div>
-          ) : (
-            <div style={{ fontSize: '12px', color: 'var(--red)', marginBottom: '12px' }}>
-              FINAL CONFIRMATION: This action cannot be undone. All records for this ingredient will be permanently deleted.
-            </div>
-          )}
+          <div style={{ fontSize: '12px', color: 'var(--fg-dim)', marginBottom: '12px' }}>
+            Its inventory records stay on the mill but can no longer be viewed here. Use Hide instead if you may need them.
+          </div>
           <div className="flex justify-end gap-2">
             <button onClick={() => setDeleteConfirm(null)} style={{ ...btnStyle, background: 'transparent', color: 'var(--fg-dim)' }}>Cancel</button>
-            {deleteConfirm.step < 2 && hasRecords(deleteConfirm.id) ? (
-              <button onClick={() => setDeleteConfirm({ ...deleteConfirm, step: deleteConfirm.step + 1 })}
-                style={{ ...btnStyle, background: 'var(--red)', color: '#fff' }}>Continue</button>
-            ) : (
-              <button onClick={() => doDelete(deleteConfirm.id)} style={{ ...btnStyle, background: 'var(--red)', color: '#fff' }}>Delete</button>
-            )}
+            <button onClick={() => doDelete(deleteConfirm)} style={{ ...btnStyle, background: 'var(--red)', color: '#fff' }}>Delete</button>
           </div>
         </Overlay>
       )}
@@ -595,53 +579,29 @@ function ReportPopup({ ingredients, events, timeframe, onClose }: {
 
   function generate() {
     const selIngs = ingredients.filter(i => selected.has(i.id));
-    const ingEvents: Record<string, InventoryEvent[]> = {};
-    for (const ing of selIngs) ingEvents[ing.id] = [];
-    for (const e of events) {
-      if (ingEvents[e.ingredientId]) ingEvents[e.ingredientId].push(e);
-    }
-
-    const allDates = new Set<string>();
-    const rowMap: Record<string, Record<string, { ref: string; change: number; notes: string }>> = {};
-    for (const [ingId, evts] of Object.entries(ingEvents)) {
-      for (const e of evts) {
-        const key = e.type === 'batch' ? e.batchId! : e.adjustmentId!;
-        if (!rowMap[key]) rowMap[key] = {};
-        rowMap[key][ingId] = { ref: key, change: e.change, notes: e.notes };
-        allDates.add(`${e.date}|${key}`);
-      }
-    }
-
-    const sorted = Array.from(allDates).sort((a, b) => new Date(b.split('|')[0]).getTime() - new Date(a.split('|')[0]).getTime());
 
     const usageRow: Record<string, string | number> = { Date: 'TOTAL USAGE', 'Batch/Adj #': '', Notes: '' };
     for (const ing of selIngs) {
-      const total = events.filter(e => e.ingredientId === ing.id && e.change < 0).reduce((s, e) => s + Math.abs(e.change), 0);
+      const total = events.filter(e => e.ingredientId === ing.id && e.type === 'batch').reduce((s, e) => s - e.change, 0);
       usageRow[ing.name] = total > 0 ? parseFloat(total.toFixed(1)) : '';
     }
 
-    const rows: Record<string, string | number>[] = [usageRow];
-    for (const entry of sorted) {
-      const [date, key] = entry.split('|');
-      const row: Record<string, string | number> = {
-        Date: new Date(date).toLocaleString(),
-        'Batch/Adj #': key,
-        Notes: '',
-      };
-      let hasData = false;
-      for (const ing of selIngs) {
-        const cell = rowMap[key]?.[ing.id];
-        if (cell) {
-          row[ing.name] = parseFloat(cell.change.toFixed(1));
-          if (!row.Notes) row.Notes = cell.notes;
-          hasData = true;
-        } else {
-          row[ing.name] = '';
-        }
+    // one row per batch or adjustment (events arrive newest first); two lines of one ingredient add up
+    const byRef = new Map<string, Record<string, string | number>>();
+    for (const e of events) {
+      const ing = selIngs.find(i => i.id === e.ingredientId);
+      if (!ing) continue;
+      const ref = e.type === 'batch' ? `Batch ${e.batchId}` : `Adj ${e.adjustmentId}`;
+      let row = byRef.get(ref);
+      if (!row) {
+        row = { Date: new Date(e.date).toLocaleString(), 'Batch/Adj #': ref, Notes: e.notes };
+        for (const i of selIngs) row[i.name] = '';
+        byRef.set(ref, row);
       }
-      if (hasData) rows.push(row);
+      row[ing.name] = parseFloat((Number(row[ing.name]) + e.change).toFixed(1));
     }
 
+    const rows = [usageRow, ...byRef.values()];
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, `Inventory ${timeframe}`);
@@ -689,13 +649,14 @@ function LevelCell({ tracked, hasSwitch, switchState, pct, barColor }: {
 }) {
   const color = switchState === 'full' ? 'var(--red)' : switchState === 'empty' || switchState === 'fault' ? 'var(--orange)' : 'var(--fg-dim)';
   const label = switchState === 'full' ? 'FULL' : switchState === 'empty' ? 'EMPTY' : switchState === 'fault' ? 'SENSOR' : '';
+  const fill = Math.min(100, Math.max(0, pct)); // a negative CSS width is ignored and would draw a full bar
   if (tracked) {
     return (
       <div className="flex items-center gap-2">
         <div className="flex-1 h-2.5 rounded-sm" style={{ background: 'var(--bg)', border: '1px solid var(--border)' }}>
-          <div className="h-full rounded-sm" style={{ width: `${pct}%`, background: barColor }} />
+          <div className="h-full rounded-sm" style={{ width: `${fill}%`, background: barColor }} />
         </div>
-        <span style={{ fontSize: '11px', color: 'var(--fg-dim)', width: '28px', textAlign: 'right' }}>{pct.toFixed(0)}%</span>
+        <span style={{ fontSize: '11px', color: 'var(--fg-dim)', width: '28px', textAlign: 'right' }}>{Math.max(0, pct).toFixed(0)}%</span>
         {hasSwitch && label && <span style={{ fontSize: '11px', color, fontWeight: 600, whiteSpace: 'nowrap' }}>{label}</span>}
       </div>
     );

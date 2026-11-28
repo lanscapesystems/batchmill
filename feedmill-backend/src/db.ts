@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS counters (name TEXT PRIMARY KEY, value INTEGER NOT NU
 CREATE INDEX IF NOT EXISTS batch_history_completed ON batch_history (completed_at);
 CREATE INDEX IF NOT EXISTS fault_log_raised ON fault_log (raised_at);
 CREATE INDEX IF NOT EXISTS inventory_events_batch ON inventory_events (batch_id);
+CREATE INDEX IF NOT EXISTS inventory_events_time ON inventory_events (timestamp);
 `;
 
 // ── batch numbers: count up from 1 and are never issued twice ──
@@ -201,6 +202,27 @@ export function postInventoryEvent(
     idempotencyKey, eventType, binId, ingredientId, quantity, unit,
     batchId, new Date().toISOString(),
   );
+}
+
+// An ID with history must not be given to a new ingredient.
+export function ingredientIdsOnRecord(): string[] {
+  return (db.prepare('SELECT DISTINCT ingredient_id AS id FROM inventory_events WHERE ingredient_id IS NOT NULL').all() as { id: string }[]).map(r => r.id);
+}
+
+// shortcut: the whole period in one response (the screen totals usage from it); total here and page it if 'all' gets slow
+export function inventoryHistory(q: HistoryQuery) {
+  const rows = db.prepare(`SELECT * FROM inventory_events WHERE ingredient_id IS NOT NULL AND timestamp >= ?
+    ORDER BY timestamp DESC, seq DESC`).all(q.from ?? '') as Record<string, string | number | null>[];
+  return {
+    more: false,
+    rows: rows.map(r => ({
+      id: String(r.seq), ingredientId: r.ingredient_id as string, binId: r.bin_id as string,
+      type: r.event_type === 'adjustment' ? 'adjustment' as const : 'batch' as const,
+      batchId: (r.batch_id as string | null) ?? undefined,
+      adjustmentId: r.event_type === 'adjustment' ? String(r.seq) : undefined,
+      change: r.quantity as number, date: r.timestamp as string, notes: '',
+    })),
+  };
 }
 
 // ── fault log ──

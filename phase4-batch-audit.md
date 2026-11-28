@@ -43,7 +43,7 @@ Checked against the code and `feedmill-backend/src/batch.check.ts` (one test per
 | 2 | Invalid / unstable scale ignored mid-batch | **Fixed.** Scale lost while feeding stops the auger and pauses the batch; settling waits for a valid stable reading; Resume needs the scale back. New no-flow watchdog (delay per bin, default 60 s, then a minimum rise per 10 s). |
 | 3 | E-stop / tripped auger not handled in DOSING | **Fixed.** E-stop pauses the batch with a reason (it did pause before, with none); owned-equipment trips already paused. |
 | 4 | Steps not validated | **Fixed** (release gate: bin, auger, Auto, not faulted, destination, flow path, gates). Not checked: a *bin* trip (bins have none). |
-| 5 | Discharge ends on a timeout | **Fixed.** Empty = valid, stable, below the threshold; then the mixer's Cleanout Time; a timeout only alarms and keeps waiting (Extend Discharge). |
+| 5 | Discharge ends on a timeout | **Fixed.** Empty = valid, stable, below the threshold; then the mixer's Cleanout Time; a timeout alarms and pauses the batch (Resume retries). |
 | 6 | Wrong discharge gate | **Fixed.** Gates come from the flow path mixer to destination, each with the outlet toward the next hop. Mixer is re-requested after a pause (it was not before). |
 | 7 | Batch size ignored | **Fixed.** Size scales every line. |
 | 8 | Abort / Unload broken | **Fixed.** Abort with material gives ABORTED_HOLD; Unload (to the original or another finished bin) or Discard once empty. |

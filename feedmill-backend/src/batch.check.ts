@@ -171,10 +171,9 @@ assert.ok(['PAUSING', 'PAUSED'].includes(m.activeBatch.state)); assert.equal(m.a
 // ── discharge never completes on a timeout ──
 reset(); Object.assign(m.equipment.get('MX').config, { dischargeTimeoutSec: 1, cleanoutSec: 0 }); queue(); run();
 assert.ok(until(() => m.activeBatch?.state === 'DISCHARGING')); drain = 0; scan(25);
-assert.equal(m.activeBatch.state, 'DISCHARGING'); assert.match(m.activeBatch.faultReason, /not empty/); assert.ok(m.faults.some((f: any) => f.code === 'W-BA-02'));
-scan(30); assert.equal(m.activeBatch.state, 'DISCHARGING', 'still waiting, never completes on the timeout');
-assert.equal(cmd('ExtendDischarge').accepted, true); assert.equal(m.activeBatch.faultReason, undefined);
-drain = 20; finished(); assert.equal(m.queue[0].state, 'COMPLETED');
+assert.ok(until(() => m.activeBatch.state === 'PAUSED')); assert.match(m.activeBatch.faultReason, /not empty/); assert.ok(m.faults.some((f: any) => f.code === 'W-BA-02'));
+scan(30); assert.equal(m.activeBatch.state, 'PAUSED', 'never completes on the timeout');
+drain = 20; assert.equal(cmd('ResumeBatch').accepted, true); assert.equal(m.activeBatch.faultReason, undefined); finished(); assert.equal(m.queue[0].state, 'COMPLETED');
 
 // ── a mixer scale well under zero is not an empty mixer ──
 reset(); drain = 0; queue(); run(); assert.ok(until(() => m.activeBatch?.state === 'DISCHARGING'));
@@ -234,6 +233,8 @@ assert.ok(Math.abs(m.bins.find((b: any) => b.id === 'B1').balance - (1000 - d)) 
 reset(); queue(); run(); assert.ok(until(() => m.activeBatch?.dosingSteps[0].state === 'cutoff' || m.activeBatch?.dosingSteps[0].state === 'settling'));
 cmd('PauseBatch'); assert.ok(until(() => m.activeBatch.state === 'PAUSED'));
 assert.equal(cmd('AbortBatch', undefined, { mode: 'mixUnload' }).accepted, true); assert.equal(m.activeBatch.state, 'MIXING');
+cmd('PauseBatch'); assert.ok(until(() => m.activeBatch.state === 'PAUSED')); assert.equal(m.getSnapshot().activeBatch.unloading, true);
+assert.equal(cmd('AbortBatch', undefined, { mode: 'unload' }).accepted, false, 'the abort choice is made once'); assert.equal(cmd('ResumeBatch').accepted, true);
 assert.ok(until(() => m.activeBatch === null && m.queue[0].state === 'ABORTED'));
 // cancel (acknowledged) closes at once, material stays in the mixer
 reset(); queue(); run(); assert.ok(until(() => m.activeBatch?.dosingSteps[0].state === 'feeding')); scan(3); cmd('PauseBatch'); assert.ok(until(() => m.activeBatch.state === 'PAUSED'));
@@ -241,6 +242,20 @@ const d2 = dosed0(); assert.equal(cmd('AbortBatch', undefined, { mode: 'cancel',
 assert.ok(Math.abs(m.bins.find((b: any) => b.id === 'B1').balance - (1000 - d2)) < 0.01);
 // aborting before anything was dosed closes at once
 reset(); queue(); run(); scan(2); cmd('PauseBatch'); assert.ok(until(() => m.activeBatch.state === 'PAUSED')); assert.equal(cmd('AbortBatch', undefined, { mode: 'unload' }).accepted, true); assert.equal(m.activeBatch, null); assert.equal(m.queue[0].state, 'ABORTED');
+
+// ── destination changes until the unload starts (also after an abort); no abort once it has ──
+const twoBins = () => { reset(); m.bins.push({ ...m.bins.find((x: any) => x.id === 'FB'), id: 'FB2', name: 'FB2', balance: 0 }); m.connections.push({ from: 'MX', fromPort: 'discharge', to: 'FB2', toPort: 'inlet' }); queue(); run(); assert.ok(until(() => m.activeBatch?.dosingSteps[0].state === 'feeding')); scan(3); };
+const sendTo = (destination: string) => cmd('SetBatchDestination', undefined, { destination }).accepted;
+const pauseNow = () => { cmd('PauseBatch'); assert.ok(until(() => m.activeBatch.state === 'PAUSED')); };
+twoBins(); assert.deepEqual(m.getSnapshot().bins.filter((x: any) => x.mixerPath).map((x: any) => x.id), ['FB', 'FB2'], 'only bins the mixer can reach are offered'); assert.equal(sendTo('B1'), false, 'finished bins only'); assert.equal(sendTo('FB2'), true);
+pauseNow(); assert.equal(cmd('AbortBatch', undefined, { mode: 'mixUnload' }).accepted, true); assert.equal(sendTo('FB'), true); assert.equal(sendTo('FB2'), true, 'still open after the abort');
+drain = 0; assert.ok(until(() => m.activeBatch.state === 'DISCHARGING')); assert.equal(sendTo('FB'), false, 'fixed once the unload starts');
+pauseNow(); assert.equal(sendTo('FB'), false); drain = 20; cmd('ResumeBatch'); assert.ok(finished()); assert.ok(m.bins.find((x: any) => x.id === 'FB2').balance > 10, 'credited to the new destination');
+twoBins(); drain = 0; assert.ok(until(() => m.activeBatch.state === 'DISCHARGING', 2000)); pauseNow();
+assert.equal(cmd('AbortBatch', undefined, { mode: 'cancel', acknowledged: true }).accepted, false, 'no abort after the unload started'); drain = 20;
+// cancelled with material in the mixer: the next batch waits until it is emptied
+twoBins(); queue(); pauseNow(); assert.equal(cmd('AbortBatch', undefined, { mode: 'cancel', acknowledged: true }).accepted, true);
+scan(20); assert.equal(m.activeBatch, null); assert.match(m.getSnapshot().queueControl.waiting, /mixer not empty/);
 
 // ── Not tracked bins: only a bin that discharges only to a hammermill ──
 reset(); m.equipment.set('HM', mk('HM', 'hammermill', {})); m.equipment.set('A2', mk('A2', 'auger', {})); m.equipment.set('B2', mk('B2', 'bin', {}));

@@ -43,6 +43,7 @@ export interface BackendBatch {
   destination: string;
   state: string;
   previousState?: string;
+  unloading?: boolean;
   mixerLbs?: number;
   startedAt?: string;
   completedAt?: string;

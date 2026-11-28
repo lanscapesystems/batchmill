@@ -148,6 +148,7 @@ export function QueueTab() {
   const allBins: Bin[] = backend?.connected ? backend.bins : [];
   const ingredients = backend?.connected ? backend.ingredients : [];
   const finishedBins = allBins.filter(b => b.type === 'finished');
+  const batchDestBins = finishedBins.filter(b => b.mixerPath); // batches only offer bins the mixer can reach
 
   const activeBatchEntry: QueueEntry | null = backend?.connected && backend.activeBatch ? backendToQueueEntry(backend.activeBatch) : null;
 
@@ -209,6 +210,12 @@ export function QueueTab() {
   }
 
   const aborted = activeBatchEntry?.state === 'ABORTED_HOLD';
+  // once the unload starts, the destination is fixed and there is no abort
+  const stage = isPaused ? backend?.activeBatch?.previousState : activeBatchEntry?.state;
+  const unloadStarted = stage === 'DISCHARGING' || stage === 'CLEAROUT';
+  const canAbort = activeBatchEntry?.state === 'PAUSED' && !backend?.activeBatch?.unloading && !unloadStarted;
+  // the choices show only after Abort is pressed: a press left over from before a resume (any screen) is forgotten
+  if (!canAbort && (abortMenu || cancelAckOpen)) { setAbortMenu(false); setCancelAckOpen(false); }
   // the tolerance popup steps aside once the batch is paused, so the Abort choices are reachable
   const dosingError: DosingError | undefined = activeBatchEntry?.dosingError;
   const dosingKey = dosingError ? `${activeBatchEntry!.id}:${dosingError.stepIndex}` : null;
@@ -227,7 +234,17 @@ export function QueueTab() {
                     #{activeBatchEntry.id} &mdash; {activeBatchEntry.recipeName}
                   </div>
                   <div style={{ color: batchDestBinFull ? 'var(--orange)' : 'var(--fg-dim)', marginTop: '2px' }}>
-                    Dest: {activeBatchEntry.destination}{batchDestBinFull && ' — BIN FULL'}
+                    Dest:{' '}
+                    {unloadStarted ? activeBatchEntry.destination : (
+                      <select aria-label="Batch destination" value={activeBatchEntry.destination}
+                        onChange={e => backend?.sendCommand('SetBatchDestination', undefined, { destination: e.target.value })}
+                        style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: '3px', color: 'var(--fg-bright)', padding: '4px 8px', fontSize: '12px' }}>
+                        {/* a current destination that lost its path still reads correctly, but is not offered */}
+                        {!batchDestBins.some(b => b.id === activeBatchEntry.destination) && <option value={activeBatchEntry.destination} hidden>{activeBatchEntry.destination}</option>}
+                        {batchDestBins.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+                      </select>
+                    )}
+                    {batchDestBinFull && ' — BIN FULL'}
                   </div>
                 </div>
                 <span style={{ color: stateColor[activeBatchEntry.state] ?? 'var(--fg)', fontWeight: 600 }}>
@@ -240,7 +257,7 @@ export function QueueTab() {
               {backend?.activeBatch && <StageBar batch={backend.activeBatch} />}
               {backend?.connected && (
                 <div className="flex gap-2">
-                  {(aborted || (abortMenu && activeBatchEntry.state === 'PAUSED')) ? (
+                  {(aborted || (abortMenu && canAbort)) ? (
                     <>
                       <button onClick={() => { setAbortMenu(false); backend.sendCommand('AbortBatch', undefined, { mode: 'mixUnload' }); }}
                         style={{ ...btnBase, background: 'var(--green)', color: '#000' }}>Mix + Unload</button>
@@ -261,7 +278,7 @@ export function QueueTab() {
                         <button onClick={() => backend.sendCommand('AcceptDosing')}
                           style={{ ...btnBase, background: 'var(--accent)', color: '#000' }}>Accept and Continue</button>
                       )}
-                      {activeBatchEntry.state === 'PAUSED' && (
+                      {canAbort && (
                         <button onClick={() => setAbortMenu(true)}
                           style={{ ...btnBase, background: 'var(--red)', color: '#fff' }}>Abort</button>
                       )}
@@ -269,10 +286,6 @@ export function QueueTab() {
                   ) : (
                     <button onClick={() => backend.sendCommand('PauseBatch')}
                       style={{ ...btnBase, background: 'var(--orange)', color: '#000' }}>Pause</button>
-                  )}
-                  {activeBatchEntry.state === 'DISCHARGING' && /not empty/.test(activeBatchEntry.faultReason ?? '') && (
-                    <button onClick={() => backend.sendCommand('ExtendDischarge')}
-                      style={{ ...btnBase, background: 'var(--accent)', color: '#000' }}>Extend Discharge</button>
                   )}
                 </div>
               )}
@@ -427,7 +440,7 @@ export function QueueTab() {
       {(newBatchOpen || editBatchId) && (
         <BatchFormModal
           recipes={recipes}
-          finishedBins={finishedBins}
+          finishedBins={batchDestBins}
           initial={editBatchId ? queueData.find(q => q.id === editBatchId) : undefined}
           onSubmit={(data) => { submitBatch(editBatchId ? 'EditBatch' : 'QueueBatch', editBatchId ?? undefined, data); }}
           onClose={() => { setNewBatchOpen(false); setEditBatchId(null); }}
@@ -601,7 +614,7 @@ function BatchFormModal({ recipes, finishedBins, initial, onSubmit, onClose }: {
   onClose: () => void;
 }) {
   const [recipeId, setRecipeId] = useState(initial?.recipeId || recipes[0]?.id || '');
-  const [dest, setDest] = useState(initial?.destination || finishedBins[0]?.id || '');
+  const [dest, setDest] = useState(finishedBins.find(b => b.id === initial?.destination)?.id ?? finishedBins[0]?.id ?? '');
   const [size, setSize] = useState(initial ? String(initial.targetMass) : '');
   // datetime-local wants local "YYYY-MM-DDTHH:mm"; empty = start as soon as the queue gets to it
   const toLocal = (iso?: string) => { if (!iso) return ''; const d = new Date(iso); return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };

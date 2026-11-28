@@ -1,6 +1,6 @@
 {
   "name": "feedmill-backend",
-  "version": "0.1.38",
+  "version": "0.1.39",
   "private": true,
   "scripts": {
     "dev": "tsx watch --ignore ./data src/server.ts",

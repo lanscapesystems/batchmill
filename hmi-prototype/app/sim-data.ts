@@ -34,6 +34,7 @@ export interface Bin {
   tracked?: boolean;
   hidden?: boolean; // hammermill-feed bin marked Not tracked: not shown in inventory or recipes
   levelSwitchState?: 'empty' | 'full' | 'normal' | 'fault';
+  mixerPath?: boolean; // the mixer can discharge into this bin
 }
 
 export interface RecipeLine {

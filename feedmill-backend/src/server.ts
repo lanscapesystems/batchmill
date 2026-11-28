@@ -6,7 +6,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { Mill } from './mill.js';
 import type { Command, CommandResult } from './types.js';
 import { screenFeed } from './hmiFeed.js';
-import { batchHistory, faultHistory, historyQuery, pruneFaults } from './db.js';
+import { batchHistory, faultHistory, inventoryHistory, historyQuery, pruneFaults } from './db.js';
 import { reconcileScaleReaders, listSerialPorts } from './scaleReader.js';
 import { registerUpdateRoutes } from './updateApi.js';
 import { registerBackupRoutes } from './backupApi.js';
@@ -127,6 +127,10 @@ app.get('/api/v1/trend/:id', (req, res) => {
 
 app.get('/api/v1/history/batches', (req, res) => {
   res.json(batchHistory(historyQuery(req.query)));
+});
+
+app.get('/api/v1/history/inventory', (req, res) => {
+  res.json(inventoryHistory(historyQuery(req.query)));
 });
 
 app.get('/api/v1/history/faults', (req, res) => {

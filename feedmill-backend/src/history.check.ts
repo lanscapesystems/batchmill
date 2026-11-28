@@ -63,6 +63,21 @@ m.postConsumption(two); finish(two);
 const reader = new Database(db.dbFilePath, { readonly: true });
 assert.equal((reader.prepare('SELECT COUNT(*) AS n FROM inventory_events WHERE batch_id = ?').get(two.id) as any).n, 2);
 
+// bin balances go below zero; adjustments are recorded; an ingredient ID with history is not reused
+m.bins.push({ id: 'B', name: 'Bin', type: 'ingredient', ingredientId: 'ING-07', balance: 3, capacity: 100, unit: 'lbs' });
+const short = queue(); short.dosingSteps = [{ ...short.dosingSteps[0], ingredientId: 'ING-07', sourceBinId: 'B', actual: 5 }];
+m.postConsumption(short); finish(short);
+const bin = () => m.bins.find((x: any) => x.id === 'B');
+assert.equal(bin().balance, -2);
+assert.equal(cmd('UpdateBin', 'B', { balance: null }).accepted, false);
+assert.equal(cmd('UpdateBin', 'B', { balance: -12 }).accepted, true);
+assert.equal(bin().balance, -12);
+const inv = db.inventoryHistory(db.historyQuery({})).rows.filter(r => r.ingredientId === 'ING-07');
+assert.deepEqual(inv.map(r => [r.type, r.change, r.batchId]), [['adjustment', -10, undefined], ['batch', -5, short.id]]);
+assert.equal(db.inventoryHistory(db.historyQuery({ from: '2999-01-01' })).rows.length, 0);
+m.ingredients = [];
+assert.equal(cmd('AddIngredient', undefined, { name: 'New', category: 'MAIN', unit: 'lbs' }).reason, 'Created ING-08');
+
 // screens get live items only; history comes in pages, newest first, filtered by date
 assert.ok(!m.getSnapshot().queue.some((b: any) => b.state === 'COMPLETED'));
 for (let i = 0; i < 60; i++) db.archiveBatch({ ...b1, id: `h${i}`, state: 'COMPLETED', completedAt: new Date(Date.UTC(2020, 0, 1, 0, i)).toISOString() });
@@ -70,7 +85,7 @@ const old = db.historyQuery({ to: '2021-01-01' });
 const first = db.batchHistory(old), second = db.batchHistory({ ...old, offset: 50 });
 assert.deepEqual([first.rows.length, first.more, second.rows.length, second.more], [50, true, 10, false]);
 assert.equal(first.rows[0].id, 'h59');
-assert.deepEqual(db.batchHistory(db.historyQuery({ from: '2021-01-01', offset: '-3' })).rows.map(r => r.id).sort(), ['1', '3', '4', two.id].sort());
+assert.deepEqual(db.batchHistory(db.historyQuery({ from: '2021-01-01', offset: '-3' })).rows.map(r => r.id).sort(), ['1', '3', '4', two.id, short.id].sort());
 
 // faults: only active ones go to screens; history groups repeats; numbers are never reused
 m.faults = [];

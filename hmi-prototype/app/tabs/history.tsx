@@ -12,7 +12,7 @@ export const ALL_DATES: DateRange = { from: '', to: '' };
 export const dateTime = (iso?: string | null) =>
   iso ? new Date(iso).toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
 
-export function useHistory<T>(kind: 'batches' | 'faults', range: DateRange, refreshKey: string, extra?: Record<string, string>) {
+export function useHistory<T>(kind: 'batches' | 'faults' | 'inventory', range: DateRange, refreshKey: string, extra?: Record<string, string>) {
   const query = new URLSearchParams(extra);
   if (range.from) query.set('from', new Date(`${range.from}T00:00`).toISOString());
   if (range.to) { const end = new Date(`${range.to}T00:00`); end.setDate(end.getDate() + 1); query.set('to', end.toISOString()); }

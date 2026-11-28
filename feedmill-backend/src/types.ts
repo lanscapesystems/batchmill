@@ -284,6 +284,7 @@ export interface QueueSnapshot {
     micro?: boolean;
   }[];
   microUnloading?: boolean;
+  unloading?: boolean;
   mixTimeRemainingMs?: number;
   mixTimeTotalMs?: number;
   faultReason?: string;

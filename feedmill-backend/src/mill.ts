@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
   type SignalDef, type SignalValue, type EquipmentRuntime, type EquipmentMode,
   type BatchRuntime, type DosingStep, type Recipe, type Ingredient,
@@ -17,7 +18,7 @@ import { loadConfig, saveConfig, type MillConfig } from './config.js';
 import {
   openDb, closeDb, persistBatch, clearActiveBatch, loadActiveBatch, loadBatchesJson,
   archiveBatch, postInventoryEvent, persistFault, loadFaults,
-  peekBatchNumber, claimBatchNumber, batchInHistory, lastFaultNumber,
+  peekBatchNumber, claimBatchNumber, batchInHistory, lastFaultNumber, ingredientIdsOnRecord,
 } from './db.js';
 
 // Logic scan period (how often the loop is woken). Timers do NOT count scans: each scan measures the real time since the
@@ -39,8 +40,8 @@ const DISCHARGE_TIMEOUT_MS = 60000;
 // All delay settings are stored in seconds (0.1 s steps, like a 100 ms PLC timer); the scan runs in ms.
 const delayMs = (sec: unknown, fallbackSec = 0) => Math.max(0, Number(sec ?? fallbackSec) || 0) * 1000;
 const EDITABLE_STATES = new Set(['IDLE']); // a queued batch; anything released is no longer editable
-const MICRO_NOT_EMPTY = 'Micros conveyor not empty - unload timed out (waiting; Pause then Abort to give up)';
-const MIXER_NOT_EMPTY ='Mixer not empty - discharge timed out (Extend or Abort)';
+const MICRO_NOT_EMPTY = 'Micros conveyor not empty - unload timed out (waiting)';
+const MIXER_NOT_EMPTY = 'Mixer not empty - discharge timed out';
 const MIXER_BELOW_ZERO = 'Waiting: mixer scale reads';
 const MICRO_BELOW_ZERO = 'Waiting: micros scale reads';
 const NO_PROGRESS_WINDOW_MS = 10_000; // once past the bin's no-flow delay, weight must rise by the minimum every window
@@ -195,10 +196,10 @@ export class Mill {
       }
       if (b.state !== 'IDLE') {
         if (!['PAUSED', 'ABORTED_HOLD'].includes(b.state)) {
-          b.previousState = b.state;
+          if (b.state !== 'PAUSING') b.previousState = b.state; // PAUSING already saved where to resume
           b.state = 'PAUSED';
           b.faultReason = 'Recovered after power loss';
-          this.raiseFault('BATCH', 'WARNING', `Batch ${b.id} recovered after power loss — review and resume or abort`, 'W-BA-REC');
+          this.raiseFault('BATCH', 'WARNING', `Batch ${b.id} recovered after power loss — review and resume${b.unloading || this.unloadStarted(b) ? '' : ' or abort'}`, 'W-BA-REC');
         }
         this.activeBatch = b;
       }
@@ -383,6 +384,8 @@ export class Mill {
         const b = this.activeBatch;
         if (!b) return reject('No active batch');
         if (b.state !== 'PAUSED' && b.state !== 'ABORTED_HOLD') return reject('Pause the batch before aborting'); // ABORTED_HOLD: a failed batch holding material
+        if (b.state === 'PAUSED' && b.unloading) return reject('Already aborted - Resume to finish unloading'); // the abort choice is made once
+        if (b.state === 'PAUSED' && this.unloadStarted(b)) return reject('Unloading has started - Resume to finish');
         const mode = cmd.parameters?.mode;
         if (mode !== 'mixUnload' && mode !== 'unload' && mode !== 'cancel') return reject('Choose Mix + Unload, Unload or Cancel');
         if (mode === 'cancel' && cmd.parameters?.acknowledged !== true) return reject('Cancel must be acknowledged');
@@ -424,11 +427,17 @@ export class Mill {
         return ok();
       }
 
-      case 'ExtendDischarge': {
+      // The running batch can be sent elsewhere until its unload starts, aborted or not (queued batches use EditBatch).
+      case 'SetBatchDestination': {
         const b = this.activeBatch;
-        if (!b || b.state !== 'DISCHARGING') return reject('Not discharging');
-        b.dischargeStartTime = this.clockMs;
-        if (b.faultReason === MIXER_NOT_EMPTY) b.faultReason = undefined;
+        if (!b) return reject('No active batch');
+        if (this.unloadStarted(b)) return reject('Unloading has started');
+        const destination = String(cmd.parameters?.destination ?? '');
+        if (!this.bins.some(x => x.id === destination && x.type === 'finished')) return reject('Destination must be a finished bin');
+        const mixer = this.findEquipmentByType('mixer');
+        if (!mixer || !flowPath(mixer.id, destination, this.connections)) return reject(`No flow path to ${destination}`);
+        b.destination = destination;
+        persistBatch(b);
         return ok();
       }
 
@@ -937,11 +946,15 @@ export class Mill {
         if (!bin) return reject('Unknown bin');
         const p = cmd.parameters as Partial<Bin> | undefined;
         if (!p) return reject('Missing parameters');
+        if (p.balance !== undefined && !Number.isFinite(p.balance)) return reject('Invalid balance');
         if (p.name !== undefined) bin.name = p.name;
         if (p.ingredientId !== undefined) bin.ingredientId = p.ingredientId;
         if (p.capacity !== undefined) bin.capacity = p.capacity;
         if (p.note !== undefined) bin.note = p.note;
-        if (p.balance !== undefined) bin.balance = p.balance;
+        if (p.balance !== undefined && p.balance !== bin.balance) {
+          postInventoryEvent(`adj-${randomUUID()}`, 'adjustment', bin.id, bin.ingredientId, p.balance - bin.balance, bin.unit, null);
+          bin.balance = p.balance;
+        }
         if (p.unit !== undefined) bin.unit = p.unit;
         if (p.type !== undefined) bin.type = p.type;
         if (p.tracked !== undefined) bin.tracked = p.tracked;
@@ -957,7 +970,8 @@ export class Mill {
         if (!p?.name || !p.category || !p.unit) return reject('Missing name, category or unit');
         const prefix = p.category === 'MICRO' ? 'MIC' : 'ING';
         const id = p.id ?? (() => {
-          const nums = this.ingredients.filter(i => i.id.startsWith(prefix + '-')).map(i => parseInt(i.id.split('-')[1]) || 0);
+          const used = [...this.ingredients.map(i => i.id), ...ingredientIdsOnRecord()];
+          const nums = used.filter(u => u.startsWith(prefix + '-')).map(u => parseInt(u.split('-')[1]) || 0);
           return `${prefix}-${String(Math.max(0, ...nums) + 1).padStart(2, '0')}`;
         })();
         if (this.ingredients.some(i => i.id === id)) return reject('Ingredient ID already exists');
@@ -1986,13 +2000,14 @@ export class Mill {
           if (this.clockMs - b.emptySinceMs >= delayMs(mixer?.config.cleanoutSec, 0)) { b.faultReason = undefined; b.state = 'CLEAROUT'; }
         } else {
           b.emptySinceMs = undefined;
-          // never completes on a timeout: alarm and keep waiting (Extend Discharge re-arms the timer, Abort gives up)
-          const limit = delayMs(mixer?.config.dischargeTimeoutSec, DISCHARGE_TIMEOUT_MS / 1000);
-          if (this.clockMs - b.dischargeStartTime > limit && b.faultReason !== MIXER_NOT_EMPTY) {
-            b.faultReason = MIXER_NOT_EMPTY;
-            this.raiseFault('BATCH', 'WARNING', `Batch ${b.id}: mixer not empty - discharge timed out`, 'W-BA-02');
-          }
           if (scale.weight <= -this.emptyLbs()) b.faultReason = `${MIXER_BELOW_ZERO} ${round1(scale.weight)} lb - zero it`;
+          // never completes on a timeout: alarm and pause (Resume restarts the timer)
+          const limit = delayMs(mixer?.config.dischargeTimeoutSec, DISCHARGE_TIMEOUT_MS / 1000);
+          if (this.clockMs - b.dischargeStartTime > limit) {
+            b.faultReason ??= MIXER_NOT_EMPTY;
+            this.raiseFault('BATCH', 'WARNING', `Batch ${b.id}: mixer not empty - discharge timed out`, 'W-BA-02');
+            this.pauseActiveBatch();
+          }
         }
         break;
       }
@@ -2372,7 +2387,7 @@ export class Mill {
     for (const [i, step] of b.dosingSteps.entries()) {
       if (step.actual <= 0) continue;
       const bin = this.bins.find(bn => bn.id === step.sourceBinId);
-      if (bin) bin.balance = Math.max(0, bin.balance - step.actual);
+      if (bin) bin.balance -= step.actual; // may go negative: more used than was recorded as received
       // the step number keeps two lines of the same ingredient apart
       postInventoryEvent(`${b.id}-${i}-${step.ingredientId}-consume`, 'consumption', step.sourceBinId, step.ingredientId, -step.actual, step.unit, b.id);
     }
@@ -2409,7 +2424,12 @@ export class Mill {
     }
   }
 
-  // Drop the run request of everything the batch owns; each motor stops after its own stop delay.
+  // From here on the destination is fixed and the batch cannot be aborted.
+  private unloadStarted(b: BatchRuntime): boolean {
+    const stage = b.state === 'PAUSING' || b.state === 'PAUSED' ? b.previousState : b.state;
+    return stage === 'DISCHARGING' || stage === 'CLEAROUT';
+  }
+
   // Pause the running batch: PAUSING releases its equipment once everything has stopped, then it sits PAUSED for Resume.
   private pauseActiveBatch(): boolean {
     const b = this.activeBatch;
@@ -2422,6 +2442,7 @@ export class Mill {
     return true;
   }
 
+  // Drop the run request of everything the batch owns; each motor stops after its own stop delay.
   private initiateEquipmentStop(ownerId: string) {
     for (const eq of this.equipment.values()) {
       // gates hold until releaseEquipment: moving one while a conveyor runs out would misroute what is still on it
@@ -2693,12 +2714,14 @@ export class Mill {
           sourceBinId: s.sourceBinId, target: s.target,
           actual: Math.round(s.actual * 10) / 10, unit: s.unit, state: s.state, deviation: s.deviation, micro: s.micro,
         })),
-        microUnloading: b.microUnloading,
+        microUnloading: b.microUnloading, unloading: b.unloading,
         mixTimeRemainingMs: b.mixTimeRemainingMs, mixTimeTotalMs: b.mixTimeTotalMs,
         faultReason: b.faultReason,
         scheduledAt: b.scheduledAt, late: b.late, warnings: b.warnings, tolHold: b.tolHold, dosingError: b.dosingError,
       };
     };
+
+    const mixerId = this.findEquipmentByType('mixer')?.id;
 
     return {
       revision: this.revision,
@@ -2709,7 +2732,7 @@ export class Mill {
       activeBatch: this.activeBatch ? batchToQueue(this.activeBatch) : null,
       faults: this.faults.filter(f => f.active),
       // a bin is a micro bin when its auger discharges onto a micros conveyor (no separate bin type to configure)
-      bins: this.bins.map(b => ({ ...b, type: b.type === 'ingredient' && this.isMicroBin(b.id) ? 'micro_hopper' as const : b.type, hidden: this.isHidden(b.id) || undefined, levelSwitchState: this.levelState(b.id) })),
+      bins: this.bins.map(b => ({ ...b, type: b.type === 'ingredient' && this.isMicroBin(b.id) ? 'micro_hopper' as const : b.type, hidden: this.isHidden(b.id) || undefined, mixerPath: (!!mixerId && !!flowPath(mixerId, b.id, this.connections)) || undefined, levelSwitchState: this.levelState(b.id) })),
       recipes: this.recipes,
       ingredients: this.ingredients,
       connections: this.connections,
