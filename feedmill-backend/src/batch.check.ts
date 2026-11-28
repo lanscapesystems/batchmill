@@ -183,6 +183,31 @@ assert.equal(m.activeBatch.faultReason, 'Waiting: mixer scale reads -300 lb - ze
 weight = -3; assert.ok(finished()); assert.equal(m.queue[0].state, 'COMPLETED', 'drift inside the empty limit still finishes');
 assert.ok(m.bins.find((b: any) => b.id === 'FB').balance <= m.queue[0].dosingSteps[0].actual + 5, 'drift is not credited to the destination');
 
+// ── PLC motion rules: settling needs the whole time without motion; an empty mixer is empty even while in motion ──
+reset(); m.equipment.get('B1').config.settleSec = 1; queue(); run();
+assert.ok(until(() => m.activeBatch?.dosingSteps[0].state === 'settling'));
+for (let i = 0; i < 40; i++) { scaleStable = i % 5 !== 4; scan(); } // never still for 10 scans in a row
+assert.equal(m.activeBatch.dosingSteps[0].state, 'settling', 'motion restarts the settle time');
+scaleStable = true; scan(5); assert.equal(m.activeBatch.dosingSteps[0].state, 'settling'); scan(6);
+assert.notEqual(m.activeBatch?.dosingSteps[0].state, 'settling');
+assert.ok(until(() => m.activeBatch?.state === 'DISCHARGING')); scaleStable = false;
+assert.ok(finished()); assert.equal(m.queue[0].state, 'COMPLETED', 'discharge does not wait for a still scale');
+
+// ── legal weight limits (PLC out of range): outside them the batch stops and the scale stays invalid until Reset Faults ──
+reset(); const limits = { id: 'SC', name: 's', minLegal: -50, maxLegal: 400 };
+assert.equal(cmd('ConfigureScale', undefined, { ...limits, minLegal: 500 }).accepted, false, 'minimum above maximum');
+assert.equal(cmd('ConfigureScale', undefined, { ...limits, format: 'plc' }).accepted, false, 'PLC format without its characters');
+m.scaleConfigs = [limits]; queue(); run(); assert.ok(until(() => m.activeBatch?.dosingSteps[0].state === 'feeding'));
+const read = (w: number) => m.setScale('SC', w, true, true);
+read(-50); read(400); m.checkScaleFaults(); assert.ok(m.scales.SC.valid && m.activeBatch.state === 'DOSING', 'the limits themselves are legal');
+read(401); assert.equal(m.scales.SC.valid, false); m.checkScaleFaults();
+assert.equal(m.activeBatch.state, 'PAUSING'); assert.match(m.activeBatch.faultReason, /legal limits/);
+assert.ok(m.faults.some((f: any) => f.active && f.code === 'E-SC-03' && f.equipment === 'SC'));
+read(20); assert.equal(m.scales.SC.valid, false, 'latched: a legal reading does not clear it');
+cmd('ResetFaults'); read(20); assert.equal(m.scales.SC.valid, true);
+read(-51); assert.equal(m.scales.SC.valid, false, 'below the minimum');
+m.scaleConfigs = []; cmd('ResetFaults'); m.checkScaleFaults();
+
 // ── status bar data: mixer pounds on the active batch only, and the stage a paused batch stopped in ──
 reset(); queue(); queue(); run(); scan(3);
 {

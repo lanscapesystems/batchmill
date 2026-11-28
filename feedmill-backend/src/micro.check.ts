@@ -14,11 +14,11 @@ const mk = (id: string, type: string, config: Record<string, unknown>, mode = 'A
 });
 const cmd = (action: string, targetId?: string, parameters?: Record<string, unknown>) =>
   m.processCommand({ requestId: 'x', action, targetId, parameters });
-let w1 = 0, w2 = 0, microCoast = 0, beltValid = true, wasA2 = false, mcRanEarly = false, mcRan = false;
+let w1 = 0, w2 = 0, microCoast = 0, beltValid = true, beltStable = true, wasA2 = false, mcRanEarly = false, mcRan = false;
 const scan = (n = 1) => {
   for (let i = 0; i < n; i++) {
     m.scales.SC = { weight: w1, stable: true, valid: true, timestamp: Date.now() };
-    m.scales.SM = { weight: w2, stable: true, valid: beltValid, timestamp: Date.now() };
+    m.scales.SM = { weight: w2, stable: beltStable, valid: beltValid, timestamp: Date.now() };
     m.scan();
     const a1 = m.equipment.get('A1'), a2 = m.equipment.get('A2'), mc = m.equipment.get('MC');
     if (a1.runCmd) w1 += 5;
@@ -39,7 +39,7 @@ const reset = (recipe: 'both' | 'micro' | 'major' = 'both') => {
   for (const b of loadBatchesJson()) clearActiveBatch(b.id);
   m.equipment.clear(); m.bins = []; m.connections = []; m.queue = []; m.activeBatch = null; m.scales = {}; m.faults = [];
   m.ioOverrides = {}; m.commissioningMode = false; m.queueHeld = true; delete m.globalConfig.estopInput;
-  w1 = 0; w2 = 0; microCoast = 0; beltValid = true; wasA2 = false; mcRanEarly = false; mcRan = false;
+  w1 = 0; w2 = 0; microCoast = 0; beltValid = true; beltStable = true; m.globalConfig.microInitialSettleSec = 0.2; wasA2 = false; mcRanEarly = false; mcRan = false;
   const bin = { freefall: 5, settleSec: 0.2, noProgressDelaySec: 0.5, toleranceLbs: 1.5 };
   m.equipment.set('MX', mk('MX', 'mixer', { scaleId: 'SC', capacity: 1000, cleanoutSec: 1 }));
   m.equipment.set('A1', mk('A1', 'auger', { startDelay: 0, stopDelay: 0 }));
@@ -184,6 +184,15 @@ assert.equal(m.equipment.get('A1').config.vfdRunOutput, undefined);
 assert.equal(cmd('RemoveSharedVfd', vid).accepted, false, 'still used by A1');
 cmd('UpdateEquipment', 'A1', { config: { sharedVfdId: '' } }); assert.equal(m.equipment.get('A1').config.sharedVfdId, undefined);
 assert.equal(cmd('RemoveSharedVfd', vid).accepted, true); assert.equal(m.sharedVfds.length, 0);
+
+// ── PLC motion rules: a micro waits for the belt scale to be still for the whole initial settle; unload ignores motion ──
+reset('micro'); m.globalConfig.microInitialSettleSec = 1; queue(); run();
+assert.ok(until(() => m.activeBatch?.state === 'DOSING'));
+for (let i = 0; i < 40; i++) { beltStable = i % 5 !== 4; scan(); } // never still for 10 scans in a row
+assert.equal(step(0).state, 'pending', 'motion restarts the initial settle');
+beltStable = true; scan(5); assert.equal(step(0).state, 'pending'); scan(6); assert.notEqual(step(0).state, 'pending');
+assert.ok(until(() => !!m.activeBatch?.microUnloading)); beltStable = false;
+assert.ok(until(() => m.activeBatch?.state === 'MIXING'), 'the running belt empties while its scale reads in motion');
 
 console.log('micro checks passed');
 process.exit(0);

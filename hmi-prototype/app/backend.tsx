@@ -88,6 +88,9 @@ export interface BackendScaleConfig {
   id: string;
   name: string;
   connectionType: 'serial' | 'rs1201';
+  format?: string; // serial indicator output format; see scaleFormats.ts in the backend
+  startCode?: string; endCode?: string; prefixChar?: string; suffixChar?: string; motionChar?: string; // 'plc' format
+  minLegal?: number; maxLegal?: number;
   comPort: string;
   baudRate: number;
   dataBits: number;

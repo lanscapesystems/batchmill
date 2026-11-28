@@ -11,6 +11,7 @@ import { verifyEthercatRack, discoverRack, syncIoConf, clearCouplerErrors, runRs
 import { MovingAverage, OnDelay, LoadPid, RelayTuner, scaleLinear } from './loadControl.js';
 import { Debounce } from './monitors.js';
 import { scaleLines, freefallAdjust, toleranceFor, feedsOnlyHammermill, flowPath, round1 } from './batchLogic.js';
+import { SCALE_DECODERS, plcConfigError } from './scaleFormats.js';
 import { readIoState, writeIoCommand, rawToPct, fullScaleFor, NX_ANALOG_DISCONNECT_RAW } from './ioDaemon.js';
 import { loadConfig, saveConfig, type MillConfig } from './config.js';
 import {
@@ -264,8 +265,13 @@ export class Mill {
   // ── external sensor input (scaleReader.ts calls this on every new reading) ──
 
   setScale(scaleId: string, weight: number, stable: boolean, valid: boolean) {
-    this.scales[scaleId] = { weight, stable, valid, timestamp: Date.now() };
+    // PLC Scale Out of Range: a reading outside the legal limits invalidates the scale until Reset Faults
+    const sc = this.scaleConfigs.find(s => s.id === scaleId);
+    if (valid && (weight < (sc?.minLegal ?? -Infinity) || weight > (sc?.maxLegal ?? Infinity))) this.scaleIllegal.set(scaleId, weight);
+    const latched = this.scaleIllegal.has(scaleId) || this.faults.some(f => f.active && f.equipment === scaleId && f.code === 'E-SC-03');
+    this.scales[scaleId] = { weight, stable, valid: valid && !latched, timestamp: Date.now() };
   }
+  private scaleIllegal = new Map<string, number>(); // seen by a reader, raised by the next scan
 
   // scaleReader.ts: why a serial scale gives no weight ('' = reading again, or no longer a serial scale).
   // Held here and raised by the scan, which stops with the database; the reader's timers do not.
@@ -364,7 +370,7 @@ export class Mill {
         }
         for (const step of active) {
           if (step.state === 'feeding') { step.augerRunMs = 0; step.progressMs = 0; step.progressRef = step.actual; } // no-flow delay starts again
-          if (step.state === 'settling') step.settleStartTime = this.clockMs; // timers are scan counts: restart after a pause or a restart
+          step.stillMs = 0; // the scale was not watched while paused: settle again
         }
         b.dischargeStartTime = this.clockMs; b.emptySinceMs = undefined;
         b.faultReason = undefined; b.dosingError = undefined;
@@ -1022,10 +1028,19 @@ export class Mill {
       case 'ConfigureScale': {
         const p = cmd.parameters as Partial<ScaleConfig> | undefined;
         if (!p?.id || !p.name) return reject('Missing scale id or name');
+        if (p.format && p.format !== 'plc' && !Object.hasOwn(SCALE_DECODERS, p.format)) return reject('Unknown scale format');
+        const framing = p.format === 'plc' && p.connectionType !== 'rs1201' ? plcConfigError(p) : null;
+        if (framing) return reject(framing);
+        const minLegal = p.minLegal ?? undefined, maxLegal = p.maxLegal ?? undefined;
+        if ([minLegal, maxLegal].some(v => v !== undefined && !Number.isFinite(v))) return reject('Legal limits must be numbers');
+        if (minLegal !== undefined && maxLegal !== undefined && minLegal >= maxLegal) return reject('Minimum legal weight must be below the maximum');
         if (p.connectionType === 'rs1201' && !SCALE_ID_RE.test(p.id)) return reject('Scale ID may use only letters, numbers, - and _ (24 at most)');
         const sc: ScaleConfig = {
           id: p.id, name: p.name,
           connectionType: p.connectionType ?? 'serial',
+          format: p.format ?? '',
+          startCode: p.startCode, endCode: p.endCode, prefixChar: p.prefixChar, suffixChar: p.suffixChar, motionChar: p.motionChar,
+          minLegal, maxLegal,
           comPort: p.comPort ?? '',
           baudRate: p.baudRate ?? 9600,
           dataBits: p.dataBits ?? 8,
@@ -1617,6 +1632,17 @@ export class Mill {
   private checkScaleFaults() {
     // a serial scale that cannot be read, whether or not any equipment uses it; latched like E-SC-01
     for (const [id, problem] of this.scaleProblems) this.raiseFault(id, 'WARNING', `Scale ${id}: ${problem}`, 'W-SC-02');
+    for (const [id, weight] of this.scaleIllegal) {
+      this.raiseFault(id, 'CRITICAL', `Scale ${id}: ${round1(weight)} lb is outside its legal limits`, 'E-SC-03');
+      if (this.scales[id]) this.scales[id].valid = false;
+      // the PLC stops the batcher when the scale it is working from goes out of range
+      const b = this.activeBatch;
+      if (!b) continue;
+      const inUse = id === this.findEquipmentByType('mixer')?.config.scaleId
+        || (id === this.microConveyor(b)?.config.scaleId && b.state === 'DOSING' && !b.microDelivered);
+      if (inUse && this.pauseActiveBatch()) b.faultReason = `Scale ${id} outside its legal limits - Reset Faults, then Resume`;
+    }
+    this.scaleIllegal.clear();
     const delay = delayMs(this.globalConfig.scaleFaultDelay, 2);
     for (const eq of this.equipment.values()) {
       const id = eq.config.scaleId as string | undefined;
@@ -1958,7 +1984,8 @@ export class Mill {
         if (b.faultReason === 'Waiting: mixer scale invalid') b.faultReason = undefined;
         // well under zero means the scale is off, not that the mixer is empty: wait for the operator to zero it
         if (b.faultReason?.startsWith(MIXER_BELOW_ZERO)) b.faultReason = undefined; // re-judged every scan
-        if (scale.stable && Math.abs(scale.weight) < this.emptyLbs()) {
+        // like the PLC, motion is ignored here (the mixer is running): the cleanout time is what rides out a passing low reading
+        if (Math.abs(scale.weight) < this.emptyLbs()) {
           // declared empty: keep running for the mixer's cleanout time, then finish
           b.emptySinceMs ??= this.clockMs;
           if (this.clockMs - b.emptySinceMs >= delayMs(mixer?.config.cleanoutSec, 0)) { b.faultReason = undefined; b.state = 'CLEAROUT'; }
@@ -1970,7 +1997,7 @@ export class Mill {
             b.faultReason = MIXER_NOT_EMPTY;
             this.raiseFault('BATCH', 'WARNING', `Batch ${b.id}: mixer not empty - discharge timed out`, 'W-BA-02');
           }
-          if (scale.stable && scale.weight <= -this.emptyLbs()) b.faultReason = `${MIXER_BELOW_ZERO} ${round1(scale.weight)} lb - zero it`;
+          if (scale.weight <= -this.emptyLbs()) b.faultReason = `${MIXER_BELOW_ZERO} ${round1(scale.weight)} lb - zero it`;
         }
         break;
       }
@@ -2150,7 +2177,7 @@ export class Mill {
     if (b.faultReason === 'Waiting: micros scale invalid') b.faultReason = undefined;
     const minMs = delayMs(conv.config.unloadMinSec, 10);
     if (b.faultReason?.startsWith(MICRO_BELOW_ZERO)) b.faultReason = undefined; // re-judged every scan, like the mixer
-    if ((b.microUnloadRunMs ?? 0) >= minMs && scale.stable && Math.abs(scale.weight) < this.microZeroLbs(conv)) {
+    if ((b.microUnloadRunMs ?? 0) >= minMs && Math.abs(scale.weight) < this.microZeroLbs(conv)) { // motion ignored: the belt is running
       conv.request = false; // stops through its own stop delay
       b.microUnloading = false; b.microDelivered = true;
       if (b.faultReason === MICRO_NOT_EMPTY) b.faultReason = undefined;
@@ -2162,7 +2189,7 @@ export class Mill {
       b.faultReason = MICRO_NOT_EMPTY;
       this.raiseFault('BATCH', 'WARNING', `Batch ${b.id}: micros conveyor not empty - unload timed out`, 'W-BA-03');
     }
-    if (scale.stable && scale.weight <= -this.microZeroLbs(conv)) b.faultReason = `${MICRO_BELOW_ZERO} ${round1(scale.weight)} lb - zero it`;
+    if (scale.weight <= -this.microZeroLbs(conv)) b.faultReason = `${MICRO_BELOW_ZERO} ${round1(scale.weight)} lb - zero it`;
   }
 
   private afterMicroUnload(b: BatchRuntime) {
@@ -2190,10 +2217,17 @@ export class Mill {
       return false;
     };
     const done = () => { if (step.micro) b.microIndex = idx + 1; else b.dosingIndex = idx + 1; };
+    // PLC settle timer: the scale must be still for the whole time; motion or a lost reading starts it over
+    const stillFor = (ms: number): boolean => {
+      if (waitScale(true)) { step.stillMs = 0; return false; }
+      step.stillMs = (step.stillMs ?? 0) + this.dtMs;
+      return step.stillMs >= ms;
+    };
 
     switch (step.state) {
       case 'pending': {
-        if (waitScale(true)) break;
+        // a micro waits out the initial settle (the belt scale), a major only needs a still reading
+        if (!stillFor(step.micro ? delayMs(this.globalConfig.microInitialSettleSec, SETTLE_MS / 1000) : 0)) break;
         step.baselineWeight = scale!.weight;
         step.augerRunMs = 0; step.progressMs = 0; step.progressRef = 0; step.clean = true;
         step.state = 'baseline';
@@ -2265,16 +2299,15 @@ export class Mill {
         if (auger) auger.request = false;
         if (!auger?.runCmd) {
           if (auger) auger.owner = undefined;
-          step.settleStartTime = this.clockMs;
+          step.stillMs = 0;
           step.state = 'settling';
         }
         break;
       }
 
       case 'settling': {
-        if (!scaleOk) { step.clean = false; waitScale(false); break; }
-        if (this.clockMs - step.settleStartTime < delayMs(binEq?.config.settleSec, SETTLE_MS / 1000)) break;
-        if (waitScale(true)) break;
+        if (!scaleOk) step.clean = false;
+        if (!stillFor(delayMs(binEq?.config.settleSec, SETTLE_MS / 1000))) break;
         step.actual = Math.max(0, scale!.weight - step.baselineWeight);
         step.deviation = Math.round((step.actual - step.target) * 100) / 100;
         const tol = toleranceFor(binEq?.config.toleranceLbs, step.target);
@@ -2897,7 +2930,6 @@ export class Mill {
         unit: line.unit,
         state: 'pending' as const,
         baselineWeight: 0,
-        settleStartTime: 0,
         cutoffStartTime: 0,
       };
     });

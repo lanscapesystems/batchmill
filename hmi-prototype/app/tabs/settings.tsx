@@ -1062,6 +1062,7 @@ function IOSection() {
   const [editingScale, setEditingScale] = useState<BackendScaleConfig | null>(null);
   const [scaleDraft, setScaleDraft] = useState<BackendScaleConfig>({ id: '', name: '', connectionType: 'serial', comPort: '', baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, rackSlot: 0, zeroOffset: 0, ratedMvV: 2.0, capacity: 5000, resolution: 1, freshnessTimeout: 5000, stabilityWindow: 500 });
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [scaleError, setScaleError] = useState('');
   const [commissioningOpen, setCommissioningOpen] = useState(false);
   const [confirmCommissioning, setConfirmCommissioning] = useState<boolean | null>(null);
   const [calOpen, setCalOpen] = useState(false);
@@ -1173,14 +1174,16 @@ function IOSection() {
   const rs1201Slots = om.cards.filter(c => c.model === 'NX-RS1201').map(c => c.slot);
 
   function startAddScale() {
+    setScaleError('');
     const nextNum = scaleConfigs.length + 1;
     setScaleDraft({ id: `SC-${nextNum}`, name: `Scale ${nextNum}`, connectionType: 'serial', comPort: '', baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, rackSlot: 0, zeroOffset: 0, ratedMvV: 2.0, capacity: 5000, resolution: 1, freshnessTimeout: 5000, stabilityWindow: 500 });
     setEditingScale({ id: '', name: '', connectionType: 'serial', comPort: '', baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, rackSlot: 0, zeroOffset: 0, ratedMvV: 2.0, capacity: 0, resolution: 0, freshnessTimeout: 0, stabilityWindow: 0 });
   }
-  function startEditScale(sc: BackendScaleConfig) { setScaleDraft({ ...sc }); setEditingScale(sc); }
-  function saveScale() {
-    backend?.sendCommand('ConfigureScale', undefined, scaleDraft as unknown as Record<string, unknown>);
-    setEditingScale(null);
+  function startEditScale(sc: BackendScaleConfig) { setScaleDraft({ ...sc }); setEditingScale(sc); setScaleError(''); }
+  async function saveScale() {
+    const r = await backend?.sendCommand('ConfigureScale', undefined, scaleDraft as unknown as Record<string, unknown>);
+    if (!r?.accepted) { setScaleError(`Not saved: ${r?.reason ?? 'no answer from the backend'}`); return; } // keep the form open
+    setScaleError(''); setEditingScale(null);
   }
   function deleteScale(id: string) { backend?.sendCommand('RemoveScale', id); setConfirmDelete(null); }
 
@@ -1443,10 +1446,33 @@ function IOSection() {
               </div>
               {scaleDraft.connectionType === 'serial' ? (
                 <>
-                  <div className="flex flex-col gap-1">
-                    <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Serial Port</span>
-                    <SerialPortSelect key={editingScale.id} value={scaleDraft.comPort} onChange={comPort => setScaleDraft(d => ({ ...d, comPort }))} style={inputStyle} />
+                  <div className="flex gap-2">
+                    <div className="flex flex-col gap-1 flex-1">
+                      <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Indicator Format</span>
+                      <select aria-label="Indicator format" value={scaleDraft.format ?? ''} onChange={e => setScaleDraft({ ...scaleDraft, format: e.target.value })} style={inputStyle}>
+                        <option value="">Plain text number (Cardinal, print output)</option>
+                        <option value="plc">Custom framing (as the PLC)</option>
+                        <option value="ricelake">Rice Lake stream (STR1 / STR5)</option>
+                        <option value="toledo">Mettler Toledo continuous (Rice Lake STR2)</option>
+                        <option value="weightronix">Avery Weigh-Tronix WI-120 (Rice Lake STR3)</option>
+                        <option value="and">A&amp;D standard</option>
+                      </select>
+                    </div>
+                    <div className="flex flex-col gap-1 flex-1">
+                      <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Serial Port</span>
+                      <SerialPortSelect key={editingScale.id} value={scaleDraft.comPort} onChange={comPort => setScaleDraft(d => ({ ...d, comPort }))} style={inputStyle} />
+                    </div>
                   </div>
+                  {scaleDraft.format === 'plc' && (
+                    <div className="flex gap-2">
+                      {([['startCode', 'Line Start (ASCII Hex)', 2], ['endCode', 'Line End (ASCII Hex)', 2], ['prefixChar', 'Prefix Char', 1], ['suffixChar', 'Suffix Char', 1], ['motionChar', 'Moving Char', 1]] as const).map(([key, label, max]) => (
+                        <label key={key} className="flex flex-col gap-1 flex-1">
+                          <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>{label}</span>
+                          <input maxLength={max} value={scaleDraft[key] ?? ''} onChange={e => setScaleDraft({ ...scaleDraft, [key]: e.target.value })} style={inputStyle} />
+                        </label>
+                      ))}
+                    </div>
+                  )}
                   <div className="flex gap-2">
                     <div className="flex flex-col gap-1 flex-1">
                       <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Baud Rate</span>
@@ -1588,6 +1614,14 @@ function IOSection() {
                 </div>
               </div>
               <div className="flex gap-2">
+                {([['minLegal', 'Minimum Legal (lbs, blank = off)'], ['maxLegal', 'Maximum Legal (lbs, blank = off)']] as const).map(([key, label]) => (
+                  <label key={key} className="flex flex-col gap-1 flex-1">
+                    <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>{label}</span>
+                    <input type="number" value={scaleDraft[key] ?? ''} onChange={e => setScaleDraft({ ...scaleDraft, [key]: e.target.value === '' ? undefined : Number(e.target.value) })} style={inputStyle} />
+                  </label>
+                ))}
+              </div>
+              <div className="flex gap-2">
                 <div className="flex flex-col gap-1 flex-1">
                   <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Freshness (ms)</span>
                   <input type="number" value={scaleDraft.freshnessTimeout} onChange={e => setScaleDraft({ ...scaleDraft, freshnessTimeout: Number(e.target.value) })} style={inputStyle} />
@@ -1597,6 +1631,7 @@ function IOSection() {
                   <input type="number" value={scaleDraft.stabilityWindow} onChange={e => setScaleDraft({ ...scaleDraft, stabilityWindow: Number(e.target.value) })} style={inputStyle} />
                 </div>
               </div>
+              {scaleError && <div role="alert" style={{ color: 'var(--orange)', fontSize: '11px' }}>{scaleError}</div>}
               <div className="flex gap-2 mt-1">
                 <button onClick={saveScale} className="px-3 py-1.5 text-xs font-medium"
                   style={{ background: 'var(--accent)', color: '#000', border: 'none', borderRadius: '3px', cursor: 'pointer' }}>Save</button>
@@ -1765,7 +1800,7 @@ function GlobalSection() {
               : <span style={{ color: globalConfig[key] ? 'var(--fg-bright)' : 'var(--fg-dim)' }}>{(globalConfig[key] as string) || 'Not Assigned'}</span>}
           </div>
         ))}
-        {([['mixerEmptyLbs', 'Mixer Empty Below', 10, 'lbs'], ['resumeMismatchLbs', 'Resume: Ask if Scale Differs by', 10, 'lbs']] as const).map(([key, label, def, unit]) => (
+        {([['mixerEmptyLbs', 'Mixer Empty Below', 10, 'lbs'], ['resumeMismatchLbs', 'Resume: Ask if Scale Differs by', 10, 'lbs'], ['microInitialSettleSec', 'Micros: Settle Before Dosing', 2, 's']] as const).map(([key, label, def, unit]) => (
           <div key={key} className="flex items-center gap-2">
             <span style={{ color: 'var(--fg-dim)', width: '200px', flexShrink: 0 }}>{label}</span>
             {editing

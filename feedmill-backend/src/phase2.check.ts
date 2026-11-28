@@ -238,7 +238,7 @@ const mxt: any = mk('MXT', 'mixer', { scaleId: 'SCT' }); mxt.mode = 'Auto'; m.eq
 m.scales.SCT = { weight: 0, stable: true, valid: true, timestamp: Date.now() };
 const ag: any = mk('AG', 'auger', { runOutput: 'AG_OUT', runConfirmAux: 'AG_AUX' }); ag.mode = 'Off'; m.equipment.set('AG', ag); m.ioInputs.AG_AUX = true;
 m.activeBatch = { id: 'BT', recipeId: 'R', recipeName: 'R', targetMass: 100, destination: 'BIN', state: 'DOSING', startedAt: new Date().toISOString(), dosingIndex: 0,
-  dosingSteps: [{ ingredientId: 'I', ingredientName: 'I', sourceBinId: 'SB', augerId: 'AG', target: 50, actual: 0, unit: 'lbs', state: 'pending', baselineWeight: 0, settleStartTime: 0, cutoffStartTime: 0 }],
+  dosingSteps: [{ ingredientId: 'I', ingredientName: 'I', sourceBinId: 'SB', augerId: 'AG', target: 50, actual: 0, unit: 'lbs', state: 'pending', baselineWeight: 0, cutoffStartTime: 0 }],
   mixTimeRemainingMs: 0, mixTimeTotalMs: 0, dischargeStartTime: 0 };
 scan(5); assert.equal(m.activeBatch.state, 'DOSING'); assert.equal(m.activeBatch.faultReason, 'Waiting: AG is not in Auto'); assert.equal(ag.owner, undefined, 'nothing claimed');
 cmd('SetEquipmentMode', 'AG', { mode: 'Auto' }); scan(15);

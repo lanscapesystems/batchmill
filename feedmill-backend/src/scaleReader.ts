@@ -3,9 +3,8 @@ import { SerialPort } from 'serialport';
 import type { Mill } from './mill.js';
 import type { ScaleConfig } from './types.js';
 import { readIoState } from './ioDaemon.js';
+import { SCALE_DECODERS, parseWeight, plcDecoder, splitFrames } from './scaleFormats.js';
 
-// sign may be padded away from the digits ("-  12.5") or trail them ("12.5-")
-const DEFAULT_WEIGHT_REGEX = '[+-]?[ \\t]*(?:\\d+\\.?\\d*|\\.\\d+)(?:-(?![\\w.]))?';
 const RS1201_POLL_MS = 100;
 const SERIAL_RETRY_MS = 3000;
 
@@ -41,15 +40,6 @@ export async function listSerialPorts(): Promise<SerialPortOption[]> {
   const options = toPortOptions(await SerialPort.list());
   if (existsSync(SIM_LINK)) options.push({ path: SIM_LINK, label: `${SIM_LINK} — scale simulator` });
   return options;
-}
-
-/** The weight in one line from a scalehead, or null if the pattern finds none. */
-export function parseWeight(line: string, re = new RegExp(DEFAULT_WEIGHT_REGEX)): number | null {
-  let s = re.exec(line)?.[0].replace(/\s/g, '');
-  if (!s) return null;
-  if (s.endsWith('-')) s = '-' + s.slice(0, -1).replace(/^[+-]/, '');
-  const weight = Number(s);
-  return Number.isFinite(weight) ? weight : null;
 }
 
 function configKey(cfg: ScaleConfig): string {
@@ -100,8 +90,10 @@ function startSerialReader(mill: Mill, cfg: ScaleConfig): () => void {
   const startedAt = Date.now();
   const faultAfterMs = Math.max(2000, cfg.freshnessTimeout || 0); // time to open the port and hear a first weight
   let portError = ''; // why the port last failed to open or closed
+  let indicatorError = ''; // what the indicator last said was wrong with its weight
   const problem = () => !cfg.comPort ? 'no serial port selected'
     : portError ? `cannot read ${cfg.comPort}: ${portError}`
+    : indicatorError ? `indicator on ${cfg.comPort} reports ${indicatorError}`
     : `no weight received on ${cfg.comPort} - check wiring, baud rate and weight format`;
 
   const markStaleLoop = setInterval(() => {
@@ -118,7 +110,12 @@ function startSerialReader(mill: Mill, cfg: ScaleConfig): () => void {
 
   const open = () => {
     try {
-      const re = new RegExp(cfg.weightRegex || DEFAULT_WEIGHT_REGEX);
+      const codes = cfg.format === 'plc' ? { startCode: cfg.startCode!, endCode: cfg.endCode! } : undefined;
+      let decode = cfg.format === 'plc' ? plcDecoder(cfg) : cfg.format ? SCALE_DECODERS[cfg.format] : undefined;
+      if (!decode) { // plain text: any line with a number in it
+        const re = cfg.weightRegex ? new RegExp(cfg.weightRegex) : undefined;
+        decode = line => { const weight = parseWeight(line, re); return weight === null ? null : { weight }; };
+      }
       buf = '';
       const p = new SerialPort({
         path: cfg.comPort, baudRate: cfg.baudRate,
@@ -128,15 +125,21 @@ function startSerialReader(mill: Mill, cfg: ScaleConfig): () => void {
       p.on('data', (chunk: Buffer) => {
         buf += chunk.toString('ascii');
         if (buf.length > 4096) buf = buf.slice(-256); // no line terminator ever arriving must not grow the buffer forever
-        let nl: number;
-        // LF or CR ends a line (some heads send CR only); blank pieces from CRLF are skipped by the regex miss
-        while ((nl = buf.search(/[\r\n]/)) >= 0) {
-          const line = buf.slice(0, nl);
-          buf = buf.slice(nl + 1);
-          const weight = parseWeight(line, re);
-          if (weight === null) continue;
+        // LF or CR ends a line (some heads send CR only); blank pieces from CRLF decode to nothing
+        const { lines, rest } = splitFrames(buf, codes);
+        buf = rest;
+        for (const line of lines) {
+          const r = decode(line);
+          if (!r) continue;
+          if ('bad' in r) { // the indicator's own verdict: invalid at once, a fault if it lasts
+            indicatorError = r.bad;
+            mill.setScale(cfg.id, 0, false, false);
+            continue;
+          }
+          indicatorError = '';
           lastValidAt = Date.now();
-          mill.setScale(cfg.id, weight, stable(weight, lastValidAt), true);
+          const settled = stable(r.weight, lastValidAt); // always tracked, so the window is full when motion ends
+          mill.setScale(cfg.id, r.weight, settled && !r.motion, true);
           mill.setScaleProblem(cfg.id, '');
         }
       });

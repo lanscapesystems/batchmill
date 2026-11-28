@@ -64,7 +64,7 @@ export interface DosingStep {
   unit: string;
   state: 'pending' | 'baseline' | 'feeding' | 'cutoff' | 'settling' | 'hold' | 'complete' | 'faulted';
   baselineWeight: number;
-  settleStartTime: number;
+  stillMs?: number;      // how long the scale has been still, while a settle time is running
   cutoffStartTime: number;
   augerRunMs?: number;   // time the auger has run this feed (no-progress delay counts from here)
   progressMs?: number;   // time in the current no-progress window
@@ -313,12 +313,17 @@ export interface CommandResult {
 }
 
 export type ScaleConnectionType = 'serial' | 'rs1201';
+export type ScaleFormat = '' | 'plc' | 'ricelake' | 'toledo' | 'and' | 'weightronix'; // '' = plain text, see scaleFormats.ts
 
 export interface ScaleConfig {
   id: string;
   name: string;
   connectionType: ScaleConnectionType;
   // Serial settings (used when connectionType === 'serial')
+  format?: ScaleFormat; // indicator output format; absent in configs saved before it existed
+  // 'plc' format (the Sysmac ScaleComms framing): line start / end are one ASCII byte in hex, the rest single characters
+  startCode?: string; endCode?: string; prefixChar?: string; suffixChar?: string; motionChar?: string;
+  minLegal?: number; maxLegal?: number; // a reading outside these latches a fault until reset; absent = no limit
   comPort: string;
   baudRate: number;
   dataBits: number;
