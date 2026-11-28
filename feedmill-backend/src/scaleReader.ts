@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from 'fs';
 import { SerialPort } from 'serialport';
 import type { Mill } from './mill.js';
 import type { ScaleConfig } from './types.js';
@@ -13,6 +14,33 @@ interface Reader {
 }
 
 const readers = new Map<string, Reader>();
+
+export interface SerialPortOption { path: string; label: string }
+
+const SIM_LINK = '/tmp/ttyScale'; // tools/scale-sim.py's default; a pty, so udev never lists it
+
+// /sys type 0 = a ttyS node with no UART behind it (Linux creates ~32 of them)
+const uartType = (name: string): string => { try { return readFileSync(`/sys/class/tty/${name}/type`, 'utf8').trim(); } catch { return ''; } };
+
+export function toPortOptions(
+  ports: { path: string; pnpId?: string; manufacturer?: string }[], readType = uartType,
+): SerialPortOption[] {
+  return ports
+    .filter(p => !(p.path.startsWith('/dev/ttyS') && readType(p.path.slice('/dev/'.length)) === '0'))
+    .map(p => {
+      // by-id survives reboots and replugging; ttyUSB numbers don't, which could swap two scales
+      // shortcut: identical adapters without a serial number share one by-id name; use /dev/serial/by-path if that occurs
+      const byId = p.path.startsWith('/dev/') && p.pnpId ? `/dev/serial/by-id/${p.pnpId}` : '';
+      return { path: byId || p.path, label: [p.path, p.manufacturer, p.pnpId].filter(Boolean).join(' — ') };
+    })
+    .sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
+}
+
+export async function listSerialPorts(): Promise<SerialPortOption[]> {
+  const options = toPortOptions(await SerialPort.list());
+  if (existsSync(SIM_LINK)) options.push({ path: SIM_LINK, label: `${SIM_LINK} — scale simulator` });
+  return options;
+}
 
 function configKey(cfg: ScaleConfig): string {
   return JSON.stringify(cfg);
@@ -59,12 +87,20 @@ function startSerialReader(mill: Mill, cfg: ScaleConfig): () => void {
   let buf = '';
   let closed = false;
   let retry: NodeJS.Timeout | null = null;
+  const startedAt = Date.now();
+  const faultAfterMs = Math.max(2000, cfg.freshnessTimeout || 0); // time to open the port and hear a first weight
+  let portError = ''; // why the port last failed to open or closed
+  const problem = () => !cfg.comPort ? 'no serial port selected'
+    : portError ? `cannot read ${cfg.comPort}: ${portError}`
+    : `no weight received on ${cfg.comPort} - check wiring, baud rate and weight format`;
 
   const markStaleLoop = setInterval(() => {
-    if (Date.now() - lastValidAt > cfg.freshnessTimeout) mill.setScale(cfg.id, 0, false, false);
+    const now = Date.now();
+    if (now - lastValidAt > cfg.freshnessTimeout) mill.setScale(cfg.id, 0, false, false);
+    if (now - Math.max(lastValidAt, startedAt) > faultAfterMs) mill.setScaleProblem(cfg.id, problem());
   }, Math.max(250, cfg.freshnessTimeout / 2));
 
-  // Port missing / unplugged / errored: stay stale (no fault from here) and re-open every few seconds.
+  // Port missing / unplugged / errored: stay stale and re-open every few seconds.
   const scheduleRetry = () => {
     if (closed || retry) return;
     retry = setTimeout(() => { retry = null; open(); }, SERIAL_RETRY_MS);
@@ -93,17 +129,28 @@ function startSerialReader(mill: Mill, cfg: ScaleConfig): () => void {
           if (!Number.isFinite(weight)) continue;
           lastValidAt = Date.now();
           mill.setScale(cfg.id, weight, stable(weight, lastValidAt), true);
+          mill.setScaleProblem(cfg.id, '');
         }
       });
-      p.on('error', () => { try { p.close(); } catch {} scheduleRetry(); });
-      p.on('close', scheduleRetry);
-    } catch {
+      // Always close with a callback: without one, closing a port that is not open emits 'error' again, and handling that
+      // by closing looped until the backend ran out of memory.
+      p.on('error', e => { portError = e.message; p.close(() => {}); scheduleRetry(); });
+      p.on('close', (e?: Error) => { if (e) portError = e.message; scheduleRetry(); }); // e: unplugged
+      p.on('open', () => {
+        portError = '';
+        if (closed) p.close(() => {}); // the scale was changed while the port was still opening
+      });
+    } catch (e) { // bad settings or weight pattern
+      portError = (e as Error).message;
       scheduleRetry();
     }
   };
   open();
 
-  return () => { closed = true; if (retry) clearTimeout(retry); clearInterval(markStaleLoop); try { port?.close(); } catch {} };
+  return () => {
+    closed = true; if (retry) clearTimeout(retry); clearInterval(markStaleLoop); port?.close(() => {});
+    mill.setScaleProblem(cfg.id, '');
+  };
 }
 
 // ── RS1201: weight PDO read via the io_daemon's cyclic state file ──

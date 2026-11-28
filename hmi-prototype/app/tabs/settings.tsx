@@ -2,7 +2,7 @@
 
 import { useState, useRef, useCallback, useEffect, type MouseEvent as ReactMouseEvent } from 'react';
 import { useMillStore, EQUIPMENT_DEFS, IO_POOL, getPortsForEquipment, GRID_SNAP, FLOW_HIDDEN_TYPES, GLOBAL_DEFAULTS, type EquipmentItem, type PortDef, type Position, type FlowConnection } from '../store';
-import { useBackend, type BackendSharedVfd, type BackendScaleConfig, type BackendOmronConfig, type BackendIoRackCard, type BackendCouplerType, type BackendEccModel } from '../backend';
+import { useBackend, BACKEND_HTTP, type BackendSharedVfd, type BackendScaleConfig, type BackendOmronConfig, type BackendIoRackCard, type BackendCouplerType, type BackendEccModel } from '../backend';
 import { IOSignalList, STATE_STYLE, stateColor } from './system';
 import { UpdateSection } from './update';
 import { BackupSection } from './backup';
@@ -1021,6 +1021,42 @@ function SidebarTypeConfig({ type, cfg, editing, setCfg, inputStyle, scaleConfig
 
 // ─── I/O Configuration Section ───
 
+// Ports detected on the controller host. A saved port that isn't detected (unplugged) stays selected; "Other" covers custom paths.
+function SerialPortSelect({ value, onChange, style }: { value: string; onChange: (v: string) => void; style: React.CSSProperties }) {
+  const [ports, setPorts] = useState<{ path: string; label: string }[] | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [manual, setManual] = useState(false);
+  const scan = useCallback(async () => {
+    try {
+      const r = await fetch(`${BACKEND_HTTP}/api/v1/serial/ports`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setPorts(await r.json());
+      setFailed(false);
+    } catch { setFailed(true); }
+  }, []);
+  useEffect(() => { scan(); }, [scan]);
+  const listed = ports?.some(p => p.path === value);
+  return (
+    <>
+      <div className="flex gap-2">
+        <select aria-label="Serial port" value={manual ? '__other' : value} style={{ ...style, minWidth: 0 }}
+          onChange={e => { const other = e.target.value === '__other'; setManual(other); if (!other) onChange(e.target.value); }}>
+          <option value="">{ports && !ports.length ? 'No ports found' : 'Select'}</option>
+          {value && !listed && <option value={value}>{value}{ports ? ' (not in detected list)' : ''}</option>}
+          {ports?.map(p => <option key={p.path} value={p.path}>{p.label}</option>)}
+          <option value="__other">Other (type path)…</option>
+        </select>
+        <button type="button" onClick={scan}
+          style={{ background: 'transparent', border: '1px solid var(--border)', borderRadius: '3px', color: 'var(--fg-dim)', padding: '4px 10px', fontSize: '12px', fontWeight: 600, cursor: 'pointer' }}>
+          Rescan
+        </button>
+      </div>
+      {manual && <input aria-label="Serial port path" value={value} onChange={e => onChange(e.target.value)} placeholder="/dev/ttyUSB0" style={style} />}
+      {failed && <span style={{ color: 'var(--orange)', fontSize: '11px' }}>Could not list ports. Choose Other to type the path.</span>}
+    </>
+  );
+}
+
 function IOSection() {
   const backend = useBackend();
   const [editingScale, setEditingScale] = useState<BackendScaleConfig | null>(null);
@@ -1419,8 +1455,8 @@ function IOSection() {
                       </select>
                     </div>
                     <div className="flex flex-col gap-1 flex-1">
-                      <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>COM Port</span>
-                      <input value={scaleDraft.comPort} onChange={e => setScaleDraft({ ...scaleDraft, comPort: e.target.value })} placeholder="COM1" style={inputStyle} />
+                      <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Serial Port</span>
+                      <SerialPortSelect key={editingScale.id} value={scaleDraft.comPort} onChange={comPort => setScaleDraft(d => ({ ...d, comPort }))} style={inputStyle} />
                     </div>
                   </div>
                   <div className="flex gap-2">

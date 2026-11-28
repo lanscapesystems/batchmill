@@ -265,6 +265,13 @@ export class Mill {
     this.scales[scaleId] = { weight, stable, valid, timestamp: Date.now() };
   }
 
+  // scaleReader.ts: why a serial scale gives no weight ('' = reading again, or no longer a serial scale).
+  // Held here and raised by the scan, which stops with the database; the reader's timers do not.
+  private scaleProblems = new Map<string, string>();
+  setScaleProblem(scaleId: string, problem: string) {
+    if (problem) this.scaleProblems.set(scaleId, problem); else this.scaleProblems.delete(scaleId);
+  }
+
   // ── commands from HMI ──
 
   processCommand(cmd: Command): CommandResult {
@@ -1606,6 +1613,8 @@ export class Mill {
   // delay is a latched fault (no reading yet is not a fault: nothing has been wired). Batch steps already hold on an invalid scale.
   private scaleBadMs = new Map<string, number>();
   private checkScaleFaults() {
+    // a serial scale that cannot be read, whether or not any equipment uses it; latched like E-SC-01
+    for (const [id, problem] of this.scaleProblems) this.raiseFault(id, 'WARNING', `Scale ${id}: ${problem}`, 'W-SC-02');
     const delay = delayMs(this.globalConfig.scaleFaultDelay, 2);
     for (const eq of this.equipment.values()) {
       const id = eq.config.scaleId as string | undefined;

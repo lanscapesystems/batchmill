@@ -1,12 +1,12 @@
 {
   "name": "feedmill-backend",
-  "version": "0.1.29",
+  "version": "0.1.30",
   "private": true,
   "scripts": {
     "dev": "tsx watch --ignore ./data src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "check": "tsx src/phase1.check.ts && tsx src/phase2.check.ts && tsx src/ethercat.check.ts && tsx src/batch.check.ts && tsx src/micro.check.ts && tsx src/fault.check.ts && tsx src/history.check.ts"
+    "check": "tsx src/phase1.check.ts && tsx src/phase2.check.ts && tsx src/ethercat.check.ts && tsx src/batch.check.ts && tsx src/serialPorts.check.ts && tsx src/micro.check.ts && tsx src/fault.check.ts && tsx src/history.check.ts && tsx src/scale.check.ts"
   },
   "dependencies": {
     "better-sqlite3": "^13.2.0",

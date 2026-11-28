@@ -7,7 +7,7 @@ import { Mill } from './mill.js';
 import type { Command, CommandResult } from './types.js';
 import { screenFeed } from './hmiFeed.js';
 import { batchHistory, faultHistory, historyQuery, pruneFaults } from './db.js';
-import { reconcileScaleReaders } from './scaleReader.js';
+import { reconcileScaleReaders, listSerialPorts } from './scaleReader.js';
 import { registerUpdateRoutes } from './updateApi.js';
 import { registerBackupRoutes } from './backupApi.js';
 
@@ -131,6 +131,14 @@ app.get('/api/v1/history/batches', (req, res) => {
 
 app.get('/api/v1/history/faults', (req, res) => {
   res.json(faultHistory(historyQuery(req.query)));
+});
+
+app.get('/api/v1/serial/ports', async (_req, res) => {
+  try { res.json(await listSerialPorts()); }
+  catch (err) {
+    console.error('Serial port list failed:', err);
+    res.status(500).json({ error: 'Could not list serial ports' });
+  }
 });
 
 app.get('/api/v1/health', (_req, res) => {
