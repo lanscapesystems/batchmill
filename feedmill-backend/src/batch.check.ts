@@ -166,7 +166,7 @@ assert.equal(m.activeBatch.dosingSteps[0].clean, false); assert.ok(Math.abs(m.ac
 // e-stop pauses a running batch
 reset(); queue(); run(); assert.ok(until(() => m.activeBatch?.dosingSteps[0].state === 'feeding'));
 m.signals.push({ id: 'ESC', direction: 'DI', label: 'estop' }); m.globalConfig.estopInput = 'ESC'; m.ioInputs.ESC = false; scan(3);
-assert.ok(['PAUSING', 'PAUSED'].includes(m.activeBatch.state)); assert.match(m.activeBatch.faultReason, /E-stop/); m.ioInputs.ESC = true; delete m.globalConfig.estopInput;
+assert.ok(['PAUSING', 'PAUSED'].includes(m.activeBatch.state)); assert.equal(m.activeBatch.faultReason, undefined, 'a plain pause: the fault says why'); m.ioInputs.ESC = true; delete m.globalConfig.estopInput;
 
 // ── discharge never completes on a timeout ──
 reset(); Object.assign(m.equipment.get('MX').config, { dischargeTimeoutSec: 1, cleanoutSec: 0 }); queue(); run();

@@ -97,13 +97,13 @@ export function FaultsTab() {
                   <td className="py-2 px-3">{f.message}</td>
                   <td className="py-2 px-3" style={{ color: 'var(--fg-dim)' }}>{dateTime(f.raisedAt)}</td>
                   <td className="py-2 px-3 flex gap-1">
-                    <button
+                    {f.code !== 'E-ES-01' && <button
                       onClick={() => clearFault(f.id)}
                       className="px-3 py-1 text-xs font-medium"
                       style={{ background: 'var(--green)', color: '#000', borderRadius: '3px', border: 'none', cursor: 'pointer' }}
                     >
                       CLEAR
-                    </button>
+                    </button>}
                   </td>
                 </tr>
               ))}

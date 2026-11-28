@@ -1780,7 +1780,7 @@ function GlobalSection() {
             : <span style={{ color: 'var(--fg-bright)' }}>{globalConfig.motorStarterFaultDelay ?? GLOBAL_DEFAULTS.motorStarterFaultDelay} s</span>}
         </div>
         <div className="flex items-center gap-2">
-          <span style={{ color: 'var(--fg-dim)', width: '200px', flexShrink: 0 }}>E-Stop Input (healthy = on)</span>
+          <span style={{ color: 'var(--fg-dim)', width: '200px', flexShrink: 0 }}>E-Stop Contactor Aux (on = ok)</span>
           {editing
             ? <select value={(draft.estopInput as string) ?? ''} onChange={e => setDraft({ ...draft, estopInput: e.target.value })} style={inputStyle}>
                 <option value="">Not Assigned</option>
@@ -1789,7 +1789,7 @@ function GlobalSection() {
             : <span style={{ color: globalConfig.estopInput ? 'var(--fg-bright)' : 'var(--fg-dim)' }}>{(globalConfig.estopInput as string) || 'Not Assigned'}</span>}
         </div>
 
-        {([['hornOutput', 'Horn Output', 'DO'], ['hornSilenceInput', 'Horn Silence Input', 'DI'], ['faultResetInput', 'Fault Reset Input', 'DI']] as const).map(([key, label, dir]) => (
+        {([['hornOutput', 'Horn Output', 'DO'], ['hornSilenceInput', 'Horn Silence Input', 'DI']] as const).map(([key, label, dir]) => (
           <div key={key} className="flex items-center gap-2">
             <span style={{ color: 'var(--fg-dim)', width: '200px', flexShrink: 0 }}>{label}</span>
             {editing

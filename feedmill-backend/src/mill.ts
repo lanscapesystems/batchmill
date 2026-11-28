@@ -616,6 +616,7 @@ export class Mill {
       case 'ClearFault': {
         const f = this.faults.find(f => f.id === cmd.targetId && f.active);
         if (!f) return reject('Fault not found');
+        if (f.code === 'E-ES-01') return reject('The E-stop fault clears itself when the E-stop circuit is back');
         f.active = false;
         f.clearedAt = new Date().toISOString();
         persistFault(f);
@@ -1156,7 +1157,6 @@ export class Mill {
     const ioState = readIoState(); // read once; shared by readRealInputs and updateRotationSensors
     this.updateBusHealth(ioState);
     this.readRealInputs(ioState);
-    this.updateFaultResetInput();
     this.checkScaleFaults();
     this.checkLevelSensors();
     this.updateRefills();
@@ -1273,7 +1273,7 @@ export class Mill {
     // have stopped), then the downstream permissive downstream-first, then feedback/fault/status/outputs.
     if (!this.estopOk()) {
       this.raiseFault('ESTOP', 'CRITICAL', 'Emergency stop pressed', 'E-ES-01');
-      if (this.pauseActiveBatch()) this.activeBatch!.faultReason = 'E-stop active - reset it, then Resume'; // motors are already dead (motorRunLogic), so PAUSING completes on the next batch tick
+      this.pauseActiveBatch(); // a plain pause (the fault tells the operator why): motors are already dead (motorRunLogic), so PAUSING completes on the next batch tick
       // Hammermills are disabled (paused) like at startup: the operator must re-enable them, and any refill is dropped.
       this.abortRefills();
       for (const eq of this.equipment.values()) {
@@ -1446,7 +1446,7 @@ export class Mill {
     }
   }
 
-  // Optional DI wired through the NC e-stop chain (globalConfig.estopInput); true = healthy. Unassigned = no e-stop.
+  // Optional DI from an auxiliary contact of the hardware e-stop contactor (globalConfig.estopInput); true = pulled in. Unassigned = no e-stop.
   private estopOk(): boolean {
     const sig = this.globalConfig.estopInput as string | undefined;
     return !sig || !!this.ioInputs[sig];
@@ -1615,15 +1615,6 @@ export class Mill {
       if (eq.status === 'fault') { eq.status = 'not_running'; eq.faultReason = undefined; eq.faultTimerMs = 0; }
     }
     return { cleared, kept };
-  }
-
-  // Optional physical Fault Reset pushbutton: a rising edge is the same as the HMI's Reset.
-  private faultResetPrev = false;
-  private updateFaultResetInput() {
-    const sig = this.globalConfig.faultResetInput as string | undefined;
-    const now = !!(sig && this.ioInputs[sig]);
-    if (now && !this.faultResetPrev) this.resetFaults();
-    this.faultResetPrev = now;
   }
 
   // Omron Scale Out-of-Range / Data Invalid / Comm faults: a scale a mixer or micros conveyor uses that stays invalid past the
@@ -1904,7 +1895,6 @@ export class Mill {
       // equipment this batch owns tripped: stop and wait (Resume after the operator resets it) instead of feeding blind
       const tripped = Array.from(this.equipment.values()).find(e => e.owner === b.id && e.status === 'fault');
       if (tripped) { this.pauseActiveBatch(); b.faultReason = `${tripped.id} faulted - reset it, then Resume`; return; }
-      if (!this.estopOk()) { this.pauseActiveBatch(); b.faultReason = 'E-stop active - reset it, then Resume'; return; }
       const hold = this.batchHold(b);
       if (hold) { b.faultReason = hold; return; }
       if (b.faultReason?.endsWith('is not in Auto')) b.faultReason = undefined;
@@ -2680,7 +2670,7 @@ export class Mill {
     for (const v of this.sharedVfds) {
       for (const [sig, label] of [[v.runOutput, 'VFD Run'], [v.auxInput, 'VFD Aux'], [v.analogSpeedOutput, 'VFD Speed']] as const) if (sig) tags.set(sig, `${v.name} ${label}`);
     }
-    for (const [key, label] of [['estopInput', 'E-Stop'], ['hornOutput', 'Horn'], ['hornSilenceInput', 'Horn Silence'], ['faultResetInput', 'Fault Reset']] as const) {
+    for (const [key, label] of [['estopInput', 'E-Stop'], ['hornOutput', 'Horn'], ['hornSilenceInput', 'Horn Silence']] as const) {
       if (this.globalConfig[key]) tags.set(String(this.globalConfig[key]), label);
     }
 

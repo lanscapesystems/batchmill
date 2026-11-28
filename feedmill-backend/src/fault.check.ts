@@ -20,7 +20,7 @@ const active = (code: string) => m.faults.some((f: any) => f.code === code && f.
 const reset = () => {
   for (const b of loadBatchesJson()) clearActiveBatch(b.id);
   m.equipment.clear(); m.bins = []; m.connections = []; m.queue = []; m.activeBatch = null; m.scales = {}; m.faults = [];
-  delete m.globalConfig.estopInput; delete m.globalConfig.faultResetInput; m.ioOverrides = {}; m.commissioningMode = false; m.queueHeld = true;
+  delete m.globalConfig.estopInput; m.ioOverrides = {}; m.commissioningMode = false; m.queueHeld = true;
   weight = 0; scaleValid = true; scaleStable = true;
   m.equipment.set('MX', mk('MX', 'mixer', { scaleId: 'SC', capacity: 1000, cleanoutSec: 1 }));
   m.equipment.set('A1', mk('A1', 'auger', { startDelay: 0, stopDelay: 0 }));
@@ -44,6 +44,7 @@ m.ioInputs.A9_AUX = false; scan(10);
 assert.equal(aug.status, 'fault'); assert.ok(active('E-MT-01') || active('E-GT-03'), 'starter feedback fault raised');
 m.signals.push({ id: 'ESB', direction: 'DI', label: 'estop' }); m.globalConfig.estopInput = 'ESB'; m.ioInputs.ESB = false; scan(2);
 assert.ok(active('E-ES-01'));
+assert.equal(cmd('ClearFault', m.faults.find((f: any) => f.code === 'E-ES-01').id).accepted, false, 'E-stop fault cannot be cleared by hand'); assert.ok(active('E-ES-01'));
 const r: any = cmd('ResetFaults');
 assert.equal(r.accepted, true); assert.match(r.reason, /1 cleared, 1 still present/);
 assert.equal(aug.status, 'not_running', 'trip latch released'); assert.ok(active('E-ES-01'), 'E-stop fault follows the circuit, not the reset');
@@ -56,13 +57,6 @@ cmd('SetEquipmentMode', 'A9', { mode: 'Hand' }); scan(10); assert.equal(aug.stat
 cmd('ResetFaults'); cmd('SetEquipmentMode', 'A9', { mode: 'Hand' }); scan(10);
 assert.equal(aug.status, 'fault', 'no feedback: faults again'); assert.ok(m.faults.filter((f: any) => f.active).length >= 1);
 cmd('SetEquipmentMode', 'A9', { mode: 'Off' }); cmd('ResetFaults');
-
-// physical reset input: rising edge only
-reset(); m.signals.push({ id: 'FRB', direction: 'DI', label: 'reset' }); m.globalConfig.faultResetInput = 'FRB'; m.ioInputs.FRB = false;
-m.equipment.get('A1').mode = 'Hand'; m.ioInputs.A1_AUX = false;
-(m as any).raiseFault('A1', 'WARNING', 'test fault', 'W-TEST-01'); assert.ok(active('W-TEST-01'));
-m.ioInputs.FRB = true; scan(1); assert.ok(!active('W-TEST-01'), 'reset input clears it');
-(m as any).raiseFault('A1', 'WARNING', 'again', 'W-TEST-01'); scan(3); assert.ok(active('W-TEST-01'), 'held input does not clear again'); m.ioInputs.FRB = false;
 
 // ── horn: a new fault re-arms a silenced horn; reset ends it ──
 reset(); Object.assign(m.globalConfig, { hornAutoSilenceSec: 60, hornOnSec: 5, hornOffSec: 0 }); // steady horn, whatever an earlier check left in the shared config
