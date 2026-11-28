@@ -4,7 +4,14 @@
   python3 scale-sim.py [--link /tmp/ttyScale] [--rate 10] [--format "ST,GS,{w:+09.1f} lb"] [--eol crlf|lf|cr]
 
 Creates a pseudo-terminal and symlinks it at --link. In the HMI scale config set
-Connection = Serial, COM Port = /tmp/ttyScale (baud/parity are ignored by a pty).
+Connection = Serial, Serial Port = /tmp/ttyScale (baud/parity are ignored by a pty).
+
+On a host running the installed backend, run it as the backend's user, `feedmill`. Only that user can then open the
+port and follow the /tmp link; run as yourself, the scale faults with "Permission denied". From this folder:
+
+  sudo rm -f /tmp/ttyScale        # a link left by another user cannot be replaced
+  install -m 644 scale-sim.py /tmp/scale-sim.py && sudo -u feedmill python3 /tmp/scale-sim.py
+
 Type commands in this terminal:
   <number> | set <n>   set weight          +<n> / -<n>   add / subtract
   noise <n>            +-n random jitter (makes the scale read unstable; 0 = off)
@@ -31,6 +38,7 @@ def main():
         os.remove(args.link)
     os.symlink(os.ttyname(slave), args.link)
     print(f'serial scale on {args.link} -> {os.ttyname(slave)}   ("help" for commands)')
+    print('"Permission denied" in the HMI? Run this as the backend\'s user: sudo -u feedmill (see "help")')
 
     weight, noise, paused = args.weight, 0.0, False
     next_tx = 0.0
