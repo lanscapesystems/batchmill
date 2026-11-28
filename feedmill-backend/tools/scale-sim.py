@@ -35,7 +35,10 @@ def main():
     master, slave = pty.openpty()  # keep `slave` open ourselves so writes never EIO when the backend disconnects
     os.set_blocking(master, False)
     if os.path.lexists(args.link):
-        os.remove(args.link)
+        try: os.remove(args.link)
+        except PermissionError:  # /tmp lets only the owner remove it
+            sys.exit(f'{args.link} was left by another user\'s simulator. Stop it if it is still running '
+                     f'(pgrep -af scale-sim), then: sudo rm -f {args.link}')
     os.symlink(os.ttyname(slave), args.link)
     print(f'serial scale on {args.link} -> {os.ttyname(slave)}   ("help" for commands)')
     print('"Permission denied" in the HMI? Run this as the backend\'s user: sudo -u feedmill (see "help")')
