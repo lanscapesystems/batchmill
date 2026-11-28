@@ -2646,18 +2646,12 @@ export class Mill {
     }
 
     const batchToQueue = (b: BatchRuntime): QueueSnapshot => {
-      const totalTarget = b.dosingSteps.reduce((s, st) => s + st.target, 0);
-      const totalActual = b.dosingSteps.reduce((s, st) => s + st.actual, 0);
-      let progress = 0;
-      if (b.state === 'COMPLETED') progress = 100;
-      else if (b.state === 'MIXING') progress = 50 + 40 * (1 - b.mixTimeRemainingMs / Math.max(1, b.mixTimeTotalMs));
-      else if (b.state === 'DOSING') progress = totalTarget > 0 ? Math.round(50 * totalActual / totalTarget) : 0;
-      else if (['DISCHARGING', 'CLEAROUT'].includes(b.state)) progress = 92;
-      else if (b.state === 'ROUTE_PRECHECK') progress = 90;
+      const mixerScale = b === this.activeBatch ? this.getMixerScale() : undefined;
       return {
         id: b.id, recipeId: b.recipeId, recipeName: b.recipeName,
         targetMass: b.targetMass, destination: b.destination, state: b.state,
-        progress,
+        previousState: b.previousState, // a paused batch keeps showing the stage it stopped in
+        mixerLbs: mixerScale?.valid ? mixerScale.weight : undefined,
         startedAt: b.startedAt, completedAt: b.completedAt,
         dosingSteps: b.dosingSteps.map(s => ({
           ingredientId: s.ingredientId, ingredientName: s.ingredientName,

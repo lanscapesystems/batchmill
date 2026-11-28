@@ -23,15 +23,13 @@ const stateColor: Record<string, string> = {
   ABORTED: 'var(--red)',
 };
 
-const RUNNING_STATES = new Set(['VALIDATING', 'DOSING', 'MIXING', 'ROUTE_PRECHECK', 'DISCHARGING', 'CLEAROUT', 'PAUSING', 'PAUSED', 'FAULTED', 'ABORTED_HOLD']);
 const EDITABLE_STATES = new Set(['IDLE']); // queued, not yet released
 const stateLabel = (s: string) => (s === 'IDLE' ? 'QUEUED' : s.replace(/_/g, ' '));
 
 const btnBase = { padding: '6px 14px', borderRadius: '3px', border: 'none', cursor: 'pointer', fontSize: '12px', fontWeight: 600 } as const;
 
-// a finished batch as the history returns it: no progress, and only the dosing figures
-type HistoryBatch = Omit<BackendBatch, 'progress' | 'dosingSteps'> & {
-  progress?: number;
+// a finished batch as the history returns it: only the dosing figures
+type HistoryBatch = Omit<BackendBatch, 'dosingSteps'> & {
   dosingSteps?: Pick<NonNullable<BackendBatch['dosingSteps']>[number], 'ingredientId' | 'ingredientName' | 'sourceBinId' | 'target' | 'actual' | 'unit'>[];
 };
 
@@ -40,7 +38,7 @@ function backendToQueueEntry(b: HistoryBatch): QueueEntry {
     id: b.id, recipeId: b.recipeId, recipeName: b.recipeName,
     targetMass: b.targetMass, destination: b.destination,
     state: b.state as QueueEntry['state'],
-    progress: b.progress,
+    progress: stageProgress(b),
     startedAt: b.startedAt, completedAt: b.completedAt,
     scheduledAt: b.scheduledAt, late: b.late, warnings: b.warnings, faultReason: b.faultReason, tolHold: b.tolHold, dosingError: b.dosingError, microUnloading: b.microUnloading,
     actuals: b.dosingSteps?.map(s => ({
@@ -48,6 +46,48 @@ function backendToQueueEntry(b: HistoryBatch): QueueEntry {
       unit: s.unit, sourceBinId: s.sourceBinId,
     })),
   };
+}
+
+// The stage a live batch is in, shared by the status bar and the queue table. A paused batch stays in the stage it stopped in.
+// width is the bar (dosing fills, mixing and unloading drain); percent always counts up, per stage.
+function batchStage(b: HistoryBatch) {
+  const state = b.state === 'PAUSING' || b.state === 'PAUSED' || b.state === 'ABORTED_HOLD' ? b.previousState ?? 'DOSING' : b.state;
+  const dosed = b.dosingSteps?.reduce((s, st) => s + st.actual, 0) ?? 0;
+  const lbs = (n: number) => Math.round(n).toLocaleString();
+  const clamp = (n: number, of: number) => (of > 0 ? Math.min(100, Math.max(0, 100 * n / of)) : 0);
+  if (state === 'MIXING') {
+    const left = b.mixTimeRemainingMs ?? 0, total = b.mixTimeTotalMs ?? 0, sec = Math.ceil(left / 1000);
+    return { label: 'Mixing', value: `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')} remaining`, width: clamp(left, total), percent: clamp(total - left, total) };
+  }
+  if (['ROUTE_PRECHECK', 'DISCHARGING', 'CLEAROUT'].includes(state)) {
+    const left = b.mixerLbs === undefined ? undefined : Math.max(0, b.mixerLbs);
+    return { label: 'Unloading', value: `${left === undefined ? '—' : lbs(left)} / ${lbs(dosed)} lbs in mixer`, width: clamp(left ?? 0, dosed), percent: left === undefined ? undefined : clamp(dosed - left, dosed) };
+  }
+  const percent = clamp(dosed, b.targetMass);
+  return { label: 'Dosing', value: `${lbs(dosed)} / ${lbs(b.targetMass)} lbs`, width: percent, percent };
+}
+
+function stageProgress(b: HistoryBatch): string | undefined {
+  if (b.state === 'IDLE') return undefined; // queued: no stage yet
+  const { label, percent } = batchStage(b);
+  return `${label} ${percent === undefined ? '—' : `${Math.floor(percent)}%`}`;
+}
+
+// One bar, repurposed per stage.
+function StageBar({ batch: b }: { batch: BackendBatch }) {
+  const { label, value, width } = batchStage(b);
+  return (
+    <div>
+      <div className="flex justify-between" style={{ fontSize: '11px', color: 'var(--fg-dim)', marginBottom: '4px' }}>
+        <span>{label}</span>
+        <span style={{ color: 'var(--fg-bright)', fontSize: '13px', fontWeight: 600 }}>{value}</span>
+      </div>
+      <div role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(width)} aria-valuetext={value}
+        style={{ background: 'var(--bg)', borderRadius: '2px', height: '6px', overflow: 'hidden' }}>
+        <div style={{ background: stateColor[b.state] ?? 'var(--accent)', width: `${width}%`, height: '100%', borderRadius: '2px', transition: 'width 0.3s' }} />
+      </div>
+    </div>
+  );
 }
 
 function findHmPathGroups(hmIds: string[], connections: FlowConnection[]): string[][] {
@@ -109,9 +149,7 @@ export function QueueTab() {
   const ingredients = backend?.connected ? backend.ingredients : [];
   const finishedBins = allBins.filter(b => b.type === 'finished');
 
-  const activeBatchEntry: QueueEntry | null = backend?.connected
-    ? (backend.activeBatch ? backendToQueueEntry(backend.activeBatch) : null)
-    : queueData.find(q => RUNNING_STATES.has(q.state)) ?? null;
+  const activeBatchEntry: QueueEntry | null = backend?.connected && backend.activeBatch ? backendToQueueEntry(backend.activeBatch) : null;
 
   // Bin full: the backend's level state for the destination (its highLevelInput is active)
   const batchDestBinFull = !!activeBatchEntry && allBins.find(b => b.id === activeBatchEntry.destination)?.levelSwitchState === 'full';
@@ -199,15 +237,7 @@ export function QueueTab() {
               {activeBatchEntry.faultReason && (
                 <div style={{ color: 'var(--orange)', fontSize: '11px' }}>{activeBatchEntry.faultReason}</div>
               )}
-              <div>
-                <div className="flex justify-between" style={{ fontSize: '11px', color: 'var(--fg-dim)', marginBottom: '4px' }}>
-                  <span>Progress</span>
-                  <span style={{ color: 'var(--fg-bright)' }}>{(activeBatchEntry.progress ?? 0).toFixed(1)}%</span>
-                </div>
-                <div style={{ background: 'var(--bg)', borderRadius: '2px', height: '6px', overflow: 'hidden' }}>
-                  <div style={{ background: stateColor[activeBatchEntry.state] ?? 'var(--accent)', width: `${activeBatchEntry.progress ?? 0}%`, height: '100%', borderRadius: '2px', transition: 'width 0.3s' }} />
-                </div>
-              </div>
+              {backend?.activeBatch && <StageBar batch={backend.activeBatch} />}
               {backend?.connected && (
                 <div className="flex gap-2">
                   {(aborted || (abortMenu && activeBatchEntry.state === 'PAUSED')) ? (
@@ -500,7 +530,7 @@ function BatchRow({ entry: q, finished, expanded, onToggle, onEdit, onDelete, on
             {q.late && <span style={{ color: 'var(--orange)', fontSize: '11px' }}>late</span>}
           </span>
         </td>
-        <td className="py-2 px-3 text-right">{finished ? dateTime(q.completedAt) : q.progress != null ? `${q.progress.toFixed(1)}%` : '—'}</td>
+        <td className="py-2 px-3 text-right">{finished ? dateTime(q.completedAt) : q.progress ?? '—'}</td>
       </tr>
       {expanded && (
         <tr style={{ background: 'var(--bg-row)' }}>

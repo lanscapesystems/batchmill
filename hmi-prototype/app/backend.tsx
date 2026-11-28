@@ -42,7 +42,8 @@ export interface BackendBatch {
   targetMass: number;
   destination: string;
   state: string;
-  progress: number;
+  previousState?: string;
+  mixerLbs?: number;
   startedAt?: string;
   completedAt?: string;
   dosingSteps?: {

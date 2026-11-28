@@ -176,6 +176,15 @@ scan(30); assert.equal(m.activeBatch.state, 'DISCHARGING', 'still waiting, never
 assert.equal(cmd('ExtendDischarge').accepted, true); assert.equal(m.activeBatch.faultReason, undefined);
 drain = 20; finished(); assert.equal(m.queue[0].state, 'COMPLETED');
 
+// ── status bar data: mixer pounds on the active batch only, and the stage a paused batch stopped in ──
+reset(); queue(); queue(); run(); scan(3);
+{
+  const s = m.getSnapshot();
+  assert.equal(s.activeBatch.mixerLbs, m.scales.SC.weight); assert.equal(s.queue[1].mixerLbs, undefined);
+  scaleValid = false; feed(); assert.equal(m.getSnapshot().activeBatch.mixerLbs, undefined, 'no weight from an invalid scale'); scaleValid = true; feed();
+  cmd('PauseBatch'); assert.ok(until(() => m.activeBatch.state === 'PAUSED')); assert.equal(m.getSnapshot().activeBatch.previousState, 'DOSING');
+}
+
 // ── abort / unload / discard and inventory ──
 reset(); queue(); run(); assert.ok(until(() => m.activeBatch?.dosingSteps[0].state === 'cutoff' || m.activeBatch?.dosingSteps[0].state === 'settling'));
 const dosed0 = () => m.activeBatch.dosingSteps[0].actual;

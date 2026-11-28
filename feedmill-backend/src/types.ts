@@ -268,7 +268,8 @@ export interface QueueSnapshot {
   targetMass: number;
   destination: string;
   state: BatchState;
-  progress: number;
+  previousState?: BatchState;
+  mixerLbs?: number; // active batch only; absent when the mixer scale is not valid
   startedAt?: string;
   completedAt?: string;
   dosingSteps?: {

@@ -58,7 +58,7 @@ export interface QueueEntry {
   targetMass: number;
   destination: string;
   state: BatchState;
-  progress?: number;
+  progress?: string; // live batches: stage and how far through it
   startedAt?: string;
   completedAt?: string;
   actuals?: { ingredientId: string; target: number; actual: number; unit: string; sourceBinId: string; alternateBinIds?: string[] }[];
