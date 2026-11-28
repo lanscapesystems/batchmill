@@ -214,5 +214,35 @@ assert.equal(cmd('AddConnection', undefined, { from: 'B2', fromPort: 'discharge'
 assert.equal(m.equipment.get('B2').config.notTracked, undefined, 'a connection that breaks the rule clears the flag');
 assert.ok(m.faults.some((f: any) => f.code === 'W-BN-01'));
 
+// ── discharge auger and gate after the mixer: MX -> A2 -> GT -> FB ──
+reset();
+m.equipment.set('A2', mk('A2', 'auger', { startDelay: 0.3, stopDelay: 0.5 }));
+m.equipment.set('GT', mk('GT', 'gate', { openOutput: 'P1', closeOutput: 'P2' }));
+const link = (from: string, to: string, fromPort = 'o') => ({ from, fromPort, to, toPort: 'i' });
+m.connections = [link('B1', 'A1'), link('A1', 'MX'), link('MX', 'A2'), link('A2', 'GT'), link('GT', 'FB', 'out1')];
+const a2 = m.equipment.get('A2'), gt = m.equipment.get('GT');
+a2.mode = 'Off'; queue(); run(); scan(3);
+assert.match(m.getSnapshot().queueControl.waiting, /A2 is not in Auto/); a2.mode = 'Auto';
+assert.ok(until(() => m.equipment.get('A1').runCmd), 'feed auger runs with the discharge auger stopped');
+assert.ok(m.equipment.get('MX').runCmd && !a2.runCmd);
+assert.ok(until(() => m.activeBatch?.state === 'MIXING')); scan(); assert.ok(m.equipment.get('MX').runCmd && !a2.runCmd, 'mixes with the discharge auger stopped');
+assert.ok(until(() => a2.runCmd), 'discharge starts the auger'); assert.equal(m.activeBatch.state, 'DISCHARGING'); assert.equal(a2.owner, m.activeBatch.id);
+cmd('PauseBatch'); scan(); assert.ok(a2.runCmd && gt.owner && gt.request, 'gate holds while the auger runs out on pause');
+assert.ok(until(() => m.activeBatch?.state === 'PAUSED')); assert.ok(!a2.runCmd);
+assert.equal(cmd('ResumeBatch').accepted, true); assert.ok(until(() => a2.runCmd), 'resume restarts the auger');
+assert.ok(until(() => m.activeBatch?.state === 'CLEAROUT'));
+scan(); assert.ok(a2.runCmd && gt.request, 'gate holds through the auger stop delay');
+assert.ok(finished()); assert.ok(!a2.runCmd && !a2.owner && !gt.owner); assert.equal(m.queue[0].state, 'COMPLETED');
+
+// ── an I/O fault drops every motor the batch drives, and it stays down until Resume ──
+const dead = () => [...m.equipment.values()].every((e: any) => !e.runCmd && !e.request && !e.owner);
+const ioFault = () => { m.ioFaultShutdown('E-OM-02', 'test'); assert.equal(m.activeBatch.state, 'PAUSED'); assert.ok(dead(), 'dropped at once'); scan(20); assert.ok(dead(), 'stays down'); };
+reset(); m.equipment.get('A1').config.stopDelay = 5; queue(); run();
+assert.ok(until(() => m.equipment.get('A1').runCmd)); ioFault();
+assert.equal(m.activeBatch.dosingSteps[0].clean, false);
+assert.equal(cmd('ResumeBatch').accepted, true); assert.ok(until(() => m.equipment.get('A1').runCmd), 'resume feeds again');
+cmd('PauseBatch'); assert.equal(m.activeBatch.state, 'PAUSING'); ioFault();
+assert.equal(m.activeBatch.previousState, 'DOSING', 'a fault while pausing must not lose where to resume');
+
 console.log('batch checks passed');
 process.exit(0);

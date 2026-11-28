@@ -1292,6 +1292,7 @@ export class Mill {
 
   // Nested run permissive: a motor may only run while every motor it feeds is running.
   private downstreamRunning(eq: EquipmentRuntime): boolean {
+    if (eq.equipmentType === 'mixer') return true; // it holds its product, so it batches and mixes with the discharge conveyors stopped
     for (const c of this.connections) {
       if (c.from !== eq.id) continue;
       const next = this.equipment.get(c.to);
@@ -1861,11 +1862,7 @@ export class Mill {
       else if (this.activeStepIdx(b).length === 0 && this.hasMicros(b) && !b.microDelivered) need.push(this.microConveyor(b));
     }
     if (['ROUTE_PRECHECK', 'DISCHARGING'].includes(b.state)) {
-      const mx = this.findEquipmentByType('mixer');
-      for (const id of (mx ? flowPath(mx.id, b.destination, this.connections) ?? [] : [])) {
-        const g = this.equipment.get(id);
-        if (g?.equipmentType === 'gate') need.push(g);
-      }
+      need.push(...this.dischargeEquipment(b.destination));
     }
     const bad = need.find(e => e && e.owner !== b.id && e.mode !== 'Auto'); // equipment the batch already owns cannot leave Auto
     return bad ? `Waiting: ${bad.id} is not in Auto` : null;
@@ -1951,6 +1948,10 @@ export class Mill {
         }
         const gates = this.requestDischargeGates(b);
         if (!gates.every(g => this.pathReady(g.id))) { b.dischargeStartTime = this.clockMs; break; } // wait for the gate(s) to reach the destination's outlet
+        // then the conveyors on the route; time spent starting them counts toward neither the timeout nor the cleanout
+        // shortcut: a mixer outlet gate ahead of a conveyor would open before it runs; order those if such a plant appears
+        const conveyors = this.requestDischargeMotors(b);
+        if (!conveyors.every(c => this.pathReady(c.id))) { b.dischargeStartTime = this.clockMs; b.emptySinceMs = undefined; break; }
         const scale = this.getMixerScale();
         if (!scale || !scale.valid) { b.faultReason = 'Waiting: mixer scale invalid'; break; }
         if (b.faultReason === 'Waiting: mixer scale invalid') b.faultReason = undefined;
@@ -1971,6 +1972,9 @@ export class Mill {
       }
 
       case 'CLEAROUT': {
+        // motors run out through their stop delays first; the batch keeps the route gates in position until then
+        this.initiateEquipmentStop(b.id);
+        if (!this.allOwnedEquipmentStopped(b.id)) break;
         // what actually left the mixer is credited to the destination: weight at the start of discharge minus what is left
         const scale = this.getMixerScale();
         const dosed = b.dosingSteps.reduce((s, st) => s + st.actual, 0);
@@ -2017,20 +2021,30 @@ export class Mill {
     return mixer;
   }
 
-  // Gates on the flow path mixer -> destination, each told which outlet leads on to the next hop.
+  // Gates and motors between the mixer and the destination, in flow order.
+  private dischargeEquipment(destination: string): EquipmentRuntime[] {
+    const mixer = this.findEquipmentByType('mixer');
+    const path = (mixer && flowPath(mixer.id, destination, this.connections)) || [];
+    return path.slice(1).map(id => this.equipment.get(id)).filter((e): e is EquipmentRuntime => !!e && (e.equipmentType === 'gate' || this.isMotor(e)));
+  }
+
+  // Each gate on the route is told which outlet leads on to the next hop.
   private requestDischargeGates(b: BatchRuntime): EquipmentRuntime[] {
     const mixer = this.findEquipmentByType('mixer');
-    const path = mixer ? flowPath(mixer.id, b.destination, this.connections) : null;
-    const gates: EquipmentRuntime[] = [];
-    path?.forEach((id, i) => {
-      const g = this.equipment.get(id);
-      if (g?.equipmentType !== 'gate') return;
+    const path = (mixer && flowPath(mixer.id, b.destination, this.connections)) || [];
+    const gates = this.dischargeEquipment(b.destination).filter(e => e.equipmentType === 'gate');
+    for (const g of gates) {
       g.owner = b.id;
       g.request = true;
-      g.gatePort = this.gatePortToward(g, path[i + 1]) ?? 1;
-      gates.push(g);
-    });
+      g.gatePort = this.gatePortToward(g, path[path.indexOf(g.id) + 1]) ?? 1;
+    }
     return gates;
+  }
+
+  private requestDischargeMotors(b: BatchRuntime): EquipmentRuntime[] {
+    const motors = this.dischargeEquipment(b.destination).filter(e => this.isMotor(e));
+    for (const m of motors) { m.owner = b.id; m.request = true; }
+    return motors;
   }
 
   private emptyLbs() { return Number(this.globalConfig.mixerEmptyLbs ?? 10); }
@@ -2076,11 +2090,9 @@ export class Mill {
     if (lvl === 'fault') return `${b.destination} level sensors disagree`;
     const path = flowPath(mixer.id, b.destination, this.connections);
     if (!path) return `no flow path from ${mixer.id} to ${b.destination}`;
-    for (const id of path) {
-      const g = this.equipment.get(id);
-      if (g?.equipmentType !== 'gate') continue;
-      if (g.mode !== 'Auto') return `${g.id} is not in Auto`;
-      if (g.status === 'fault') return `${g.id} is faulted`;
+    for (const e of this.dischargeEquipment(b.destination)) {
+      if (e.mode !== 'Auto') return `${e.id} is not in Auto`;
+      if (e.status === 'fault' || e.status === 'disabled') return `${e.id} is ${e.status === 'fault' ? 'faulted' : 'disabled'}`;
     }
     return null;
   }
@@ -2377,7 +2389,8 @@ export class Mill {
 
   private initiateEquipmentStop(ownerId: string) {
     for (const eq of this.equipment.values()) {
-      if (eq.owner === ownerId) eq.request = false;
+      // gates hold until releaseEquipment: moving one while a conveyor runs out would misroute what is still on it
+      if (eq.owner === ownerId && eq.equipmentType !== 'gate') eq.request = false;
     }
   }
 
@@ -2813,14 +2826,22 @@ export class Mill {
   // the fault, then stop the same things a rack mismatch always stopped.
   private ioFaultShutdown(code: string, message: string) {
     this.raiseFault('OMRON', 'CRITICAL', message, code);
+    // Motors a batch or refill is driving drop at once, as on e-stop: a stop delay would carry on commanding them after the bus is back.
+    for (const eq of this.equipment.values()) {
+      if (eq.owner && this.isMotor(eq)) { eq.runCmd = false; eq.startTimerMs = 0; eq.stopTimerMs = 0; }
+    }
     this.abortRefills();
     for (const eq of this.equipment.values()) {
       if (eq.equipmentType === 'hammermill') this.pauseHammermill(eq);
     }
-    if (this.activeBatch && !['COMPLETED', 'FAULTED', 'IDLE', 'PAUSED'].includes(this.activeBatch.state)) {
-      this.activeBatch.previousState = this.activeBatch.state;
-      this.activeBatch.state = 'PAUSED';
-      this.activeBatch.faultReason = message;
+    const b = this.activeBatch;
+    if (b && !['COMPLETED', 'FAULTED', 'IDLE', 'PAUSED'].includes(b.state)) {
+      if (b.state === 'DOSING') for (const i of this.activeStepIdx(b)) b.dosingSteps[i].clean = false;
+      if (b.state !== 'PAUSING') b.previousState = b.state; // PAUSING already saved where to resume
+      b.state = 'PAUSED';
+      b.faultReason = message;
+      this.releaseEquipment(b.id); // PAUSED holds no equipment: a kept run request would start it again
+      persistBatch(b);
     }
   }
 
