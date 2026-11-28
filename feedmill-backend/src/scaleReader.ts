@@ -4,7 +4,8 @@ import type { Mill } from './mill.js';
 import type { ScaleConfig } from './types.js';
 import { readIoState } from './ioDaemon.js';
 
-const DEFAULT_WEIGHT_REGEX = '[+-]?\\d+\\.?\\d*';
+// sign may be padded away from the digits ("-  12.5") or trail them ("12.5-")
+const DEFAULT_WEIGHT_REGEX = '[+-]?[ \\t]*(?:\\d+\\.?\\d*|\\.\\d+)(?:-(?![\\w.]))?';
 const RS1201_POLL_MS = 100;
 const SERIAL_RETRY_MS = 3000;
 
@@ -40,6 +41,15 @@ export async function listSerialPorts(): Promise<SerialPortOption[]> {
   const options = toPortOptions(await SerialPort.list());
   if (existsSync(SIM_LINK)) options.push({ path: SIM_LINK, label: `${SIM_LINK} — scale simulator` });
   return options;
+}
+
+/** The weight in one line from a scalehead, or null if the pattern finds none. */
+export function parseWeight(line: string, re = new RegExp(DEFAULT_WEIGHT_REGEX)): number | null {
+  let s = re.exec(line)?.[0].replace(/\s/g, '');
+  if (!s) return null;
+  if (s.endsWith('-')) s = '-' + s.slice(0, -1).replace(/^[+-]/, '');
+  const weight = Number(s);
+  return Number.isFinite(weight) ? weight : null;
 }
 
 function configKey(cfg: ScaleConfig): string {
@@ -123,10 +133,8 @@ function startSerialReader(mill: Mill, cfg: ScaleConfig): () => void {
         while ((nl = buf.search(/[\r\n]/)) >= 0) {
           const line = buf.slice(0, nl);
           buf = buf.slice(nl + 1);
-          const m = re.exec(line);
-          if (!m) continue;
-          const weight = Number(m[0]);
-          if (!Number.isFinite(weight)) continue;
+          const weight = parseWeight(line, re);
+          if (weight === null) continue;
           lastValidAt = Date.now();
           mill.setScale(cfg.id, weight, stable(weight, lastValidAt), true);
           mill.setScaleProblem(cfg.id, '');

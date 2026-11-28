@@ -1060,7 +1060,7 @@ function SerialPortSelect({ value, onChange, style }: { value: string; onChange:
 function IOSection() {
   const backend = useBackend();
   const [editingScale, setEditingScale] = useState<BackendScaleConfig | null>(null);
-  const [scaleDraft, setScaleDraft] = useState<BackendScaleConfig>({ id: '', name: '', connectionType: 'serial', protocol: '', comPort: '', baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, rackSlot: 0, zeroOffset: 0, ratedMvV: 2.0, capacity: 5000, resolution: 1, freshnessTimeout: 5000, stabilityWindow: 500 });
+  const [scaleDraft, setScaleDraft] = useState<BackendScaleConfig>({ id: '', name: '', connectionType: 'serial', comPort: '', baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, rackSlot: 0, zeroOffset: 0, ratedMvV: 2.0, capacity: 5000, resolution: 1, freshnessTimeout: 5000, stabilityWindow: 500 });
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [commissioningOpen, setCommissioningOpen] = useState(false);
   const [confirmCommissioning, setConfirmCommissioning] = useState<boolean | null>(null);
@@ -1174,8 +1174,8 @@ function IOSection() {
 
   function startAddScale() {
     const nextNum = scaleConfigs.length + 1;
-    setScaleDraft({ id: `SC-${nextNum}`, name: `Scale ${nextNum}`, connectionType: 'serial', protocol: '', comPort: '', baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, rackSlot: 0, zeroOffset: 0, ratedMvV: 2.0, capacity: 5000, resolution: 1, freshnessTimeout: 5000, stabilityWindow: 500 });
-    setEditingScale({ id: '', name: '', connectionType: 'serial', protocol: '', comPort: '', baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, rackSlot: 0, zeroOffset: 0, ratedMvV: 2.0, capacity: 0, resolution: 0, freshnessTimeout: 0, stabilityWindow: 0 });
+    setScaleDraft({ id: `SC-${nextNum}`, name: `Scale ${nextNum}`, connectionType: 'serial', comPort: '', baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, rackSlot: 0, zeroOffset: 0, ratedMvV: 2.0, capacity: 5000, resolution: 1, freshnessTimeout: 5000, stabilityWindow: 500 });
+    setEditingScale({ id: '', name: '', connectionType: 'serial', comPort: '', baudRate: 9600, dataBits: 8, parity: 'none', stopBits: 1, rackSlot: 0, zeroOffset: 0, ratedMvV: 2.0, capacity: 0, resolution: 0, freshnessTimeout: 0, stabilityWindow: 0 });
   }
   function startEditScale(sc: BackendScaleConfig) { setScaleDraft({ ...sc }); setEditingScale(sc); }
   function saveScale() {
@@ -1412,7 +1412,7 @@ function IOSection() {
             <div key={sc.id} className="flex items-center gap-2 py-2" style={{ borderBottom: '1px solid var(--border)', fontSize: '12px' }}>
               <span style={{ color: 'var(--accent)', fontWeight: 600, width: '48px', flexShrink: 0 }}>{sc.id}</span>
               <span style={{ color: 'var(--fg-bright)', flex: 1 }}>{sc.name}</span>
-              <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>{sc.connectionType === 'rs1201' ? `RS1201 Slot ${sc.rackSlot}` : (sc.protocol || '—')}</span>
+              <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>{sc.connectionType === 'rs1201' ? `RS1201 Slot ${sc.rackSlot}` : 'Serial'}</span>
               <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>{sc.capacity} lbs</span>
               <button onClick={() => startEditScale(sc)} className="px-2 py-0.5 text-xs"
                 style={{ color: 'var(--fg-bright)', background: 'transparent', border: '1px solid var(--border)', borderRadius: '3px', cursor: 'pointer' }}>Edit</button>
@@ -1443,21 +1443,9 @@ function IOSection() {
               </div>
               {scaleDraft.connectionType === 'serial' ? (
                 <>
-                  <div className="flex gap-2">
-                    <div className="flex flex-col gap-1 flex-1">
-                      <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Protocol</span>
-                      <select value={scaleDraft.protocol} onChange={e => setScaleDraft({ ...scaleDraft, protocol: e.target.value })} style={inputStyle}>
-                        <option value="">Select</option>
-                        <option value="A&D">A&amp;D</option>
-                        <option value="Toledo">Toledo</option>
-                        <option value="Rice Lake">Rice Lake</option>
-                        <option value="GSE">GSE</option>
-                      </select>
-                    </div>
-                    <div className="flex flex-col gap-1 flex-1">
-                      <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Serial Port</span>
-                      <SerialPortSelect key={editingScale.id} value={scaleDraft.comPort} onChange={comPort => setScaleDraft(d => ({ ...d, comPort }))} style={inputStyle} />
-                    </div>
+                  <div className="flex flex-col gap-1">
+                    <span style={{ color: 'var(--fg-dim)', fontSize: '11px' }}>Serial Port</span>
+                    <SerialPortSelect key={editingScale.id} value={scaleDraft.comPort} onChange={comPort => setScaleDraft(d => ({ ...d, comPort }))} style={inputStyle} />
                   </div>
                   <div className="flex gap-2">
                     <div className="flex flex-col gap-1 flex-1">

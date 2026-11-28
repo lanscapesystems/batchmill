@@ -40,6 +40,8 @@ const delayMs = (sec: unknown, fallbackSec = 0) => Math.max(0, Number(sec ?? fal
 const EDITABLE_STATES = new Set(['IDLE']); // a queued batch; anything released is no longer editable
 const MICRO_NOT_EMPTY = 'Micros conveyor not empty - unload timed out (waiting; Pause then Abort to give up)';
 const MIXER_NOT_EMPTY ='Mixer not empty - discharge timed out (Extend or Abort)';
+const MIXER_BELOW_ZERO = 'Waiting: mixer scale reads';
+const MICRO_BELOW_ZERO = 'Waiting: micros scale reads';
 const NO_PROGRESS_WINDOW_MS = 10_000; // once past the bin's no-flow delay, weight must rise by the minimum every window
 // Per-device input bypasses ("Overrides" in the sidebar): the input is ignored as if it were not assigned.
 const BYPASSABLE = ['runConfirmAux', 'vfdAuxInput', 'motorAuxInput', 'analogLoadInput', 'rotationPulseInput', 'openLimitInput', 'closedLimitInput',
@@ -1024,7 +1026,6 @@ export class Mill {
         const sc: ScaleConfig = {
           id: p.id, name: p.name,
           connectionType: p.connectionType ?? 'serial',
-          protocol: p.protocol ?? '',
           comPort: p.comPort ?? '',
           baudRate: p.baudRate ?? 9600,
           dataBits: p.dataBits ?? 8,
@@ -1955,7 +1956,9 @@ export class Mill {
         const scale = this.getMixerScale();
         if (!scale || !scale.valid) { b.faultReason = 'Waiting: mixer scale invalid'; break; }
         if (b.faultReason === 'Waiting: mixer scale invalid') b.faultReason = undefined;
-        if (scale.stable && scale.weight < this.emptyLbs()) {
+        // well under zero means the scale is off, not that the mixer is empty: wait for the operator to zero it
+        if (b.faultReason?.startsWith(MIXER_BELOW_ZERO)) b.faultReason = undefined; // re-judged every scan
+        if (scale.stable && Math.abs(scale.weight) < this.emptyLbs()) {
           // declared empty: keep running for the mixer's cleanout time, then finish
           b.emptySinceMs ??= this.clockMs;
           if (this.clockMs - b.emptySinceMs >= delayMs(mixer?.config.cleanoutSec, 0)) { b.faultReason = undefined; b.state = 'CLEAROUT'; }
@@ -1967,6 +1970,7 @@ export class Mill {
             b.faultReason = MIXER_NOT_EMPTY;
             this.raiseFault('BATCH', 'WARNING', `Batch ${b.id}: mixer not empty - discharge timed out`, 'W-BA-02');
           }
+          if (scale.stable && scale.weight <= -this.emptyLbs()) b.faultReason = `${MIXER_BELOW_ZERO} ${round1(scale.weight)} lb - zero it`;
         }
         break;
       }
@@ -1978,7 +1982,7 @@ export class Mill {
         // what actually left the mixer is credited to the destination: weight at the start of discharge minus what is left
         const scale = this.getMixerScale();
         const dosed = b.dosingSteps.reduce((s, st) => s + st.actual, 0);
-        const left = scale?.valid ? scale.weight : 0;
+        const left = scale?.valid ? Math.max(0, scale.weight) : 0; // zero drift must not credit more than was in the mixer
         const discharged = Math.max(0, (b.dischargeStartWeight ?? dosed) - left);
         this.postConsumption(b);
         const destBin = this.bins.find(bn => bn.id === b.destination);
@@ -2145,7 +2149,8 @@ export class Mill {
     if (!scale || !scale.valid) { b.faultReason = 'Waiting: micros scale invalid'; return; }
     if (b.faultReason === 'Waiting: micros scale invalid') b.faultReason = undefined;
     const minMs = delayMs(conv.config.unloadMinSec, 10);
-    if ((b.microUnloadRunMs ?? 0) >= minMs && scale.stable && scale.weight < this.microZeroLbs(conv)) {
+    if (b.faultReason?.startsWith(MICRO_BELOW_ZERO)) b.faultReason = undefined; // re-judged every scan, like the mixer
+    if ((b.microUnloadRunMs ?? 0) >= minMs && scale.stable && Math.abs(scale.weight) < this.microZeroLbs(conv)) {
       conv.request = false; // stops through its own stop delay
       b.microUnloading = false; b.microDelivered = true;
       if (b.faultReason === MICRO_NOT_EMPTY) b.faultReason = undefined;
@@ -2157,6 +2162,7 @@ export class Mill {
       b.faultReason = MICRO_NOT_EMPTY;
       this.raiseFault('BATCH', 'WARNING', `Batch ${b.id}: micros conveyor not empty - unload timed out`, 'W-BA-03');
     }
+    if (scale.stable && scale.weight <= -this.microZeroLbs(conv)) b.faultReason = `${MICRO_BELOW_ZERO} ${round1(scale.weight)} lb - zero it`;
   }
 
   private afterMicroUnload(b: BatchRuntime) {

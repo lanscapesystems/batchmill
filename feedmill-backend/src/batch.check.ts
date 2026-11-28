@@ -40,7 +40,7 @@ const scan = (n = 1) => {
     if (a.runCmd) weight += rate;
     if (wasRunning && !a.runCmd) weight += coast;
     wasRunning = a.runCmd;
-    if (m.activeBatch?.state === 'DISCHARGING') weight = Math.max(0, weight - drain);
+    if (drain && m.activeBatch?.state === 'DISCHARGING') weight = Math.max(0, weight - drain);
   }
 };
 const until = (pred: () => boolean, max = 1500) => { for (let i = 0; i < max && !pred(); i++) scan(); return pred(); };
@@ -175,6 +175,13 @@ assert.equal(m.activeBatch.state, 'DISCHARGING'); assert.match(m.activeBatch.fau
 scan(30); assert.equal(m.activeBatch.state, 'DISCHARGING', 'still waiting, never completes on the timeout');
 assert.equal(cmd('ExtendDischarge').accepted, true); assert.equal(m.activeBatch.faultReason, undefined);
 drain = 20; finished(); assert.equal(m.queue[0].state, 'COMPLETED');
+
+// ── a mixer scale well under zero is not an empty mixer ──
+reset(); drain = 0; queue(); run(); assert.ok(until(() => m.activeBatch?.state === 'DISCHARGING'));
+weight = -300; scan(100); assert.equal(m.activeBatch?.state, 'DISCHARGING', 'does not complete below zero');
+assert.equal(m.activeBatch.faultReason, 'Waiting: mixer scale reads -300 lb - zero it');
+weight = -3; assert.ok(finished()); assert.equal(m.queue[0].state, 'COMPLETED', 'drift inside the empty limit still finishes');
+assert.ok(m.bins.find((b: any) => b.id === 'FB').balance <= m.queue[0].dosingSteps[0].actual + 5, 'drift is not credited to the destination');
 
 // ── status bar data: mixer pounds on the active batch only, and the stage a paused batch stopped in ──
 reset(); queue(); queue(); run(); scan(3);

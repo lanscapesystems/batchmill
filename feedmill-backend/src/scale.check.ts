@@ -3,13 +3,22 @@
 import './testScan.js';
 import assert from 'node:assert/strict';
 import { Mill } from './mill.js';
-import { reconcileScaleReaders } from './scaleReader.js';
+import { reconcileScaleReaders, parseWeight } from './scaleReader.js';
 import type { ScaleConfig } from './types.js';
+
+// weights below zero keep their sign however the head pads or places it
+for (const [line, weight] of [
+  ['ST,GS,+001234.5 lb', 1234.5], ['ST,GS,-000012.5 lb', -12.5], ['ST,GS,-   12.5lb', -12.5], ['  12.5- lb', -12.5],
+  ['  500', 500], ['-.5', -0.5], ['12.5-lb', 12.5], ['#### ERR ####', null],
+  ['\x02-   12.5LG ', -12.5], ['\x02    1234LG ', 1234], // Rice Lake 480 STR1 frames: padded digits, no thousands commas
+] as const) assert.equal(parseWeight(line), weight, line);
+assert.equal(parseWeight('W=- 7', /-?\s*\d+/), -7, 'a custom pattern may span the padding too');
+assert.equal(parseWeight('abc', /\d*/), null, 'an empty match is not zero');
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 const m: any = new Mill();
 const cfg: ScaleConfig = {
-  id: 'SC-X', name: 'x', connectionType: 'serial', protocol: '', comPort: '/dev/no-such-scale', baudRate: 9600, dataBits: 8,
+  id: 'SC-X', name: 'x', connectionType: 'serial', comPort: '/dev/no-such-scale', baudRate: 9600, dataBits: 8,
   parity: 'none', stopBits: 1, weightRegex: '', rackSlot: 0, zeroOffset: 0, ratedMvV: 2, capacity: 1000, resolution: 1,
   freshnessTimeout: 2000, stabilityWindow: 500,
 };

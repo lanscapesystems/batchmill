@@ -319,7 +319,6 @@ export interface ScaleConfig {
   name: string;
   connectionType: ScaleConnectionType;
   // Serial settings (used when connectionType === 'serial')
-  protocol: string;
   comPort: string;
   baudRate: number;
   dataBits: number;

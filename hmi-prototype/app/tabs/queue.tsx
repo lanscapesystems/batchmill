@@ -49,22 +49,21 @@ function backendToQueueEntry(b: HistoryBatch): QueueEntry {
 }
 
 // The stage a live batch is in, shared by the status bar and the queue table. A paused batch stays in the stage it stopped in.
-// width is the bar (dosing fills, mixing and unloading drain); percent always counts up, per stage.
+// percent counts up from 0 to 100 in each stage, so the bar always fills toward the right.
 function batchStage(b: HistoryBatch) {
   const state = b.state === 'PAUSING' || b.state === 'PAUSED' || b.state === 'ABORTED_HOLD' ? b.previousState ?? 'DOSING' : b.state;
   const dosed = b.dosingSteps?.reduce((s, st) => s + st.actual, 0) ?? 0;
-  const lbs = (n: number) => Math.round(n).toLocaleString();
+  const lbs = (n: number) => (Math.round(n) || 0).toLocaleString(); // || 0: never "-0"
   const clamp = (n: number, of: number) => (of > 0 ? Math.min(100, Math.max(0, 100 * n / of)) : 0);
   if (state === 'MIXING') {
     const left = b.mixTimeRemainingMs ?? 0, total = b.mixTimeTotalMs ?? 0, sec = Math.ceil(left / 1000);
-    return { label: 'Mixing', value: `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')} remaining`, width: clamp(left, total), percent: clamp(total - left, total) };
+    return { label: 'Mixing', value: `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')} remaining`, percent: clamp(total - left, total) };
   }
   if (['ROUTE_PRECHECK', 'DISCHARGING', 'CLEAROUT'].includes(state)) {
-    const left = b.mixerLbs === undefined ? undefined : Math.max(0, b.mixerLbs);
-    return { label: 'Unloading', value: `${left === undefined ? '—' : lbs(left)} / ${lbs(dosed)} lbs in mixer`, width: clamp(left ?? 0, dosed), percent: left === undefined ? undefined : clamp(dosed - left, dosed) };
+    const left = b.mixerLbs; // shown as read, below zero included; the bar clamps
+    return { label: 'Unloading', value: `${left === undefined ? '—' : lbs(left)} / ${lbs(dosed)} lbs in mixer`, percent: left === undefined ? undefined : clamp(dosed - left, dosed) };
   }
-  const percent = clamp(dosed, b.targetMass);
-  return { label: 'Dosing', value: `${lbs(dosed)} / ${lbs(b.targetMass)} lbs`, width: percent, percent };
+  return { label: 'Dosing', value: `${lbs(dosed)} / ${lbs(b.targetMass)} lbs`, percent: clamp(dosed, b.targetMass) };
 }
 
 function stageProgress(b: HistoryBatch): string | undefined {
@@ -75,7 +74,8 @@ function stageProgress(b: HistoryBatch): string | undefined {
 
 // One bar, repurposed per stage.
 function StageBar({ batch: b }: { batch: BackendBatch }) {
-  const { label, value, width } = batchStage(b);
+  const { label, value, percent } = batchStage(b);
+  const width = percent ?? 0; // no mixer weight: empty bar
   return (
     <div>
       <div className="flex justify-between" style={{ fontSize: '11px', color: 'var(--fg-dim)', marginBottom: '4px' }}>

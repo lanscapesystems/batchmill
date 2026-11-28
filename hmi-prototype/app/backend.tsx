@@ -88,7 +88,6 @@ export interface BackendScaleConfig {
   id: string;
   name: string;
   connectionType: 'serial' | 'rs1201';
-  protocol: string;
   comPort: string;
   baudRate: number;
   dataBits: number;
